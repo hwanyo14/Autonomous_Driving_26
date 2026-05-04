@@ -1,0 +1,51 @@
+# External repositories
+mmdetection3d/
+
+# Data
+data/
+datasets/
+nuscenes/
+nuScenes-Occupancy/
+lyft/
+
+# Training outputs
+work_dirs/
+outputs/
+output/
+runs/
+logs/
+wandb/
+checkpoints/
+checkpoint/
+ckpts/
+weights/
+
+# Model files
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.pickle
+*.npz
+*.npy
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.so
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Conda / env
+.env
+.venv/
+venv/
+env/
