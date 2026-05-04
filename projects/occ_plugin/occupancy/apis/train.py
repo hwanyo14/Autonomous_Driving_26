@@ -15,7 +15,14 @@ def custom_train_model(model,
     future.
     """
     if cfg.model.type in ['EncoderDecoder3D']:
-        assert False
+        train_segmentor(
+            model,
+            dataset,
+            cfg,
+            distributed=distributed,
+            validate=validate,
+            timestamp=timestamp,
+            meta=meta)
     else:
         custom_train_detector(
             model,
