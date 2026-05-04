@@ -1,24 +1,26 @@
 # External repositories
-mmdetection3d/
+/mmdetection3d/
+/mmcv/
+/mmcv_1.7.2/
 
 # Data
-data/
-datasets/
-nuscenes/
-nuScenes-Occupancy/
-lyft/
+/data/
+/datasets/
+/nuscenes/
+/nuScenes-Occupancy/
+/lyft/
 
 # Training outputs
-work_dirs/
-outputs/
-output/
-runs/
-logs/
-wandb/
-checkpoints/
-checkpoint/
-ckpts/
-weights/
+/work_dirs/
+/outputs/
+/output/
+/runs/
+/logs/
+/wandb/
+/checkpoints/
+/checkpoint/
+/ckpts/
+/weights/
 
 # Model files
 *.pth
