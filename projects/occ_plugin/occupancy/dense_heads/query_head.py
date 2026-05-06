@@ -2288,6 +2288,7 @@ class QueryHead(nn.Module):
             header += f" | ego(+)=xy(0,0)->pix({ego_ix},{ego_iy})"
         else:
             header += " | ego(+)=xy(0,0) out-of-range"
+        header += f" | grid={X}x{Y}"
         draw.text((2, 1), header, fill=(255, 255, 255))
 
         for t in range(T):

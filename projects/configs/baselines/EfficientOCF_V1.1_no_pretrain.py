@@ -6,7 +6,8 @@ import copy
 # Basic params ******************************************
 _base_ = ['../datasets/custom_nus-3d.py', '../_base_/default_runtime.py']
 
-find_unused_parameters = True
+find_unused_parameters = False
+ddp_static_graph = True
 # Whether to run only dataset generation without training.
 only_generate_dataset = False
 
@@ -131,10 +132,9 @@ train_pipeline = [
         use_separate_classes=use_separate_classes,
         validate_cache=validate_instance_cache,
         write_cache=write_instance_cache,
-        load_segmentation_instance3d=True,
-        load_segmentation_cls_instance3d=True,
-        segmentation_cls_dataset_path=segmentation_cls_dataset_path,
-        validate_segmentation_cls_instance3d_alignment=validate_segmentation_cls_instance3d_alignment,
+        load_ocf_labels=False,
+        load_segmentation_instance3d=False,
+        load_segmentation_cls_instance3d=False,
         load_gt_occ_inst=True,
         gt_occ_inst_dataset_path=gt_occ_inst_dataset_path,
     ),
@@ -165,6 +165,7 @@ train_pipeline = [
         load_occ_dt=True,
         dt_type='float16',
         strict_dt=True,
+        load_height=False,
         validate_height_cache=False,
         write_height_cache=write_height_cache,
     ),
@@ -175,15 +176,7 @@ train_pipeline = [
             'img_inputs_seq',
             'gt_occ',
             'future_egomotion',
-            'segmentation',
-            'segmentation_bev',
-            'instance_bev',
-            'segmentation_instance3d',
-            'segmentation_cls_instance3d',
             'gt_occ_inst',
-            'gt_instance_centers_world',
-            'gt_instance_centers_valid',
-            'gt_instance_ids',
             'occ_dt',
         ],
         meta_keys=(
@@ -229,10 +222,9 @@ test_pipeline = [
         use_separate_classes=use_separate_classes,
         validate_cache=validate_instance_cache,
         write_cache=write_instance_cache,
-        load_segmentation_instance3d=True,
-        load_segmentation_cls_instance3d=True,
-        segmentation_cls_dataset_path=segmentation_cls_dataset_path,
-        validate_segmentation_cls_instance3d_alignment=validate_segmentation_cls_instance3d_alignment,
+        load_ocf_labels=False,
+        load_segmentation_instance3d=False,
+        load_segmentation_cls_instance3d=False,
         load_gt_occ_inst=True,
         gt_occ_inst_dataset_path=gt_occ_inst_dataset_path,
     ),
@@ -262,6 +254,7 @@ test_pipeline = [
         load_occ_dt=True,
         dt_type='float16',
         strict_dt=True,
+        load_height=False,
         validate_height_cache=False,
         write_height_cache=write_height_cache,
     ),
@@ -272,15 +265,7 @@ test_pipeline = [
             'img_inputs_seq',
             'gt_occ',
             'future_egomotion',
-            'segmentation',
-            'segmentation_bev',
-            'instance_bev',
-            'segmentation_instance3d',
-            'segmentation_cls_instance3d',
             'gt_occ_inst',
-            'gt_instance_centers_world',
-            'gt_instance_centers_valid',
-            'gt_instance_ids',
             'occ_dt',
         ],
         meta_keys=['pc_range', 'occ_size', 'scene_token', 'lidar_token'],
@@ -355,7 +340,7 @@ grid_config = {
 }
 
 # BEV / neck channel setup.
-bev_feat_dim = 64
+bev_feat_dim = 32
 voxel_channels = [
     bev_feat_dim * time_receptive_field,
     bev_feat_dim * 2 * time_receptive_field,
@@ -432,7 +417,7 @@ query_bev_dice_match_cost_weight = 0.0
 query_attn_match_cost_weight = 0.5
 
 query_embed_dim = bev_feat_dim
-query_num_queries = 200
+query_num_queries = 100
 query_transformer_num_layers = 1
 query_id_reinject_scale = 0.2
 query_ca_kv_identity_init = False
@@ -541,7 +526,7 @@ model = dict(
 
     # Query supervision source.
     gmo_ids=(2, 3, 4, 5, 6, 7, 9, 10),
-    use_segmentation_as_query_gt=True,
+    use_segmentation_as_query_gt=False,
 
     # Pretrain-only visualization.
     pretrain_view_transform_only=False,  # True: image->view_transform->BEV->occ_head only
@@ -696,10 +681,6 @@ model = dict(
     debug_query_attn_softargmax_vis_max_frames=debug_query_attn_softargmax_vis_max_frames,
     debug_query_attn_softargmax_vis_max_cams=debug_query_attn_softargmax_vis_max_cams,
     debug_query_attn_softargmax_vis_max_queries=debug_query_attn_softargmax_vis_max_queries,
-    debug_print_segmentation_cls_instance3d=True,
-    debug_loss_grad_enabled=False,
-    debug_loss_grad_every=0,
-    debug_loss_grad_include_dt=False,
 
     # Backbone / neck / head.
     img_backbone=dict(
@@ -709,7 +690,7 @@ model = dict(
         num_stages=4,
         out_indices=(0, 1, 2, 3),
         frozen_stages=0,
-        with_cp=False,
+        with_cp=True,
         norm_cfg=dict(type='BN', requires_grad=True),
         norm_eval=True,
         style='pytorch'
@@ -791,10 +772,16 @@ optimizer = dict(
 # optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
 
 optimizer_config = dict(
-    type='GradientCumulativeOptimizerHook',
+    # type='GradientCumulativeOptimizerHook',
+    type='GradientCumulativeFp16OptimizerHook',
     cumulative_iters=8,
     grad_clip=dict(max_norm=35, norm_type=2),
+    # Mixed precision training optiion.
+    loss_scale='dynamic',
 )
+
+# Mixed precision training optiion.
+# fp16 = dict(loss_scale='dynamic')
 
 lr_config = dict(
     policy='CosineAnnealing',

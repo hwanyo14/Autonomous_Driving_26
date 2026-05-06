@@ -1000,11 +1000,12 @@ class EfficientOCFLossMixin:
             valid_tq = valid_tq & finite_tq
 
             if metric in ("bce", "bce_dice"):
-                bce_tqp = F.binary_cross_entropy(
-                    pred_tqp.clamp(min=eps_v, max=(1.0 - eps_v)),
-                    tgt_tqp.clamp(min=0.0, max=1.0),
-                    reduction="none",
-                )
+                with torch.cuda.amp.autocast(enabled=False):
+                    bce_tqp = F.binary_cross_entropy(
+                        pred_tqp.clamp(min=eps_v, max=(1.0 - eps_v)).to(torch.float32),
+                        tgt_tqp.clamp(min=0.0, max=1.0).to(torch.float32),
+                        reduction="none",
+                    )
                 bce_tq = bce_tqp.mean(dim=-1)
             else:
                 bce_tq = torch.zeros_like(dist_tq)
@@ -1172,11 +1173,12 @@ class EfficientOCFLossMixin:
             finite_tkn = torch.isfinite(pred_metric).all(dim=-1) & torch.isfinite(tgt_tknp).all(dim=-1)
             valid_tkn = valid_tkn & finite_tkn
             if metric_v in ("bce", "bce_dice"):
-                bce_tknp = F.binary_cross_entropy(
-                    pred_metric.clamp(min=eps_v, max=(1.0 - eps_v)),
-                    tgt_tknp.clamp(min=0.0, max=1.0),
-                    reduction="none",
-                )
+                with torch.cuda.amp.autocast(enabled=False):
+                    bce_tknp = F.binary_cross_entropy(
+                        pred_metric.clamp(min=eps_v, max=(1.0 - eps_v)).to(torch.float32),
+                        tgt_tknp.clamp(min=0.0, max=1.0).to(torch.float32),
+                        reduction="none",
+                    )
                 bce_tkn = bce_tknp.mean(dim=-1)
             else:
                 bce_tkn = torch.zeros_like(dist_tkn)
@@ -1632,9 +1634,11 @@ class EfficientOCFLossMixin:
 
         loss_type = str(loss_type).lower()
         if loss_type in ("balanced_bce", "bce"):
-            loss_map = F.binary_cross_entropy(p, t, reduction="none")
+            with torch.cuda.amp.autocast(enabled=False):
+                loss_map = F.binary_cross_entropy(p, t, reduction="none")
         elif loss_type in ("balanced_focal", "focal"):
-            bce_map = F.binary_cross_entropy(p, t, reduction="none")
+            with torch.cuda.amp.autocast(enabled=False):
+                bce_map = F.binary_cross_entropy(p, t, reduction="none")
             pt = p * t + (1.0 - p) * (1.0 - t)
             focal_w = (1.0 - pt).clamp(min=0.0).pow(float(focal_gamma))
             loss_map = bce_map * focal_w

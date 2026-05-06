@@ -145,33 +145,34 @@ class EfficientOCFInstanceImgDebugMixin:
     ):
         if len(frame_indices) <= 0:
             return []
-        ego = future_egomotion_seq44.to(torch.float32)
-        eye = torch.eye(4, dtype=ego.dtype, device=ego.device)
-        present_g = int(present_global_idx)
-        seq_len = int(ego.shape[0])
+        with torch.cuda.amp.autocast(enabled=False):
+            ego = future_egomotion_seq44.to(torch.float32)
+            eye = torch.eye(4, dtype=ego.dtype, device=ego.device)
+            present_g = int(present_global_idx)
+            seq_len = int(ego.shape[0])
 
-        def compose_forward(start_g: int, end_g: int):
-            # Compose transforms from frame start_g -> end_g, using adjacent g->g+1 matrices.
-            if end_g <= start_g:
-                return eye.clone()
-            out = eye.clone()
-            for g in range(int(start_g), int(end_g)):
-                if g < 0 or g >= seq_len:
-                    continue
-                out = ego[g] @ out
+            def compose_forward(start_g: int, end_g: int):
+                # Compose transforms from frame start_g -> end_g, using adjacent g->g+1 matrices.
+                if end_g <= start_g:
+                    return eye.clone()
+                out = eye.clone()
+                for g in range(int(start_g), int(end_g)):
+                    if g < 0 or g >= seq_len:
+                        continue
+                    out = ego[g] @ out
+                return out
+
+            out = []
+            for g in frame_indices:
+                g = int(g)
+                if g == present_g:
+                    out.append(eye.clone())
+                elif g < present_g:
+                    out.append(compose_forward(g, present_g))
+                else:
+                    present_to_g = compose_forward(present_g, g)
+                    out.append(torch.inverse(present_to_g))
             return out
-
-        out = []
-        for g in frame_indices:
-            g = int(g)
-            if g == present_g:
-                out.append(eye.clone())
-            elif g < present_g:
-                out.append(compose_forward(g, present_g))
-            else:
-                present_to_g = compose_forward(present_g, g)
-                out.append(torch.inverse(present_to_g))
-        return out
 
     @staticmethod
     def _project_corners_to_aug_uv(corners_lidar: torch.Tensor, rot, trans, intrins, post_rot, post_trans):

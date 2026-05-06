@@ -28,6 +28,7 @@ class LoadOccupancy(object):
                  load_occ_dt=False,
                  dt_type='float16',
                  strict_dt=True,
+                 load_height=True,
                  validate_height_cache=True,
                  write_height_cache=True):
         '''
@@ -49,6 +50,7 @@ class LoadOccupancy(object):
         self.load_occ_dt = load_occ_dt
         self.dt_type = dt_type
         self.strict_dt = strict_dt
+        self.load_height = bool(load_height)
         self.validate_height_cache = bool(validate_height_cache)
         self.write_height_cache = bool(write_height_cache)
 
@@ -333,6 +335,11 @@ class LoadOccupancy(object):
             prefix = prefix + "_lyft"
             results['gt_occ'] = self.get_seq_occ(results, only_gt_occ=True)
             return results
+        if not self.load_height:
+            results['gt_occ'] = self.get_seq_occ(results, only_gt_occ=True)
+            if self.load_occ_dt:
+                results["occ_dt"] = self.get_seq_occ_dt(results)
+            return results
 
         height_bev_dir = os.path.join(self.ocf_dataset_path, prefix, "pcd_height")
         
@@ -340,10 +347,16 @@ class LoadOccupancy(object):
             os.mkdir(height_bev_dir)  
         height_bev_path = os.path.join(height_bev_dir, \
             results['input_dict'][time_receptive_field-1]['scene_token']+"_"+results['input_dict'][time_receptive_field-1]['lidar_token'])
+        sample_key = (
+            results['input_dict'][time_receptive_field-1]['scene_token']
+            + "_"
+            + results['input_dict'][time_receptive_field-1]['lidar_token']
+        )
         
 
         # ======== optional cache validation ========
         need_regen = False
+        regen_reasons = []
         if self.validate_height_cache:
             check_list = [
                 (height_bev_path + ".npz", "height_bev_saved_list2"),
@@ -352,6 +365,7 @@ class LoadOccupancy(object):
             for p, key in check_list:
                 if not os.path.exists(p):
                     need_regen = True
+                    regen_reasons.append(f"missing:{p}")
                     continue
                 try:
                     with np.load(p, allow_pickle=True) as f:
@@ -360,11 +374,14 @@ class LoadOccupancy(object):
                         _ = f[key]  # 실제로 로드가 되는지까지 확인
                 except Exception as e:
                     print(f"[BAD_NPZ] {p} key={key} err={repr(e)}", flush=True)
+                    regen_reasons.append(f"bad_npz:{p}")
                     try:
                         os.remove(p)
                     except Exception as e2:
                         print(f"[BAD_NPZ_REMOVE_FAIL] {p} err={repr(e2)}", flush=True)
                     need_regen = True
+        elif not os.path.exists(height_bev_path + ".npz"):
+            regen_reasons.append(f"missing:{height_bev_path}.npz")
 
 
         pcd_xyhl_list = []
@@ -408,8 +425,10 @@ class LoadOccupancy(object):
 
                 results['height'] = torch.cat(pcd_xyhl_list, dim=0)
                 load_ok = True
+                print(f"[LOAD_HEIGHT_CACHE] sample={sample_key}", flush=True)
             except Exception as e:
                 print(f"[BAD_NPZ] {height_bev_path}.npz err={repr(e)}", flush=True)
+                regen_reasons.append(f"bad_load:{height_bev_path}.npz")
                 try:
                     os.remove(height_bev_path + ".npz")
                 except Exception:
@@ -417,6 +436,14 @@ class LoadOccupancy(object):
                 need_regen = True
         
         if not load_ok:
+            if not regen_reasons:
+                regen_reasons.append("incomplete_cache")
+            print(
+                f"[LOAD_HEIGHT_REGEN] sample={sample_key} "
+                f"write_cache={self.write_height_cache} reasons={';'.join(regen_reasons)} "
+                f"dest={height_bev_path}.npz",
+                flush=True,
+            )
             results['gt_occ'], pcd_xyhl_saved_list = self.get_seq_occ(results, only_gt_occ=False)
             results['height'] = torch.cat(pcd_xyhl_saved_list, dim=0)
 

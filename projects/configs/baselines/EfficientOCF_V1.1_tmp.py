@@ -696,10 +696,6 @@ model = dict(
     debug_query_attn_softargmax_vis_max_frames=debug_query_attn_softargmax_vis_max_frames,
     debug_query_attn_softargmax_vis_max_cams=debug_query_attn_softargmax_vis_max_cams,
     debug_query_attn_softargmax_vis_max_queries=debug_query_attn_softargmax_vis_max_queries,
-    debug_print_segmentation_cls_instance3d=True,
-    debug_loss_grad_enabled=False,
-    debug_loss_grad_every=0,
-    debug_loss_grad_include_dt=False,
 
     # Backbone / neck / head.
     img_backbone=dict(

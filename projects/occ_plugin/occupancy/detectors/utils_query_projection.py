@@ -365,7 +365,7 @@ class EfficientOCFQueryProjectionMixin:
                     [lidar_t, torch.ones((int(lidar_t.shape[0]), 1), device=lidar_t.device, dtype=torch.float32)],
                     dim=1,
                 )
-                present_xyz = (tf_lidar_to_present @ lidar_h.t()).t()[:, :3]
+                present_xyz = (tf_lidar_to_present @ lidar_h.t()).t()[:, :3].to(lifted_center_tqn3.dtype)
                 lifted_center_tqn3[t_idx, q_idx, cam_idx] = present_xyz
                 lifted_valid_tqn[t_idx, q_idx, cam_idx] = torch.isfinite(present_xyz).all(dim=-1)
 

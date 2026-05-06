@@ -13,7 +13,7 @@ import copy
 
 @PIPELINES.register_module()
 class LoadInstanceWithFlow(object):
-    def __init__(self, ocf_dataset_path, grid_size=[512, 512, 40], pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0], background=0, use_flow=True, use_separate_classes=False, use_lyft=False, validate_cache=False, write_cache=True, load_segmentation_instance3d=False, segmentation_instance3d_path=None, segmentation_instance3d_key='segmentation_instance_saved_list2', load_segmentation_cls_instance3d=False, segmentation_cls_dataset_path=None, segmentation_cls_key='segmentation_saved_list2', validate_segmentation_cls_instance3d_alignment=False, load_gt_occ_inst=False, gt_occ_inst_dataset_path=None, gt_occ_inst_key='segmentation_instance_saved_list2'):
+    def __init__(self, ocf_dataset_path, grid_size=[512, 512, 40], pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0], background=0, use_flow=True, use_separate_classes=False, use_lyft=False, validate_cache=False, write_cache=True, load_ocf_labels=True, load_segmentation_instance3d=False, segmentation_instance3d_path=None, segmentation_instance3d_key='segmentation_instance_saved_list2', load_segmentation_cls_instance3d=False, segmentation_cls_dataset_path=None, segmentation_cls_key='segmentation_saved_list2', validate_segmentation_cls_instance3d_alignment=False, load_gt_occ_inst=False, gt_occ_inst_dataset_path=None, gt_occ_inst_key='segmentation_instance_saved_list2'):
         '''
         Loading sequential occupancy labels and instance flows for training and testing
         '''
@@ -32,6 +32,7 @@ class LoadInstanceWithFlow(object):
         self.use_lyft = use_lyft
         self.validate_cache = bool(validate_cache)
         self.write_cache = bool(write_cache)
+        self.load_ocf_labels = bool(load_ocf_labels)
         self.load_segmentation_instance3d = bool(load_segmentation_instance3d)
         self.segmentation_instance3d_path = segmentation_instance3d_path
         self.segmentation_instance3d_key = str(segmentation_instance3d_key)
@@ -226,6 +227,35 @@ class LoadInstanceWithFlow(object):
                 sample_key=sample_key,
                 frame_idx=frame_idx,
             )
+
+    def load_gt_occ_inst_sparse_list(self, prefix, sample_key, expected_seq_len):
+        gt_occ_inst_label_dir = self.resolve_gt_occ_inst_dir(prefix)
+        if gt_occ_inst_label_dir is None:
+            raise FileNotFoundError(
+                "Could not resolve gt_occ_inst directory from "
+                f"gt_occ_inst_dataset_path={self.gt_occ_inst_dataset_path!r} "
+                f"for prefix={prefix!r}."
+            )
+
+        npz_path = os.path.join(gt_occ_inst_label_dir, sample_key) + ".npz"
+        if not os.path.exists(npz_path):
+            raise FileNotFoundError(f"gt_occ_inst npz is missing: {npz_path}")
+
+        gt_list = self._npz_load_list(npz_path, self.gt_occ_inst_key)
+        self._validate_gt_occ_inst_sparse_list(
+            sparse_list=gt_list,
+            sample_key=sample_key,
+            expected_seq_len=expected_seq_len,
+        )
+        out = []
+        for rows_raw in gt_list:
+            rows = self._normalize_sparse_rows(
+                rows_raw,
+                min_cols=5,
+                label="gt_occ_inst",
+            )
+            out.append(rows.astype(np.int64, copy=False))
+        return out
 
     def get_poly_region(self, instance_annotation, present_egopose, present_ego2lidar):
         """
@@ -980,6 +1010,26 @@ class LoadInstanceWithFlow(object):
             + results['input_dict'][time_receptive_field - 1]['lidar_token']
         )
 
+        if not self.load_ocf_labels:
+            if self.load_gt_occ_inst:
+                results['gt_occ_inst'] = self.load_gt_occ_inst_sparse_list(
+                    prefix=prefix,
+                    sample_key=sample_key,
+                    expected_seq_len=results['sequence_length'],
+                )
+            for key, value in results.items():
+                if key in [
+                    'sample_token', 'centerness', 'offset', 'flow_bev', 'time_receptive_field', "indices",
+                    'segmentation', 'segmentation_bev', 'instance_bev', 'attribute_label',
+                    'segmentation_instance3d', 'segmentation_cls_instance3d', 'gt_occ_inst',
+                    'gt_instance_centers_world', 'gt_instance_centers_valid', 'gt_instance_ids',
+                    'sequence_length', 'instance_dict', 'instance_map', 'input_dict',
+                    'egopose_list', 'ego2lidar_list', 'scene_token', 'instance'
+                ]:
+                    continue
+                results[key] = torch.cat(value, dim=0)
+            return results
+
         # ---------------- paths ----------------
         seg_label_dir = os.path.join(self.ocf_dataset_path, prefix, "segmentation")
         if not os.path.exists(seg_label_dir):
@@ -1157,6 +1207,7 @@ class LoadInstanceWithFlow(object):
 
         # ========== data regen if the npz files are broken ==========
         need_regen = False
+        regen_reasons = []
 
         check_list = [
             (seg_label_path + ".npz", "segmentation_saved_list2"),
@@ -1179,12 +1230,14 @@ class LoadInstanceWithFlow(object):
             for p, key in check_list:
                 if not os.path.exists(p):
                     need_regen = True
+                    regen_reasons.append(f"missing:{p}")
                     continue
                 try:
                     with np.load(p, allow_pickle=True) as f:
                         _ = f[key]
                 except Exception as e:
                     print(f"[BAD_NPZ] {p} key={key} err={repr(e)}", flush=True)
+                    regen_reasons.append(f"bad_npz:{p}")
                     try:
                         os.remove(p)
                     except Exception as e2:
@@ -1194,6 +1247,7 @@ class LoadInstanceWithFlow(object):
             for p, _ in check_list:
                 if not os.path.exists(p):
                     need_regen = True
+                    regen_reasons.append(f"missing:{p}")
                     break
 
         # ---------------- load cached labels ----------------
@@ -1213,6 +1267,7 @@ class LoadInstanceWithFlow(object):
                     segmentation_list.append(torch.from_numpy(segmentation).unsqueeze(0))
             except Exception as e:
                 print(f"[BAD_NPZ] {seg_label_path}.npz err={repr(e)}", flush=True)
+                regen_reasons.append(f"bad_load:{seg_label_path}.npz")
                 try:
                     os.remove(seg_label_path + ".npz")
                 except Exception:
@@ -1235,6 +1290,7 @@ class LoadInstanceWithFlow(object):
                     segmentation_bev_list.append(torch.from_numpy(segmentation_bev).unsqueeze(0))
             except Exception as e:
                 print(f"[BAD_NPZ] {seg_bev_label_path}.npz err={repr(e)}", flush=True)
+                regen_reasons.append(f"bad_load:{seg_bev_label_path}.npz")
                 try:
                     os.remove(seg_bev_label_path + ".npz")
                 except Exception:
@@ -1257,6 +1313,7 @@ class LoadInstanceWithFlow(object):
                     instance_bev_list.append(torch.from_numpy(instance_bev).unsqueeze(0))
             except Exception as e:
                 print(f"[BAD_NPZ] {instance_bev_label_path}.npz err={repr(e)}", flush=True)
+                regen_reasons.append(f"bad_load:{instance_bev_label_path}.npz")
                 try:
                     os.remove(instance_bev_label_path + ".npz")
                 except Exception:
@@ -1279,6 +1336,7 @@ class LoadInstanceWithFlow(object):
                     flow_bev_list.append(torch.from_numpy(flow_bev).unsqueeze(0))
             except Exception as e:
                 print(f"[BAD_NPZ] {flow_bev_label_path}.npz err={repr(e)}", flush=True)
+                regen_reasons.append(f"bad_load:{flow_bev_label_path}.npz")
                 try:
                     os.remove(flow_bev_label_path + ".npz")
                 except Exception:
@@ -1296,6 +1354,7 @@ class LoadInstanceWithFlow(object):
                     pcd_height_list.append(torch.from_numpy(pcd_height).unsqueeze(0))
             except Exception as e:
                 print(f"[BAD_NPZ] {pcd_height_label_path}.npz err={repr(e)}", flush=True)
+                regen_reasons.append(f"bad_load:{pcd_height_label_path}.npz")
                 try:
                     os.remove(pcd_height_label_path + ".npz")
                 except Exception:
@@ -1313,6 +1372,7 @@ class LoadInstanceWithFlow(object):
                     segmentation_instance3d_list.append(segmentation_instance3d.unsqueeze(0))
             except Exception as e:
                 print(f"[BAD_NPZ] {seg_instance3d_label_path}.npz err={repr(e)}", flush=True)
+                regen_reasons.append(f"bad_load:{seg_instance3d_label_path}.npz")
                 segmentation_instance3d_sparse_list = None
                 need_regen = True
 
@@ -1344,6 +1404,7 @@ class LoadInstanceWithFlow(object):
                 and (len(gt_occ_inst_sparse_list) == int(results['sequence_length']))
 
         if use_cache:
+            print(f"[LOAD_INSTANCE_CACHE] sample={sample_key} prefix={prefix}", flush=True)
             results['segmentation'] = torch.cat(segmentation_list, dim=0)
             results['attribute_label'] = torch.from_numpy(
                 np.zeros((self.dimension[0], self.dimension[1], self.dimension[2]), dtype=np.float32)
@@ -1402,6 +1463,15 @@ class LoadInstanceWithFlow(object):
             return results
 
         # ---------------- regenerate and save (원래 else 블록 유지) ----------------
+        if not regen_reasons:
+            regen_reasons.append("incomplete_cache")
+        print(
+            f"[LOAD_INSTANCE_REGEN] sample={sample_key} prefix={prefix} "
+            f"write_cache={self.write_cache} reasons={';'.join(regen_reasons)} "
+            f"dest={seg_label_path}.npz,{seg_bev_label_path}.npz,"
+            f"{instance_bev_label_path}.npz,{flow_bev_label_path}.npz",
+            flush=True,
+        )
         results['segmentation'] = []
         results['attribute_label'] = []
         results['segmentation_bev'] = []
