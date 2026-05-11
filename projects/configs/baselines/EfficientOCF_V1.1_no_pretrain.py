@@ -432,7 +432,7 @@ query_traj_loss_weight = 0.1
 query_traj_loss_type = 'l1'
 query_traj_residual_max_m = (8.0, 8.0)
 query_traj_moving_reweight_enabled = True
-query_traj_moving_threshold_m = 0.5
+query_traj_moving_threshold_m = 1.0
 query_traj_moving_weight = 5.0
 query_traj_static_weight = 1.0
 
@@ -639,7 +639,7 @@ model = dict(
     query_traj_static_weight=query_traj_static_weight,
 
     # Debug controls.
-    debug_query_vis_every=8,
+    debug_query_vis_every=48,
     debug_query_vis_dir="./work_dirs/query_debug_vis_no_pretrain",
     center_only_mode=center_only_mode,
     debug_query_center_marker_radius=debug_query_center_marker_radius,
