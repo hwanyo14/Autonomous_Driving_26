@@ -1,6 +1,10 @@
 import torch
 # from projects.occ_plugin.ops.occ_pooling import occ_pool_ext
-from . import occ_pool_ext 
+try:
+    from . import occ_pool_ext
+except ImportError:
+    import occ_pool_ext
+
 
 __all__ = ["occ_pool"]
 

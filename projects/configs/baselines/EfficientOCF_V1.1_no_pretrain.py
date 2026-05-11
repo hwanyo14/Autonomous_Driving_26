@@ -792,7 +792,7 @@ lr_config = dict(
     min_lr_ratio=1e-3,
 )
 
-runner = dict(type='EpochBasedRunner', max_epochs=15)
+runner = dict(type='EpochBasedRunner', max_epochs=16)
 checkpoint_config = dict(interval=1, filename_tmpl='epoch_{}_lss_only.pth')
 evaluation = dict(
     interval=1,

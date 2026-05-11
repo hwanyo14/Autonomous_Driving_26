@@ -1,5 +1,5 @@
 # External repositories
-/mmdetection3d/
+/mmdetection3d
 /mmcv/
 /mmcv_1.7.2/
 
@@ -51,3 +51,6 @@ dist/
 .venv/
 venv/
 env/
+
+# Jupyter
+*.ipynb
