@@ -337,7 +337,7 @@ val_config['test_capacity'] = 100
 # In our work we use 8 NVIDIA A100 GPUs.
 data = dict(
     samples_per_gpu=1,
-    workers_per_gpu=2,
+    workers_per_gpu=1,
     train=train_config,
     # val=test_config,
     val=val_config,
@@ -432,7 +432,7 @@ query_bev_dice_match_cost_weight = 0.0
 query_attn_match_cost_weight = 0.5
 
 query_embed_dim = bev_feat_dim
-query_num_queries = 200
+query_num_queries = 100
 query_transformer_num_layers = 1
 query_id_reinject_scale = 0.2
 query_ca_kv_identity_init = False
@@ -467,7 +467,7 @@ query_multi_gaussian_softplus_bias_init = -2.0
 query_multi_gaussian_weight_reg_loss_weight = 1e-3
 query_multi_gaussian_weight_reg_target_sum = 1.0
 
-query_gmo_loss_type = 'bce'
+query_gmo_loss_type = 'focal'
 query_gmo_focal_gamma = 2.0
 query_gmo_focal_alpha = 0.25
 query_gmo_dice_loss_weight = 0.5
@@ -781,7 +781,7 @@ model = dict(
 # Learning policy params ******************************************
 optimizer = dict(
     type='AdamW',
-    lr=5e-4,
+    lr=3e-4,
     paramwise_cfg=dict(
         custom_keys={
             'img_backbone': dict(lr_mult=0.1),
@@ -790,19 +790,19 @@ optimizer = dict(
     weight_decay=0.01,
 )
 
-# optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
+optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
 
-optimizer_config = dict(
-    type='GradientCumulativeOptimizerHook',
-    cumulative_iters=8,
-    grad_clip=dict(max_norm=35, norm_type=2),
-)
+# optimizer_config = dict(
+#     type='GradientCumulativeOptimizerHook',
+#     cumulative_iters=8,
+#     grad_clip=dict(max_norm=35, norm_type=2),
+# )
 
 lr_config = dict(
     policy='CosineAnnealing',
     warmup='linear',
-    # warmup_iters=4000,
-    warmup_iters=800,
+    warmup_iters=4000,
+    # warmup_iters=800,
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
 )

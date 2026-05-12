@@ -250,7 +250,6 @@ class EfficientOCFInstanceImgDebugMixin:
         if t_hist <= 0:
             return None
         present_global_idx = int(getattr(self, "query_present_global_idx", int(self.time_receptive_field - 1)))
-        query_present_only = bool(getattr(self, "query_present_only", False))
         frame_indices_hist = list(range(frame_start, max(frame_start, frame_end)))
         if len(frame_indices_hist) < t_hist:
             frame_indices_hist = list(
@@ -258,16 +257,6 @@ class EfficientOCFInstanceImgDebugMixin:
             )
         frame_indices_hist = frame_indices_hist[:t_hist]
         selected_src_idx = list(range(t_hist))
-        if query_present_only:
-            present_candidates = [
-                int(i) for i, g in enumerate(frame_indices_hist) if int(g) == int(present_global_idx)
-            ]
-            if len(present_candidates) > 0:
-                selected_src_idx = [present_candidates[0]]
-            else:
-                fallback_idx = int(present_global_idx - frame_start)
-                fallback_idx = max(0, min(t_hist - 1, fallback_idx))
-                selected_src_idx = [fallback_idx]
         t_out = int(len(selected_src_idx))
         if t_out <= 0:
             return None
@@ -1073,33 +1062,11 @@ class EfficientOCFInstanceImgDebugMixin:
             gt_inst_cam_mask_tnnhw: [T, Ninst, Ncam, H, W] bool
             gt_inst_cam_valid_tnn: [T, Ninst, Ncam] bool
         """
-        attn_t_idx_t = None
-        if bool(getattr(self, "query_present_only", False)) and isinstance(query_match_inputs, dict):
-            frame_start = int(query_match_inputs.get("frame_start_idx", 0))
-            frame_end = int(query_match_inputs.get("frame_end_idx_exclusive", frame_start))
-            rots_tn33 = query_match_inputs.get("rots_tn33", None)
-            t_cam = int(rots_tn33.shape[0]) if torch.is_tensor(rots_tn33) and rots_tn33.dim() >= 1 else 0
-            frame_indices = list(range(frame_start, max(frame_start, frame_end)))
-            if len(frame_indices) < t_cam:
-                frame_indices = list(range(int(self.time_receptive_field - t_cam), int(self.time_receptive_field)))
-            frame_indices = frame_indices[:t_cam]
-            present_global_idx = int(getattr(self, "query_present_global_idx", int(self.time_receptive_field - 1)))
-            present_local = None
-            for idx, global_idx in enumerate(frame_indices):
-                if int(global_idx) == int(present_global_idx):
-                    present_local = int(idx)
-                    break
-            if present_local is None and t_cam > 0:
-                present_local = max(0, min(t_cam - 1, int(present_global_idx - frame_start)))
-            if present_local is not None:
-                device = rots_tn33.device if torch.is_tensor(rots_tn33) else None
-                attn_t_idx_t = torch.as_tensor([present_local], device=device, dtype=torch.long)
         gt_proj = self._project_gt_instances_to_cam_masks(
             segmentation_instance3d_txyz=segmentation_instance3d_txyz,
             future_egomotion=future_egomotion,
             gt_inst_ids_n=gt_inst_ids_n,
             query_match_inputs=query_match_inputs,
-            attn_t_idx_t=attn_t_idx_t,
             fallback_segmentation_instance3d_txyz=fallback_segmentation_instance3d_txyz,
         )
         if not isinstance(gt_proj, dict):
@@ -1254,36 +1221,24 @@ class EfficientOCFInstanceImgDebugMixin:
             if frame_mode != "overlap_only":
                 return None
             if bool(getattr(self, "query_present_only", False)):
-                present_global_idx = int(getattr(self, "query_present_global_idx", int(self.time_receptive_field - 1)))
-                frame_indices_tmp = list(range(frame_start, max(frame_start, frame_end)))
-                if len(frame_indices_tmp) < t_hist:
-                    frame_indices_tmp = list(
-                        range(int(self.time_receptive_field - t_hist), int(self.time_receptive_field))
-                    )
-                frame_indices_tmp = frame_indices_tmp[:t_hist]
-                present_local = 0
-                for idx, global_idx in enumerate(frame_indices_tmp):
-                    if int(global_idx) == int(present_global_idx):
-                        present_local = int(idx)
-                        break
-                present_local = max(0, min(t_hist - 1, int(present_local)))
-                attn_t_idx = torch.tensor([present_local], device=proj_device, dtype=torch.long)
-                query_t_idx = torch.tensor([0], device=proj_device, dtype=torch.long)
+                t_overlap = min(t_hist, t_query)
+                attn_t_idx = torch.arange(0, t_overlap, device=proj_device, dtype=torch.long)
+                query_t_idx = torch.arange(0, t_overlap, device=proj_device, dtype=torch.long)
             elif t_hist >= 2:
                 attn_t_idx = torch.tensor(
                     [t_hist - 2, t_hist - 1],
                     device=proj_device,
                     dtype=torch.long,
                 )
+                query_t_idx = torch.arange(
+                    0,
+                    min(int(attn_t_idx.numel()), t_query),
+                    device=proj_device,
+                    dtype=torch.long,
+                )
+                attn_t_idx = attn_t_idx[: int(query_t_idx.numel())]
             else:
                 attn_t_idx = torch.tensor([t_hist - 1], device=proj_device, dtype=torch.long)
-            query_t_idx = torch.arange(
-                0,
-                min(int(attn_t_idx.numel()), t_query),
-                device=proj_device,
-                dtype=torch.long,
-            )
-            attn_t_idx = attn_t_idx[: int(query_t_idx.numel())]
         else:
             return None
 

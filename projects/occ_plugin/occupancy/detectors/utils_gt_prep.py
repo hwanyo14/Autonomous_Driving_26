@@ -76,6 +76,40 @@ class EfficientOCFGTPrepMixin:
             return tensor[start_idx:].contiguous(), start_idx, "tail"
         return tensor.contiguous(), 0, "as_is"
 
+    def _select_query_visualization_gt_slice(
+        self,
+        tensor: torch.Tensor,
+    ):
+        """
+        Align a dense GT tensor to the 7-frame BEV visualization horizon
+        [t-(T_past-1), ..., t-1, t, t+1, ..., t+n_future_frames].
+
+        - Source T >= time_receptive_field + n_future_frames : tail slice.
+        - Source T == n_future_frames_plus (legacy plus window starting at t-1):
+              prepend (time_receptive_field - eval_start_moment - 1) empty past
+              frames so the present aligns at index time_receptive_field - 1.
+        - Otherwise: zero-pad on the past side to reach the target length.
+
+        The returned tensor matches the visualization grid order so that index
+        time_receptive_field - 1 corresponds to the current frame.
+        """
+        target_t = int(self.time_receptive_field) + int(self.n_future_frames)
+        if (not torch.is_tensor(tensor)) or tensor.dim() <= 0 or target_t <= 0:
+            return tensor, None, "none"
+        t = int(tensor.shape[0])
+        if t <= 0:
+            return tensor, None, "empty"
+
+        if t >= target_t:
+            start_idx = int(t - target_t)
+            return tensor[start_idx:start_idx + target_t].contiguous(), start_idx, "tail_vis"
+
+        # GT shorter than visualization horizon: pad past frames with zeros.
+        pad_count = int(target_t - t)
+        pad_shape = (pad_count,) + tuple(int(v) for v in tensor.shape[1:])
+        pad_tensor = tensor.new_zeros(pad_shape)
+        return torch.cat([pad_tensor, tensor], dim=0).contiguous(), 0, "past_pad_vis"
+
     def _select_query_trajectory_gt_slice(
         self,
         tensor: torch.Tensor,
@@ -473,6 +507,190 @@ class EfficientOCFGTPrepMixin:
                 valid_out = centers_valid_tn[:, :0].contiguous()
 
         return centers_out, valid_out, ids_out
+
+    @staticmethod
+    def _reindex_temporal_tensor_by_instance_ids(
+        values_tn=None,
+        instance_ids_n=None,
+        target_ids_n=None,
+    ):
+        if (
+            (not torch.is_tensor(values_tn))
+            or values_tn.dim() < 2
+            or (not torch.is_tensor(instance_ids_n))
+            or instance_ids_n.dim() != 1
+            or (not torch.is_tensor(target_ids_n))
+            or target_ids_n.dim() != 1
+            or int(values_tn.shape[1]) != int(instance_ids_n.numel())
+        ):
+            return None
+        id_to_col = {
+            int(instance_ids_n[idx].item()): int(idx)
+            for idx in range(int(instance_ids_n.numel()))
+        }
+        gather = []
+        for iid in target_ids_n.tolist():
+            col = id_to_col.get(int(iid), None)
+            if col is None:
+                return None
+            gather.append(col)
+        if len(gather) != int(target_ids_n.numel()):
+            return None
+        gather_idx = torch.as_tensor(
+            gather,
+            device=values_tn.device,
+            dtype=torch.long,
+        )
+        return values_tn.index_select(1, gather_idx).contiguous()
+
+    @staticmethod
+    def _reindex_vector_by_instance_ids(
+        values_n=None,
+        instance_ids_n=None,
+        target_ids_n=None,
+    ):
+        if (
+            (not torch.is_tensor(values_n))
+            or values_n.dim() != 1
+            or (not torch.is_tensor(instance_ids_n))
+            or instance_ids_n.dim() != 1
+            or (not torch.is_tensor(target_ids_n))
+            or target_ids_n.dim() != 1
+            or int(values_n.numel()) != int(instance_ids_n.numel())
+        ):
+            return None
+        id_to_col = {
+            int(instance_ids_n[idx].item()): int(idx)
+            for idx in range(int(instance_ids_n.numel()))
+        }
+        gather = []
+        for iid in target_ids_n.tolist():
+            col = id_to_col.get(int(iid), None)
+            if col is None:
+                return None
+            gather.append(col)
+        if len(gather) != int(target_ids_n.numel()):
+            return None
+        gather_idx = torch.as_tensor(
+            gather,
+            device=values_n.device,
+            dtype=torch.long,
+        )
+        return values_n.index_select(0, gather_idx).contiguous()
+
+    def _build_full_query_instance_centers_from_history_and_traj(
+        self,
+        history_centers_tn3=None,
+        history_valid_tn=None,
+        history_ids_n=None,
+        traj_centers_tn3=None,
+        traj_valid_tn=None,
+        traj_ids_n=None,
+    ):
+        if (
+            (not torch.is_tensor(history_centers_tn3))
+            or (not torch.is_tensor(history_valid_tn))
+            or (not torch.is_tensor(history_ids_n))
+            or (not torch.is_tensor(traj_centers_tn3))
+            or (not torch.is_tensor(traj_valid_tn))
+            or (not torch.is_tensor(traj_ids_n))
+        ):
+            return None, None, None
+        if history_centers_tn3.dim() != 3 or history_valid_tn.dim() != 2:
+            return None, None, None
+        if traj_centers_tn3.dim() != 3 or traj_valid_tn.dim() != 2:
+            return None, None, None
+        if history_ids_n.dim() != 1 or traj_ids_n.dim() != 1:
+            return None, None, None
+        if tuple(history_centers_tn3.shape[:2]) != tuple(history_valid_tn.shape):
+            return None, None, None
+        if tuple(traj_centers_tn3.shape[:2]) != tuple(traj_valid_tn.shape):
+            return None, None, None
+        if int(history_centers_tn3.shape[1]) != int(history_ids_n.numel()):
+            return None, None, None
+        if int(traj_centers_tn3.shape[1]) != int(traj_ids_n.numel()):
+            return None, None, None
+
+        present_local_idx = int(self.time_receptive_field) - 1
+        if int(history_centers_tn3.shape[0]) < (present_local_idx + 1):
+            return None, None, None
+        if int(traj_centers_tn3.shape[0]) <= 0:
+            return None, None, None
+
+        target_device = traj_centers_tn3.device
+        history_centers_tn3 = history_centers_tn3.to(
+            device=target_device,
+        ).contiguous()
+        history_valid_tn = history_valid_tn.to(
+            device=target_device,
+            dtype=torch.bool,
+        ).contiguous()
+        history_ids = history_ids_n.to(
+            device=target_device,
+            dtype=torch.long,
+        ).contiguous()
+        traj_centers_tn3 = traj_centers_tn3.to(
+            device=target_device,
+        ).contiguous()
+        traj_valid_tn = traj_valid_tn.to(
+            device=target_device,
+            dtype=torch.bool,
+        ).contiguous()
+        traj_ids = traj_ids_n.to(
+            device=target_device,
+            dtype=torch.long,
+        ).contiguous()
+        shared_np = np.intersect1d(
+            history_ids.detach().cpu().numpy(),
+            traj_ids.detach().cpu().numpy(),
+            assume_unique=False,
+        )
+        if shared_np.size <= 0:
+            return None, None, None
+        shared_ids_n = torch.from_numpy(shared_np.astype(np.int64, copy=False)).to(
+            device=traj_ids.device,
+            dtype=torch.long,
+        ).contiguous()
+
+        history_centers_sel = self._reindex_temporal_tensor_by_instance_ids(
+            values_tn=history_centers_tn3,
+            instance_ids_n=history_ids,
+            target_ids_n=shared_ids_n,
+        )
+        history_valid_sel = self._reindex_temporal_tensor_by_instance_ids(
+            values_tn=history_valid_tn,
+            instance_ids_n=history_ids,
+            target_ids_n=shared_ids_n,
+        )
+        traj_centers_sel = self._reindex_temporal_tensor_by_instance_ids(
+            values_tn=traj_centers_tn3,
+            instance_ids_n=traj_ids,
+            target_ids_n=shared_ids_n,
+        )
+        traj_valid_sel = self._reindex_temporal_tensor_by_instance_ids(
+            values_tn=traj_valid_tn,
+            instance_ids_n=traj_ids,
+            target_ids_n=shared_ids_n,
+        )
+        if (
+            history_centers_sel is None
+            or history_valid_sel is None
+            or traj_centers_sel is None
+            or traj_valid_sel is None
+        ):
+            return None, None, None
+
+        past_only = history_centers_sel[:present_local_idx].contiguous()
+        past_valid = history_valid_sel[:present_local_idx].contiguous()
+        full_centers = torch.cat([past_only, traj_centers_sel], dim=0).contiguous()
+        full_valid = torch.cat([past_valid, traj_valid_sel], dim=0).contiguous()
+        active = full_valid.any(dim=0)
+        if not bool(active.any().item()):
+            return full_centers[:, :0, :].contiguous(), full_valid[:, :0].contiguous(), shared_ids_n[:0]
+        full_centers = full_centers[:, active, :].contiguous()
+        full_valid = full_valid[:, active].contiguous()
+        shared_ids_n = shared_ids_n[active].contiguous()
+        return full_centers, full_valid, shared_ids_n
 
     def _prepare_segmentation_instance3d(self, segmentation_instance3d=None):
         """

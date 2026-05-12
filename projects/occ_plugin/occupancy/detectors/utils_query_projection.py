@@ -263,7 +263,25 @@ class EfficientOCFQueryProjectionMixin:
             return None
 
         present_global_idx = int(getattr(self, "query_present_global_idx", int(self.time_receptive_field - 1)))
-        if bool(getattr(self, "query_present_only", False)):
+        # Three time-mapping regimes for output_frame_indices:
+        #   - history:  t_depth == time_receptive_field  -> [0, 1, ..., T_past-1]
+        #               (each past frame gets its own lifted center; this is the
+        #                new path enabled when the QueryHead projection is removed)
+        #   - present:  t_depth == 1                     -> [present_global_idx]
+        #               (legacy / inference compatibility path)
+        #   - future :  otherwise (query_present_only=False) ->
+        #               trailing window of n_future_frames_plus future frames
+        if (
+            bool(getattr(self, "query_present_only", False))
+            and t_depth == int(self.time_receptive_field)
+        ):
+            output_frame_indices = torch.arange(
+                0,
+                int(self.time_receptive_field),
+                device=query_attn_weights_tqnhw.device,
+                dtype=torch.long,
+            )
+        elif bool(getattr(self, "query_present_only", False)) and t_depth == 1:
             output_frame_indices = torch.full(
                 (t_depth,),
                 fill_value=present_global_idx,
@@ -517,7 +535,20 @@ class EfficientOCFQueryProjectionMixin:
             return out
 
         present_global_idx = int(getattr(self, "query_present_global_idx", int(self.time_receptive_field - 1)))
-        if bool(getattr(self, "query_present_only", False)):
+        # Mirror the regime in `_build_query_attn_soft_lift_pack`:
+        # history-mapping when t_query == time_receptive_field (3 past frames),
+        # present-only when t_query == 1, else future-pointing window.
+        if (
+            bool(getattr(self, "query_present_only", False))
+            and t_query == int(self.time_receptive_field)
+        ):
+            query_global_idx_t = torch.arange(
+                0,
+                int(self.time_receptive_field),
+                device=query_depth_logits_tqd.device,
+                dtype=torch.long,
+            )
+        elif bool(getattr(self, "query_present_only", False)) and t_query == 1:
             query_global_idx_t = torch.full(
                 (t_query,),
                 fill_value=present_global_idx,

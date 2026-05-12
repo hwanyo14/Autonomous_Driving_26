@@ -138,15 +138,20 @@ class QueryDepthHead(nn.Module):
     
 
 class TrajectoryHead(nn.Module):
-    def __init__(self, embed_dim=128, out_dim=8):
+    def __init__(self, input_dim=128, hidden_dim=128, out_dim=8):
         super(TrajectoryHead, self).__init__()
-        self.embed_dim = int(embed_dim)
+        self.input_dim = int(input_dim)
+        self.hidden_dim = int(hidden_dim)
         self.out_dim = int(out_dim)
+        if self.input_dim <= 0:
+            raise ValueError(f"input_dim must be positive, got {self.input_dim}")
+        if self.hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be positive, got {self.hidden_dim}")
         if self.out_dim <= 0:
             raise ValueError(f"out_dim must be positive, got {self.out_dim}")
         self.mlp = MLP(
-            in_dim=self.embed_dim,
-            hidden_dim=self.embed_dim,
+            in_dim=self.input_dim,
+            hidden_dim=self.hidden_dim,
             out_dim=self.out_dim,
             num_layers=2,
             dropout=0.0,
@@ -168,6 +173,7 @@ class QueryHead(nn.Module):
                  query_pred_num_frames=None,
                  query_traj_num_steps=0,
                  query_traj_residual_max_m=(8.0, 8.0),
+                 query_traj_prior_detach=True,
                  num_query_classes=3,
                  query_class_ids=None,
                  query_class_names=None,
@@ -208,7 +214,14 @@ class QueryHead(nn.Module):
         self.num_future_frames = num_future_frames
         self.num_overlap_frames = int(num_overlap_frames)
         self.query_present_only = bool(query_present_only)
-        if query_pred_num_frames is None:
+        # In present-only mode, query_pred_num_frames is overridden to num_past_frames:
+        # the projection module is removed and query_inst (shape [T_past, Q, D])
+        # is consumed directly so depth / 2D soft-argmax / 3D lifting can run on
+        # every past frame. The user-supplied query_pred_num_frames (legacy) is
+        # accepted for config compatibility but ignored in present-only mode.
+        if self.query_present_only:
+            self.query_pred_num_frames = int(num_past_frames)
+        elif query_pred_num_frames is None:
             self.query_pred_num_frames = int(num_future_frames)
         else:
             self.query_pred_num_frames = int(query_pred_num_frames)
@@ -216,17 +229,13 @@ class QueryHead(nn.Module):
             raise ValueError(
                 f"query_pred_num_frames must be >= 1, got {self.query_pred_num_frames}"
             )
-        if self.query_present_only and self.query_pred_num_frames != 1:
-            raise ValueError(
-                "query_present_only=True requires query_pred_num_frames=1, "
-                f"got {self.query_pred_num_frames}"
-            )
         self.query_traj_num_steps = int(query_traj_num_steps)
         if self.query_traj_num_steps < 0:
             raise ValueError(
                 f"query_traj_num_steps must be >= 0, got {self.query_traj_num_steps}"
             )
         self.query_traj_residual_max_m = tuple(float(v) for v in query_traj_residual_max_m)
+        self.query_traj_prior_detach = bool(query_traj_prior_detach)
         if len(self.query_traj_residual_max_m) != 2:
             raise ValueError(
                 "query_traj_residual_max_m must be (x,y), "
@@ -368,12 +377,12 @@ class QueryHead(nn.Module):
                 f"num_overlap_frames({self.num_overlap_frames}) exceeds num_past_frames({self.num_past_frames})"
             )
 
-        self.query_projection = nn.Sequential(
-            nn.LayerNorm(self.embed_dim * self.num_past_frames),
-            nn.Linear(self.embed_dim * self.num_past_frames, self.embed_dim),
-            nn.GELU(),
-            nn.Linear(self.embed_dim, self.embed_dim * self.query_pred_num_frames)
-        )
+        # NOTE: The temporal projection module (3-past-frames -> T_pred frames) has
+        # been removed. The transformer's last layer is already an FFN+LN, and we
+        # now consume query_inst directly as [T_past, Q, D] in forward(). The
+        # legacy projection collapsed past frames into a single present frame and
+        # blocked depth / 2D soft-argmax / 3D lifting from running on past frames,
+        # which is exactly what we need for trajectory motion priors.
 
         self.center_head = CenterHead(embed_dim=self.embed_dim,
                                       out_dim=center_out_dim)
@@ -400,9 +409,14 @@ class QueryHead(nn.Module):
             out_dim=self.query_depth_num_bins,
         )
         self.query_traj_head = None
+        self.query_traj_input_steps = max(0, int(self.num_past_frames) - 1) + max(
+            0, int(self.query_traj_num_steps)
+        )
+        self.query_traj_input_dim = int(self.embed_dim) + 2
         if self.query_traj_num_steps > 0:
             self.query_traj_head = TrajectoryHead(
-                embed_dim=self.embed_dim,
+                input_dim=(self.query_traj_input_steps * self.query_traj_input_dim),
+                hidden_dim=self.embed_dim,
                 out_dim=(self.query_traj_num_steps * 2),
             )
 
@@ -414,16 +428,8 @@ class QueryHead(nn.Module):
                 # if center_last.bias is not None:
                     # center_last.bias.mul_(4.0)
 
-    def _project_query_tokens(self, query_inst: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            query_inst: [T_past, Q, D]
-        Returns:
-            query_feat_tqd: [T_pred, Q, D]
-              where T_pred = self.query_pred_num_frames.
-              In query_present_only=True mode, T_pred == 1 and local index 0
-              corresponds to global frame index (time_receptive_field - 1) == t.
-        """
+    def _validate_query_inst_shape(self, query_inst: torch.Tensor) -> None:
+        """Shape checks for the [T_past, Q, D] queries consumed in forward()."""
         if query_inst.dim() != 3:
             raise ValueError(
                 f"query_inst must be [T,Q,D], got {tuple(query_inst.shape)}"
@@ -439,22 +445,107 @@ class QueryHead(nn.Module):
                 f"expected embed_dim={int(self.embed_dim)}"
             )
 
-        q = query_inst.permute(1, 0, 2).contiguous()  # [Q, T_past, D]
-        q = q.reshape(q.shape[0], -1)                  # [Q, T_past*D]
-        q = self.query_projection(q)                   # [Q, T_pred*D]
-        q = q.reshape(q.shape[0], self.query_pred_num_frames, self.embed_dim)
-        q = q.permute(1, 0, 2).contiguous()            # [T_pred, Q, D]
-        return q
-
     def _resolve_present_query_local_idx(self, t_pred: int) -> int:
         t_pred = int(t_pred)
         if t_pred <= 0:
             return 0
+        # query_feat_tqd is now query_inst itself ([T_past, Q, D]); the present
+        # frame is the last past frame (global index time_receptive_field - 1).
         if bool(self.query_present_only):
-            return 0
+            return max(0, t_pred - 1)
         if int(self.num_overlap_frames) > 0:
             return max(0, min(t_pred - 1, int(self.num_overlap_frames) - 1))
         return max(0, min(t_pred - 1, int(self.num_past_frames) - 1))
+
+    def _build_query_trajectory_input(
+        self,
+        query_feat_tqd: torch.Tensor,
+        centers_world_tq3: torch.Tensor,
+    ):
+        if self.query_traj_head is None:
+            return None
+        if (not torch.is_tensor(query_feat_tqd)) or query_feat_tqd.dim() != 3:
+            raise ValueError("query_feat_tqd must be [T,Q,D] for trajectory input")
+        if (not torch.is_tensor(centers_world_tq3)) or centers_world_tq3.dim() != 3:
+            raise ValueError("centers_world_tq3 must be [T,Q,3] for trajectory input")
+        if tuple(query_feat_tqd.shape[:2]) != tuple(centers_world_tq3.shape[:2]):
+            raise ValueError(
+                "trajectory query feature / center shape mismatch: "
+                f"{tuple(query_feat_tqd.shape)} vs {tuple(centers_world_tq3.shape)}"
+            )
+
+        t_count = int(query_feat_tqd.shape[0])
+        q_count = int(query_feat_tqd.shape[1])
+        if t_count <= 0 or q_count <= 0:
+            return None
+
+        present_local_idx = self._resolve_present_query_local_idx(t_count)
+        if present_local_idx >= t_count:
+            return None
+
+        hist_feat_tqd = query_feat_tqd[:present_local_idx]
+        present_feat_qd = query_feat_tqd[present_local_idx]
+        future_feat_tqd = present_feat_qd.unsqueeze(0).expand(
+            int(self.query_traj_num_steps), -1, -1
+        )
+        motion_feat_tqd = torch.cat([hist_feat_tqd, future_feat_tqd], dim=0).to(torch.float32)
+
+        prior_offsets_tq2 = centers_world_tq3[1:(present_local_idx + 1), :, :2] - centers_world_tq3[
+            :present_local_idx, :, :2
+        ]
+        if bool(self.query_traj_prior_detach):
+            prior_offsets_tq2 = prior_offsets_tq2.detach()
+        prior_offsets_tq2 = prior_offsets_tq2.to(device=query_feat_tqd.device, dtype=torch.float32)
+
+        future_prior_tq2 = query_feat_tqd.new_zeros(
+            (int(self.query_traj_num_steps), q_count, 2),
+            dtype=query_feat_tqd.dtype,
+        ).to(torch.float32)
+        motion_prior_tq2 = torch.cat([prior_offsets_tq2, future_prior_tq2], dim=0)
+
+        if int(motion_feat_tqd.shape[0]) != int(self.query_traj_input_steps):
+            raise ValueError(
+                "unexpected trajectory feature timeline length: "
+                f"{int(motion_feat_tqd.shape[0])} vs expected {int(self.query_traj_input_steps)}"
+            )
+        if tuple(motion_feat_tqd.shape[:2]) != tuple(motion_prior_tq2.shape[:2]):
+            raise ValueError(
+                "trajectory feature / prior time-query mismatch: "
+                f"{tuple(motion_feat_tqd.shape)} vs {tuple(motion_prior_tq2.shape)}"
+            )
+
+        traj_max_xy = query_feat_tqd.new_tensor(self.query_traj_residual_max_m).view(1, 1, 2).to(torch.float32)
+        motion_prior_tq2 = motion_prior_tq2 / traj_max_xy.clamp_min(1e-6)
+        motion_prior_tq2 = motion_prior_tq2.clamp(min=-1.0, max=1.0)
+        return torch.cat([motion_feat_tqd, motion_prior_tq2], dim=-1).contiguous()
+
+    def _predict_trajectory_from_inputs(
+        self,
+        motion_input_tqd2: torch.Tensor,
+        query_feat_tqd: torch.Tensor,
+    ):
+        if self.query_traj_head is None or motion_input_tqd2 is None:
+            return None, None
+        if (not torch.is_tensor(motion_input_tqd2)) or motion_input_tqd2.dim() != 3:
+            raise ValueError("motion_input_tqd2 must be [S,Q,D+2]")
+        s_count, q_count, d_count = [int(v) for v in motion_input_tqd2.shape]
+        if s_count != int(self.query_traj_input_steps):
+            raise ValueError(
+                f"trajectory input step mismatch: {s_count} vs {int(self.query_traj_input_steps)}"
+            )
+        if d_count != int(self.query_traj_input_dim):
+            raise ValueError(
+                f"trajectory input dim mismatch: {d_count} vs {int(self.query_traj_input_dim)}"
+            )
+        motion_input_qsd = motion_input_tqd2.permute(1, 0, 2).contiguous()
+        motion_input_qd = motion_input_qsd.reshape(q_count, s_count * d_count)
+        traj_logits_qf2 = self.query_traj_head(motion_input_qd).reshape(
+            q_count, int(self.query_traj_num_steps), 2
+        )
+        traj_logits_fq2 = traj_logits_qf2.permute(1, 0, 2).contiguous()
+        traj_max_xy = query_feat_tqd.new_tensor(self.query_traj_residual_max_m).view(1, 1, 2)
+        traj_offsets_fq2 = torch.tanh(traj_logits_fq2) * traj_max_xy
+        return traj_logits_fq2, traj_offsets_fq2
 
     @staticmethod
     def _resolve_center_branch_input(
@@ -481,6 +572,27 @@ class QueryHead(nn.Module):
         center_input_tqd: torch.Tensor,
         centers_world: torch.Tensor,
     ):
+        """
+        Predict Gaussian-mixture parameters ONCE from a single frame's feature
+        and broadcast the same mixture across every time slot in centers_world.
+
+        Args:
+            center_input_tqd: [T, Q, D] center-branch feature. The slice at
+                `present_local_idx = T - 1` (last past frame, i.e. current frame
+                in present-only mode) is used as the sole input to the Gaussian
+                heads — this captures the "predict gaussian once at [t]" rule.
+            centers_world:    [T, Q, 3] per-frame anchor centers (e.g. 3D-lifted
+                centers, one per past frame). The shared mixture offsets are
+                added to each frame's center so that each past frame gets the
+                same Gaussian shape located at its own anchor.
+
+        Returns:
+            query_sigma_world_tq3:        [T, Q, 3]
+            mixture_centers_world_tqg3:   [T, Q, G, 3]   (per-frame placement)
+            mixture_sigmas_world_tqg3:    [T, Q, G, 3]   (shared across T)
+            mixture_yaw_tqg:              [T, Q, G]      (shared across T)
+            mixture_weights_tqg:          [T, Q, G]      (shared across T)
+        """
         query_sigma_world_tq3 = None
         mixture_centers_world_tqg3 = None
         mixture_sigmas_world_tqg3 = None
@@ -497,31 +609,43 @@ class QueryHead(nn.Module):
             )
 
         t_count, q_count = int(center_input_tqd.shape[0]), int(center_input_tqd.shape[1])
+        if t_count <= 0 or q_count <= 0:
+            return (
+                query_sigma_world_tq3,
+                mixture_centers_world_tqg3,
+                mixture_sigmas_world_tqg3,
+                mixture_yaw_tqg,
+                mixture_weights_tqg,
+            )
         g_count = int(self.query_num_gaussians)
 
-        offset_logits = self.gaussian_offset_head(center_input_tqd).reshape(t_count, q_count, g_count, 3)
-        sigma_logits = self.gaussian_sigma_head(center_input_tqd).reshape(t_count, q_count, g_count, 3)
-        yaw_basis_logits = self.gaussian_yaw_head(center_input_tqd).reshape(t_count, q_count, g_count, 2)
-        weight_logits = self.gaussian_weight_head(center_input_tqd).reshape(t_count, q_count, g_count)
+        # Run the four Gaussian heads on the present-frame feature only.
+        present_local_idx = self._resolve_present_query_local_idx(t_count)
+        center_input_qd = center_input_tqd[present_local_idx]  # [Q, D]
 
-        off_max = centers_world.new_tensor(self.query_multi_gaussian_offset_max_m).view(1, 1, 1, 3)
-        offsets_world_tqg3 = torch.tanh(offset_logits) * off_max
+        offset_logits_qg3 = self.gaussian_offset_head(center_input_qd).reshape(q_count, g_count, 3)
+        sigma_logits_qg3 = self.gaussian_sigma_head(center_input_qd).reshape(q_count, g_count, 3)
+        yaw_basis_logits_qg2 = self.gaussian_yaw_head(center_input_qd).reshape(q_count, g_count, 2)
+        weight_logits_qg = self.gaussian_weight_head(center_input_qd).reshape(q_count, g_count)
 
-        mixture_sigmas_world_tqg3 = sigmoid_to_sigma_from_range(
-            sigma_logits,
+        off_max = centers_world.new_tensor(self.query_multi_gaussian_offset_max_m).view(1, 1, 3)
+        offsets_world_qg3 = torch.tanh(offset_logits_qg3) * off_max
+
+        sigmas_world_qg3 = sigmoid_to_sigma_from_range(
+            sigma_logits_qg3,
             sigma_min=self.query_multi_gaussian_sigma_min_m,
             sigma_max=self.query_multi_gaussian_sigma_max_m,
         )
 
-        yaw_basis = F.normalize(yaw_basis_logits, dim=-1, eps=1e-6)
-        mixture_yaw_tqg = torch.atan2(yaw_basis[..., 0], yaw_basis[..., 1])
+        yaw_basis_qg2 = F.normalize(yaw_basis_logits_qg2, dim=-1, eps=1e-6)
+        yaw_qg = torch.atan2(yaw_basis_qg2[..., 0], yaw_basis_qg2[..., 1])
 
         if self.query_multi_gaussian_weight_mode == "softmax":
-            mixture_weights_tqg = torch.softmax(weight_logits, dim=-1)
-            mixture_weights_surrogate_tqg = mixture_weights_tqg
+            weights_qg = torch.softmax(weight_logits_qg, dim=-1)
+            weights_surrogate_qg = weights_qg
         elif self.query_multi_gaussian_weight_mode == "softplus":
-            mixture_weights_tqg = F.softplus(weight_logits)
-            mixture_weights_surrogate_tqg = mixture_weights_tqg / mixture_weights_tqg.sum(
+            weights_qg = F.softplus(weight_logits_qg)
+            weights_surrogate_qg = weights_qg / weights_qg.sum(
                 dim=-1, keepdim=True
             ).clamp_min(1e-6)
         else:
@@ -529,14 +653,22 @@ class QueryHead(nn.Module):
                 f"Unsupported query_multi_gaussian_weight_mode={self.query_multi_gaussian_weight_mode!r}"
             )
 
-        mixture_centers_world_tqg3 = centers_world.unsqueeze(2) + offsets_world_tqg3
+        # Broadcast the shared mixture to each frame:
+        # - mixture centers move with the per-frame anchor (lifted center).
+        # - sigmas/yaw/weights are identical across the T frames.
+        mixture_centers_world_tqg3 = centers_world.unsqueeze(2) + offsets_world_qg3.unsqueeze(0)
         pc_min_g = centers_world.new_tensor(self.point_cloud_range[:3]).view(1, 1, 1, 3)
         pc_max_g = centers_world.new_tensor(self.point_cloud_range[3:]).view(1, 1, 1, 3)
         mixture_centers_world_tqg3 = torch.max(torch.min(mixture_centers_world_tqg3, pc_max_g), pc_min_g)
 
+        mixture_sigmas_world_tqg3 = sigmas_world_qg3.unsqueeze(0).expand(t_count, -1, -1, -1).contiguous()
+        mixture_yaw_tqg = yaw_qg.unsqueeze(0).expand(t_count, -1, -1).contiguous()
+        mixture_weights_tqg = weights_qg.unsqueeze(0).expand(t_count, -1, -1).contiguous()
+        weights_surrogate_tqg = weights_surrogate_qg.unsqueeze(0).expand(t_count, -1, -1).contiguous()
+
         effective_offset_tqg3 = mixture_centers_world_tqg3 - centers_world.unsqueeze(2)
         moment2_tq3 = (
-            mixture_weights_surrogate_tqg.unsqueeze(-1)
+            weights_surrogate_tqg.unsqueeze(-1)
             * (mixture_sigmas_world_tqg3.pow(2) + effective_offset_tqg3.pow(2))
         ).sum(dim=2)
         query_sigma_world_tq3 = torch.sqrt(moment2_tq3.clamp_min(1e-8))
@@ -587,6 +719,19 @@ class QueryHead(nn.Module):
             mixture_weights_tqg,
         ) = self._compute_gaussian_outputs(center_input_tqd, centers_world)
 
+        traj_motion_input_tqd2 = None
+        traj_logits_fq2 = None
+        traj_offsets_fq2 = None
+        if self.query_traj_head is not None:
+            traj_motion_input_tqd2 = self._build_query_trajectory_input(
+                query_feat_tqd=query_feat_tqd,
+                centers_world_tq3=centers_world,
+            )
+            traj_logits_fq2, traj_offsets_fq2 = self._predict_trajectory_from_inputs(
+                motion_input_tqd2=traj_motion_input_tqd2,
+                query_feat_tqd=query_feat_tqd,
+            )
+
         outputs = dict(outputs)
         outputs.update({
             "centers_world_tq3": centers_world,
@@ -596,6 +741,11 @@ class QueryHead(nn.Module):
             "mixture_sigmas_world_tqg3": mixture_sigmas_world_tqg3,
             "mixture_yaw_tqg": mixture_yaw_tqg,
             "mixture_weights_tqg": mixture_weights_tqg,
+            "traj_motion_input_tqd2": traj_motion_input_tqd2,
+            "traj_logits_fq2": traj_logits_fq2,
+            "traj_offsets_fq2": traj_offsets_fq2,
+            "query_traj_logits_fq2": traj_logits_fq2,
+            "query_traj_offsets_fq2": traj_offsets_fq2,
             "centers_world": centers_world,
             "center_logits": center_logits,
             "gaussian_sigmas_world": query_sigma_world_tq3,
@@ -610,17 +760,15 @@ class QueryHead(nn.Module):
         """
         Build one class feature per query from the unique temporal support.
 
-        Plus-window semantics (query_present_only=False):
+        Present-only semantics (query_present_only=True):
+        - query_inst and query_future_feat are the same tensor [T_past, Q, D]
+          since the projection module was removed. Average over the past
+          temporal axis to produce a single context-aware class feature.
+
+        Plus-window semantics (query_present_only=False, legacy):
         - input 3       : (t-2, t-1, t)
         - output T_pred : (t-1, t, t+1, ...)
         - Overlap with input excluded via num_overlap_frames.
-
-        Present-only semantics (query_present_only=True, T_pred=1):
-        - input 3       : (t-2, t-1, t)
-        - output 1      : (t)
-        - With num_overlap_frames=1, prefix = (t-2, t-1) and the concatenation
-          becomes [t-2, t-1, t], i.e. context-augmented present classification
-          feature (option b in the implementation plan).
         """
         if query_inst_tqd.dim() != 3 or query_future_feat_tqd.dim() != 3:
             raise ValueError("query_inst_tqd and query_future_feat_tqd must be [T,Q,D].")
@@ -629,6 +777,10 @@ class QueryHead(nn.Module):
                 "query_inst_tqd and query_future_feat_tqd must share [Q,D], got "
                 f"{tuple(query_inst_tqd.shape)} vs {tuple(query_future_feat_tqd.shape)}"
             )
+        if bool(self.query_present_only):
+            # query_future_feat_tqd == query_inst_tqd ([T_past, Q, D]); a single
+            # mean over the past axis already gives a context-augmented feature.
+            return query_future_feat_tqd.to(torch.float32).mean(dim=0)
         prefix_len = max(0, int(self.num_past_frames) - int(self.num_overlap_frames))
         temporal_chunks = []
         if prefix_len > 0:
@@ -1219,7 +1371,11 @@ class QueryHead(nn.Module):
                 - True: center/gaussian branch uses detached query features.
                 - None: uses self.detach_query_for_center_default.
         '''
-        query_feat_tqd = self._project_query_tokens(query_inst)
+        self._validate_query_inst_shape(query_inst)
+        # Consume query_inst directly as the per-past-frame feature [T_past, Q, D].
+        # All downstream branches (depth, center, gaussian, traj, cls) now see one
+        # feature slot per past frame instead of a single projected present slot.
+        query_feat_tqd = query_inst
         if detach_query_for_center is None:
             detach_query_for_center = bool(self.detach_query_for_center_default)
         center_input_tqd = self._resolve_center_branch_input(
@@ -1232,21 +1388,14 @@ class QueryHead(nn.Module):
         query_cls_logits_qc = self.cls_head(query_cls_feat_qd)  # [Q,C]
         query_cls_scores_qc = torch.softmax(query_cls_logits_qc, dim=-1)
         query_cls_scores_tqc = query_cls_scores_qc.unsqueeze(0).expand(
-            int(self.query_pred_num_frames), -1, -1
+            int(query_feat_tqd.shape[0]), -1, -1
         )
         query_present_local_idx = self._resolve_present_query_local_idx(
             int(query_feat_tqd.shape[0])
         )
         traj_logits_fq2 = None
         traj_offsets_fq2 = None
-        if self.query_traj_head is not None:
-            present_feat_qd = query_feat_tqd[query_present_local_idx].to(torch.float32)
-            traj_logits_qf2 = self.query_traj_head(present_feat_qd).reshape(
-                int(present_feat_qd.shape[0]), int(self.query_traj_num_steps), 2
-            )
-            traj_logits_fq2 = traj_logits_qf2.permute(1, 0, 2).contiguous()
-            traj_max_xy = query_feat_tqd.new_tensor(self.query_traj_residual_max_m).view(1, 1, 2)
-            traj_offsets_fq2 = torch.tanh(traj_logits_fq2) * traj_max_xy
+        traj_motion_input_tqd2 = None
 
         centers_world = None
         center_logits = None
@@ -1270,6 +1419,15 @@ class QueryHead(nn.Module):
                 mixture_yaw_tqg,
                 mixture_weights_tqg,
             ) = self._compute_gaussian_outputs(center_input_tqd, centers_world)
+            if self.query_traj_head is not None:
+                traj_motion_input_tqd2 = self._build_query_trajectory_input(
+                    query_feat_tqd=query_feat_tqd,
+                    centers_world_tq3=centers_world,
+                )
+                traj_logits_fq2, traj_offsets_fq2 = self._predict_trajectory_from_inputs(
+                    motion_input_tqd2=traj_motion_input_tqd2,
+                    query_feat_tqd=query_feat_tqd,
+                )
 
         outputs = {
             "centers_world_tq3": centers_world,
@@ -1286,6 +1444,7 @@ class QueryHead(nn.Module):
             "query_depth_probs_tqd": query_depth_probs_tqd,
             "query_feat_tqd": query_feat_tqd,
             "query_present_local_idx": int(query_present_local_idx),
+            "traj_motion_input_tqd2": traj_motion_input_tqd2,
             "traj_logits_fq2": traj_logits_fq2,
             "traj_offsets_fq2": traj_offsets_fq2,
             "query_traj_logits_fq2": traj_logits_fq2,

@@ -123,19 +123,6 @@ class EfficientOCFLossMixin:
 
         gt_sel = None
         gt_valid_sel = None
-        if bool(getattr(self, "query_present_only", False)):
-            q_sel = query_feat_tqd[:1].contiguous()
-            present_hist_idx = max(0, int(getattr(self, "time_receptive_field", 1)) - 1)
-            if torch.is_tensor(gt_feat_tnd) and gt_feat_tnd.dim() == 3 and int(gt_feat_tnd.shape[0]) > 0:
-                src_idx = max(0, min(int(gt_feat_tnd.shape[0]) - 1, present_hist_idx))
-                gt_sel = gt_feat_tnd.narrow(0, src_idx, 1).contiguous()
-            if torch.is_tensor(gt_valid_tn) and gt_valid_tn.dim() == 2 and int(gt_valid_tn.shape[0]) > 0:
-                src_idx = max(0, min(int(gt_valid_tn.shape[0]) - 1, present_hist_idx))
-                gt_valid_sel = gt_valid_tn.narrow(0, src_idx, 1).contiguous()
-                if gt_sel is not None and int(gt_sel.shape[0]) != int(gt_valid_sel.shape[0]):
-                    gt_sel = gt_sel[: int(gt_valid_sel.shape[0])].contiguous()
-            return q_sel, gt_sel, gt_valid_sel
-
         if torch.is_tensor(gt_feat_tnd) and gt_feat_tnd.dim() == 3 and int(gt_feat_tnd.shape[0]) > 0:
             t = min(int(query_feat_tqd.shape[0]), int(gt_feat_tnd.shape[0]))
             gt_sel = gt_feat_tnd[:t].contiguous()
@@ -313,6 +300,7 @@ class EfficientOCFLossMixin:
         inst_match_result: dict = None,
         loss_weight: float = 1.0,
         loss_type: str = "l1",
+        present_local_idx: int = 0,
         moving_reweight_enabled: bool = False,
         moving_threshold_m: float = 0.5,
         moving_weight: float = 5.0,
@@ -351,7 +339,8 @@ class EfficientOCFLossMixin:
         T, Q, _ = [int(v) for v in centers_world_tq3.shape]
         Tg, N, _ = [int(v) for v in gt_centers_tn3.shape]
         t_match = min(T, Tg, int(gt_valid_tn.shape[0]))
-        if t_match <= 1:
+        present_local_idx = max(0, min(t_match - 1, int(present_local_idx)))
+        if t_match <= (present_local_idx + 1):
             return None
 
         mq = matched_query_idx.to(device=centers_world_tq3.device, dtype=torch.long)
@@ -364,14 +353,14 @@ class EfficientOCFLossMixin:
         if mq.numel() <= 0:
             return None
 
-        pred_tk2 = centers_world_tq3[1:t_match].index_select(1, mq).to(torch.float32)[..., :2]
-        gt_tk2 = gt_centers_tn3[1:t_match].to(
+        pred_tk2 = centers_world_tq3[(present_local_idx + 1):t_match].index_select(1, mq).to(torch.float32)[..., :2]
+        gt_tk2 = gt_centers_tn3[(present_local_idx + 1):t_match].to(
             device=centers_world_tq3.device, dtype=torch.float32
         ).index_select(1, mi)[..., :2]
-        valid_tk = gt_valid_tn[1:t_match].to(
+        valid_tk = gt_valid_tn[(present_local_idx + 1):t_match].to(
             device=centers_world_tq3.device, dtype=torch.bool
         ).index_select(1, mi)
-        present_valid_k = gt_valid_tn[0].to(
+        present_valid_k = gt_valid_tn[present_local_idx].to(
             device=centers_world_tq3.device, dtype=torch.bool
         ).index_select(0, mi)
         valid_tk = valid_tk & present_valid_k.unsqueeze(0)
@@ -386,7 +375,7 @@ class EfficientOCFLossMixin:
             err_tk = torch.abs(pred_tk2 - gt_tk2).sum(dim=-1)
 
         traj_weight_tk = torch.ones_like(valid_f)
-        gt_present_k2 = gt_centers_tn3[0].to(
+        gt_present_k2 = gt_centers_tn3[present_local_idx].to(
             device=centers_world_tq3.device, dtype=torch.float32
         ).index_select(0, mi)[..., :2]
         motion_mag_tk = torch.norm(gt_tk2 - gt_present_k2.unsqueeze(0), p=2, dim=-1)

@@ -568,16 +568,6 @@ class EfficientOCFVisualizationMixin:
         candidate_limit = min(int(mq.numel()), max(max_queries, max_queries * 4))
         attn_src = attn_src_idx_t[:t_count].to(device=query_attn_weights_tqnhw.device, dtype=torch.long)
         output_global_idx_t = output_global_idx_t[:t_count].to(device=query_attn_weights_tqnhw.device, dtype=torch.long)
-        if bool(getattr(self, "query_present_only", False)):
-            keep_present = output_global_idx_t == int(present_global_idx)
-            if bool(keep_present.any().item()):
-                keep_idx = torch.nonzero(keep_present, as_tuple=False).squeeze(1)
-                keep_idx = keep_idx[:1]
-            else:
-                keep_idx = output_global_idx_t.new_tensor([0], dtype=torch.long)
-            attn_src = attn_src.index_select(0, keep_idx)
-            output_global_idx_t = output_global_idx_t.index_select(0, keep_idx)
-            t_count = int(attn_src.numel())
         attn_src = attn_src.clamp(min=0, max=max(0, t_attn - 1))
         attn_for_rank = query_attn_weights_tqnhw.index_select(0, attn_src).index_select(1, mq)[:, :, :n_cam]
         rank_score = attn_for_rank.to(torch.float32).amax(dim=(0, 2, 3, 4))
@@ -589,9 +579,7 @@ class EfficientOCFVisualizationMixin:
         gt_t_total = int(gt_t_src.shape[0])
         if gt_source_start_global is None:
             seq_total = int(imgs_seq.shape[1])
-            if bool(getattr(self, "query_present_only", False)) and gt_t_total == 1:
-                gt_source_start_global = int(present_global_idx)
-            elif gt_t_total >= seq_total:
+            if gt_t_total >= seq_total:
                 gt_source_start_global = 0
             elif gt_t_total >= int(self.n_future_frames_plus):
                 gt_source_start_global = int(
@@ -649,7 +637,10 @@ class EfficientOCFVisualizationMixin:
         if not bool(gt_valid_tkn.any().item()):
             return _bail("skip: projected GT CAM masks have no valid matched entries")
 
-        max_frames = max(1, int(getattr(self, "debug_query_attn_softargmax_vis_max_frames", 2)))
+        max_frames = max(
+            int(getattr(self, "time_receptive_field", 1)),
+            int(getattr(self, "debug_query_attn_softargmax_vis_max_frames", 2)),
+        )
         max_cams = max(1, int(getattr(self, "debug_query_attn_softargmax_vis_max_cams", 3)))
         frame_score = gt_valid_tkn.to(torch.float32).sum(dim=(1, 2))
         frame_order = torch.argsort(frame_score, descending=True).tolist()

@@ -294,6 +294,25 @@ class EfficientOCFMatcherMixin:
                    / valid_count_qn.clamp_min(1.0))
         return cost_qn, valid_pair_qn
 
+    @staticmethod
+    def _resolve_temporal_cost_frame_indices(
+        frame_indices,
+        t_limit: int,
+    ):
+        t_limit = int(t_limit)
+        if t_limit <= 0:
+            return None
+        if frame_indices is None:
+            return None
+        if torch.is_tensor(frame_indices):
+            idx_list = [int(v) for v in frame_indices.reshape(-1).tolist()]
+        else:
+            idx_list = [int(v) for v in frame_indices]
+        idx_list = [idx for idx in idx_list if 0 <= int(idx) < t_limit]
+        if len(idx_list) <= 0:
+            return None
+        return idx_list
+
     def _match_queries_to_gt_instances(
         self,
         centers_world: torch.Tensor,
@@ -325,6 +344,7 @@ class EfficientOCFMatcherMixin:
         query_attn_match_pred_norm: str = "amax",
         query_attn_match_eps: float = 1e-6,
         query_center_match_frame_idx: int = None,
+        query_temporal_cost_frame_indices=None,
     ):
         match_result = self._build_empty_match_result(device=centers_world.device)
 
@@ -498,33 +518,140 @@ class EfficientOCFMatcherMixin:
             int(match_gt_center_tn3.shape[0]),
             int(match_valid_tn.shape[0]),
         )
+        temporal_cost_idx = self._resolve_temporal_cost_frame_indices(
+            query_temporal_cost_frame_indices,
+            t_center,
+        )
         if t_center > 0:
-            if query_center_match_frame_idx is not None:
+            if temporal_cost_idx is not None:
+                pred_center_tq3 = centers_world.index_select(
+                    0,
+                    torch.as_tensor(temporal_cost_idx, device=centers_world.device, dtype=torch.long),
+                ).to(torch.float32)
+                gt_center_tn3 = match_gt_center_tn3.index_select(
+                    0,
+                    torch.as_tensor(temporal_cost_idx, device=centers_world.device, dtype=torch.long),
+                ).to(torch.float32)
+                gt_center_valid_tn = match_valid_tn.index_select(
+                    0,
+                    torch.as_tensor(temporal_cost_idx, device=centers_world.device, dtype=torch.long),
+                ).to(device=centers_world.device, dtype=torch.bool)
+                center_l1_tqn = torch.abs(
+                    pred_center_tq3[:, :, None, :] - gt_center_tn3[:, None, :, :]
+                ).sum(dim=-1)
+                center_valid_t1n = gt_center_valid_tn.to(torch.float32)[:, None, :]
+                center_num_qn = (center_l1_tqn * center_valid_t1n).sum(dim=0)
+                center_den_qn = center_valid_t1n.sum(dim=0)
+                center_valid_qn = center_den_qn > 0.0
+                bev_diag_m = float(np.hypot(float(self.spatial_extent3d[0]), float(self.spatial_extent3d[1])))
+                bev_diag_m = max(1e-6, bev_diag_m)
+                center_cost_qn = (center_num_qn / center_den_qn.clamp_min(1.0) / bev_diag_m).clamp(0.0, 2.0)
+                if center_cost_w > 0.0:
+                    center_contrib_qn = center_cost_w * center_cost_qn * center_valid_qn.to(cost_qn.dtype)
+                    cost_qn = cost_qn + center_contrib_qn
+            elif query_center_match_frame_idx is not None:
                 preferred_center_idx = int(query_center_match_frame_idx)
-            elif bool(getattr(self, "query_present_only", False)):
-                preferred_center_idx = 0
-            else:
-                preferred_center_idx = int(getattr(self, "eval_start_moment", t_center - 1))
-            preferred_center_idx = max(0, min(t_center - 1, preferred_center_idx))
-            center_frame_idx = preferred_center_idx
-            pred_center_q3 = centers_world[center_frame_idx].to(torch.float32)
-            gt_center_n3 = match_gt_center_tn3[center_frame_idx].to(torch.float32)
-            gt_center_valid_n = match_valid_tn[center_frame_idx].to(
-                device=centers_world.device, dtype=torch.bool
-            )
-            center_l1_qn = torch.abs(
-                pred_center_q3[:, None, :] - gt_center_n3[None, :, :]
-            ).sum(dim=-1)
-            bev_diag_m = float(np.hypot(float(self.spatial_extent3d[0]), float(self.spatial_extent3d[1])))
-            bev_diag_m = max(1e-6, bev_diag_m)
-            center_cost_qn = (center_l1_qn / bev_diag_m).clamp(0.0, 2.0)
-            center_pair_valid_qn = gt_center_valid_n[None, :].expand_as(center_cost_qn)
-            if center_cost_w > 0.0:
-                center_contrib_qn = center_cost_w * center_cost_qn * center_pair_valid_qn.to(cost_qn.dtype)
-                cost_qn = cost_qn + center_contrib_qn
+                preferred_center_idx = max(0, min(t_center - 1, preferred_center_idx))
+                center_frame_idx = preferred_center_idx
+                pred_center_q3 = centers_world[center_frame_idx].to(torch.float32)
+                gt_center_n3 = match_gt_center_tn3[center_frame_idx].to(torch.float32)
+                gt_center_valid_n = match_valid_tn[center_frame_idx].to(
+                    device=centers_world.device, dtype=torch.bool
+                )
+                center_l1_qn = torch.abs(
+                    pred_center_q3[:, None, :] - gt_center_n3[None, :, :]
+                ).sum(dim=-1)
+                bev_diag_m = float(np.hypot(float(self.spatial_extent3d[0]), float(self.spatial_extent3d[1])))
+                bev_diag_m = max(1e-6, bev_diag_m)
+                center_cost_qn = (center_l1_qn / bev_diag_m).clamp(0.0, 2.0)
+                center_pair_valid_qn = gt_center_valid_n[None, :].expand_as(center_cost_qn)
+                if center_cost_w > 0.0:
+                    center_contrib_qn = center_cost_w * center_cost_qn * center_pair_valid_qn.to(cost_qn.dtype)
+                    cost_qn = cost_qn + center_contrib_qn
 
         bev_dice_cost_qn = None
         bev_dice_contrib_qn = torch.zeros_like(cost_feat_qn)
+        bev_dice_cost_w = float(query_bev_dice_cost_weight)
+        if (
+            bev_dice_cost_w > 0.0
+            and torch.is_tensor(gt_instance_occ3d_txyz)
+            and torch.is_tensor(match_ids_n)
+            and match_ids_n.numel() > 0
+        ):
+            if temporal_cost_idx is not None:
+                frame_idx_t = torch.as_tensor(
+                    temporal_cost_idx,
+                    device=centers_world.device,
+                    dtype=torch.long,
+                )
+                bev_centers_tq3 = centers_world.index_select(0, frame_idx_t)
+                bev_valid_tn = match_valid_tn.index_select(0, frame_idx_t)
+                gt_occ_cost_txyz = gt_instance_occ3d_txyz.index_select(0, frame_idx_t.to(gt_instance_occ3d_txyz.device))
+                bev_sigmas_tq3 = (
+                    query_sigmas_world_tq3.index_select(0, frame_idx_t)
+                    if torch.is_tensor(query_sigmas_world_tq3)
+                    and tuple(query_sigmas_world_tq3.shape[:2]) == tuple(centers_world.shape[:2])
+                    else None
+                )
+                bev_mix_centers_tqg3 = (
+                    query_mixture_centers_world_tqg3.index_select(0, frame_idx_t)
+                    if torch.is_tensor(query_mixture_centers_world_tqg3)
+                    and int(query_mixture_centers_world_tqg3.shape[0]) == int(centers_world.shape[0])
+                    else None
+                )
+                bev_mix_sigmas_tqg3 = (
+                    query_mixture_sigmas_world_tqg3.index_select(0, frame_idx_t)
+                    if torch.is_tensor(query_mixture_sigmas_world_tqg3)
+                    and int(query_mixture_sigmas_world_tqg3.shape[0]) == int(centers_world.shape[0])
+                    else None
+                )
+                bev_mix_yaw_tqg = (
+                    query_mixture_yaw_tqg.index_select(0, frame_idx_t)
+                    if torch.is_tensor(query_mixture_yaw_tqg)
+                    and int(query_mixture_yaw_tqg.shape[0]) == int(centers_world.shape[0])
+                    else None
+                )
+                bev_mix_weights_tqg = (
+                    query_mixture_weights_tqg.index_select(0, frame_idx_t)
+                    if torch.is_tensor(query_mixture_weights_tqg)
+                    and int(query_mixture_weights_tqg.shape[0]) == int(centers_world.shape[0])
+                    else None
+                )
+            else:
+                bev_centers_tq3 = centers_world
+                bev_valid_tn = match_valid_tn
+                gt_occ_cost_txyz = gt_instance_occ3d_txyz
+                bev_sigmas_tq3 = query_sigmas_world_tq3
+                bev_mix_centers_tqg3 = query_mixture_centers_world_tqg3
+                bev_mix_sigmas_tqg3 = query_mixture_sigmas_world_tqg3
+                bev_mix_yaw_tqg = query_mixture_yaw_tqg
+                bev_mix_weights_tqg = query_mixture_weights_tqg
+            bev_dice_cost_qn, bev_dice_valid_qn = self._compute_query_gt_bev_dice_cost_qn(
+                centers_world_tq3=bev_centers_tq3,
+                sigmas_world_tq3=bev_sigmas_tq3,
+                gt_instance_occ3d_txyz=gt_occ_cost_txyz,
+                gt_ids_n=match_ids_n,
+                gt_valid_tn=bev_valid_tn,
+                mixture_centers_world_tqg3=bev_mix_centers_tqg3,
+                mixture_sigmas_world_tqg3=bev_mix_sigmas_tqg3,
+                mixture_yaw_tqg=bev_mix_yaw_tqg,
+                mixture_weights_tqg=bev_mix_weights_tqg,
+            )
+            if (
+                torch.is_tensor(bev_dice_cost_qn)
+                and bev_dice_cost_qn.shape == cost_qn.shape
+                and torch.is_tensor(bev_dice_valid_qn)
+                and bev_dice_valid_qn.shape == cost_qn.shape
+            ):
+                bev_dice_contrib_qn = (
+                    bev_dice_cost_w
+                    * bev_dice_cost_qn.to(cost_qn.dtype)
+                    * bev_dice_valid_qn.to(cost_qn.dtype)
+                )
+                cost_qn = cost_qn + bev_dice_contrib_qn
+            else:
+                bev_dice_cost_qn = None
+                bev_dice_contrib_qn = torch.zeros_like(cost_feat_qn)
         attn_iou_cost_qn = None
         attn_iou_contrib_qn = torch.zeros_like(cost_feat_qn)
         attn_iou_cost_w = float(query_attn_match_cost_weight)
