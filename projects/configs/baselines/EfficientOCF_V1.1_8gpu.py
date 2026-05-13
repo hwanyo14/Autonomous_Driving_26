@@ -443,12 +443,12 @@ query_attn_vis_dir = "./work_dirs/query_attn_vis_no_pretrain"
 query_center_match_cost_weight = 4.0
 query_center_match_loss_type = 'l1'
 query_center_routed_loss_weight = 0.3
-query_traj_loss_weight = 0.1
+query_traj_loss_weight = 0.5
 query_traj_loss_type = 'l1'
 query_traj_residual_max_m = (15.0, 15.0)
 query_traj_prior_detach = True
 query_traj_moving_reweight_enabled = True
-query_traj_moving_threshold_m = 1.5
+query_traj_moving_threshold_m = 0.8
 query_traj_moving_weight = 5.0
 query_traj_static_weight = 1.0
 

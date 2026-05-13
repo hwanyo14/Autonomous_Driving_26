@@ -544,8 +544,8 @@ class QueryHead(nn.Module):
         )
         traj_logits_fq2 = traj_logits_qf2.permute(1, 0, 2).contiguous()
         traj_max_xy = query_feat_tqd.new_tensor(self.query_traj_residual_max_m).view(1, 1, 2)
-        traj_offsets_fq2 = torch.tanh(traj_logits_fq2) * traj_max_xy
-        return traj_logits_fq2, traj_offsets_fq2
+        traj_deltas_fq2 = torch.tanh(traj_logits_fq2) * traj_max_xy
+        return traj_logits_fq2, traj_deltas_fq2
 
     @staticmethod
     def _resolve_center_branch_input(
@@ -744,8 +744,10 @@ class QueryHead(nn.Module):
             "traj_motion_input_tqd2": traj_motion_input_tqd2,
             "traj_logits_fq2": traj_logits_fq2,
             "traj_offsets_fq2": traj_offsets_fq2,
+            "traj_deltas_fq2": traj_offsets_fq2,
             "query_traj_logits_fq2": traj_logits_fq2,
             "query_traj_offsets_fq2": traj_offsets_fq2,
+            "query_traj_deltas_fq2": traj_offsets_fq2,
             "centers_world": centers_world,
             "center_logits": center_logits,
             "gaussian_sigmas_world": query_sigma_world_tq3,
@@ -1447,8 +1449,10 @@ class QueryHead(nn.Module):
             "traj_motion_input_tqd2": traj_motion_input_tqd2,
             "traj_logits_fq2": traj_logits_fq2,
             "traj_offsets_fq2": traj_offsets_fq2,
+            "traj_deltas_fq2": traj_offsets_fq2,
             "query_traj_logits_fq2": traj_logits_fq2,
             "query_traj_offsets_fq2": traj_offsets_fq2,
+            "query_traj_deltas_fq2": traj_offsets_fq2,
             # Legacy aliases for compatibility with older call sites.
             "centers_world": centers_world,
             "center_logits": center_logits,

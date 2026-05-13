@@ -297,6 +297,7 @@ class EfficientOCFLossMixin:
     def _compute_query_trajectory_loss_from_match(
         self,
         centers_world_tq3: torch.Tensor,
+        pred_traj_offsets_fq2: torch.Tensor = None,
         inst_match_result: dict = None,
         loss_weight: float = 1.0,
         loss_type: str = "l1",
@@ -308,8 +309,7 @@ class EfficientOCFLossMixin:
     ):
         """
         Future trajectory loss on matched pairs.
-        Uses only future slices [t+1, ...] and xy coordinates.
-        Expects centers_world_tq3 to be aligned in present-frame lidar coordinates.
+        Supervises present-frame per-step xy deltas: (t->t+1), (t+1->t+2), ...
         """
         if float(loss_weight) <= 0.0:
             return None
@@ -353,20 +353,53 @@ class EfficientOCFLossMixin:
         if mq.numel() <= 0:
             return None
 
-        pred_tk2 = centers_world_tq3[(present_local_idx + 1):t_match].index_select(1, mq).to(torch.float32)[..., :2]
-        gt_tk2 = gt_centers_tn3[(present_local_idx + 1):t_match].to(
+        future_steps = int(t_match - present_local_idx - 1)
+        if future_steps <= 0:
+            return None
+
+        gt_centers_xy_tn2 = gt_centers_tn3.to(
             device=centers_world_tq3.device, dtype=torch.float32
-        ).index_select(1, mi)[..., :2]
-        valid_tk = gt_valid_tn[(present_local_idx + 1):t_match].to(
+        )[..., :2]
+        gt_deltas_tn2 = (
+            gt_centers_xy_tn2[(present_local_idx + 1):t_match]
+            - gt_centers_xy_tn2[present_local_idx:(t_match - 1)]
+        )
+        gt_tk2 = gt_deltas_tn2.index_select(1, mi)
+
+        valid_prev_tk = gt_valid_tn[present_local_idx:(t_match - 1)].to(
             device=centers_world_tq3.device, dtype=torch.bool
         ).index_select(1, mi)
-        present_valid_k = gt_valid_tn[present_local_idx].to(
+        valid_next_tk = gt_valid_tn[(present_local_idx + 1):t_match].to(
             device=centers_world_tq3.device, dtype=torch.bool
-        ).index_select(0, mi)
-        valid_tk = valid_tk & present_valid_k.unsqueeze(0)
+        ).index_select(1, mi)
+        valid_tk = valid_prev_tk & valid_next_tk
         valid_f = valid_tk.to(torch.float32)
         if not bool((valid_f.sum() > 0).item()):
             return None
+
+        pred_tk2 = None
+        if (
+            torch.is_tensor(pred_traj_offsets_fq2)
+            and pred_traj_offsets_fq2.dim() == 3
+            and int(pred_traj_offsets_fq2.shape[1]) == Q
+            and int(pred_traj_offsets_fq2.shape[2]) == 2
+        ):
+            pred_steps = min(future_steps, int(pred_traj_offsets_fq2.shape[0]))
+            pred_tk2 = pred_traj_offsets_fq2[:pred_steps].to(
+                device=centers_world_tq3.device, dtype=torch.float32
+            ).index_select(1, mq)
+            if pred_steps < future_steps:
+                gt_tk2 = gt_tk2[:pred_steps]
+                valid_f = valid_f[:pred_steps]
+                valid_tk = valid_tk[:pred_steps]
+            if pred_tk2.numel() <= 0:
+                return None
+        else:
+            pred_centers_xy_tq2 = centers_world_tq3.to(torch.float32)[..., :2]
+            pred_tk2 = (
+                pred_centers_xy_tq2[(present_local_idx + 1):t_match].index_select(1, mq)
+                - pred_centers_xy_tq2[present_local_idx:(t_match - 1)].index_select(1, mq)
+            )
 
         loss_type = str(loss_type).lower()
         if loss_type == "l2":
@@ -375,10 +408,7 @@ class EfficientOCFLossMixin:
             err_tk = torch.abs(pred_tk2 - gt_tk2).sum(dim=-1)
 
         traj_weight_tk = torch.ones_like(valid_f)
-        gt_present_k2 = gt_centers_tn3[present_local_idx].to(
-            device=centers_world_tq3.device, dtype=torch.float32
-        ).index_select(0, mi)[..., :2]
-        motion_mag_tk = torch.norm(gt_tk2 - gt_present_k2.unsqueeze(0), p=2, dim=-1)
+        motion_mag_tk = torch.norm(gt_tk2, p=2, dim=-1)
         reweight_applied = bool(moving_reweight_enabled)
         if bool(moving_reweight_enabled):
             traj_weight_tk = torch.where(
