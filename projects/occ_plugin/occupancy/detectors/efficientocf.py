@@ -4,7 +4,7 @@
 
 import torch
 import torch.nn as nn
-import os
+
 from mmdet.models import DETECTORS
 from mmcv.runner import force_fp32
 from .bevdepth import BEVDepth
@@ -190,9 +190,6 @@ class EfficientOCF(
             query_inst_depth_max=0.0,
             debug_query_cam_gaussian_vis_gt_overlay_enabled=False,
             debug_query_cam_gaussian_vis_topk_matched=0,
-            lss_pretrained_ckpt_path=None,
-            freeze_lss_pretrained=True,
-            lss_pretrained_strict=False,
             **kwargs):
         '''
         EfficientNet is our end-to-end baseline for 4D camera-only occupancy forecasting
@@ -891,22 +888,9 @@ class EfficientOCF(
                 )
         self._query_train_iter = 0
         self._train_iter_synced = False
-        self.lss_pretrained_ckpt_path = str(lss_pretrained_ckpt_path) if lss_pretrained_ckpt_path else None
-        self.freeze_lss_pretrained = bool(freeze_lss_pretrained)
-        self.lss_pretrained_strict = bool(lss_pretrained_strict)
         if self.center_only_mode:
             self.use_gmo_bce_loss = False
             self.use_query_gmo_dice_loss = False
-
-        self._keep_img_backbone_eval = False
-        self._keep_img_neck_eval = False
-        self._keep_img_view_transformer_eval = False
-        self._keep_lss_depthnet_eval = False
-        self._keep_occ_encoder_backbone_eval = False
-        self._keep_occ_predictor_eval = False
-        self._keep_occ_encoder_neck_eval = False
-        self._keep_pts_bbox_head_eval = False
-        self._lss_pretrained_loaded = False
 
         context_feat_dim = self._get_context_feat_dim_from_depth_net()
         geo_input_dim = int(getattr(self.img_view_transformer, "cam_channels", 27))
@@ -1017,15 +1001,7 @@ class EfficientOCF(
         self.max_weight= nn.Parameter(torch.ones(1) * 1.0, requires_grad=True)
 
     def init_weights(self):
-        """Run base initialization first, then load LSS checkpoint once."""
         super().init_weights()
-        if (self.lss_pretrained_ckpt_path is not None) and (not self._lss_pretrained_loaded):
-            self._load_lss_pretrained_modules(
-                ckpt_path=self.lss_pretrained_ckpt_path,
-                strict=self.lss_pretrained_strict,
-                freeze_modules=self.freeze_lss_pretrained,
-            )
-            self._lss_pretrained_loaded = True
 
     def set_train_iteration(self, train_iter: int, one_based: bool = True) -> None:
         step = int(train_iter)
@@ -1060,314 +1036,9 @@ class EfficientOCF(
                 raise AttributeError(f"img_view_transformer.depth_net.{attr_name} is required but not found.")
         return int(depth_net.context_conv.out_channels)
 
-    @staticmethod
-    def _extract_model_state_dict(checkpoint):
-        if not isinstance(checkpoint, dict):
-            raise TypeError(f"checkpoint must be dict, got {type(checkpoint)}")
-
-        state_dict = None
-        for key in ("state_dict", "model_state_dict", "model"):
-            if key in checkpoint and isinstance(checkpoint[key], dict):
-                state_dict = checkpoint[key]
-                break
-        if state_dict is None:
-            state_dict = checkpoint
-
-        out = {}
-        for key, value in state_dict.items():
-            if not torch.is_tensor(value):
-                continue
-            if key.startswith("module."):
-                key = key[len("module."):]
-            out[key] = value
-        return out
-
-    @staticmethod
-    def _freeze_module(module: nn.Module):
-        module.eval()
-        for p in module.parameters():
-            p.requires_grad = False
-
-    @staticmethod
-    def _load_submodule_by_prefix(module: nn.Module, state_dict: dict, prefix: str, strict: bool = False):
-        sub_state_dict = {}
-        plen = len(prefix)
-        for key, value in state_dict.items():
-            if key.startswith(prefix):
-                sub_state_dict[key[plen:]] = value
-
-        if len(sub_state_dict) <= 0:
-            raise KeyError(f"No checkpoint keys found with prefix '{prefix}'")
-
-        if strict:
-            incompatible = module.load_state_dict(sub_state_dict, strict=True)
-            return {
-                "loaded": len(sub_state_dict),
-                "missing_keys": list(incompatible.missing_keys),
-                "unexpected_keys": list(incompatible.unexpected_keys),
-                "skipped_shape_mismatch_keys": [],
-                "skipped_unmatched_keys": [],
-                "prefix": prefix,
-            }
-
-        module_state_dict = module.state_dict()
-        filtered_sub_state_dict = {}
-        skipped_shape_mismatch_keys = []
-        skipped_unmatched_keys = []
-
-        for key, value in sub_state_dict.items():
-            if key not in module_state_dict:
-                skipped_unmatched_keys.append(key)
-                continue
-            if tuple(module_state_dict[key].shape) != tuple(value.shape):
-                skipped_shape_mismatch_keys.append(key)
-                continue
-            filtered_sub_state_dict[key] = value
-
-        incompatible = module.load_state_dict(filtered_sub_state_dict, strict=False)
-        return {
-            "loaded": len(filtered_sub_state_dict),
-            "missing_keys": list(incompatible.missing_keys),
-            "unexpected_keys": list(incompatible.unexpected_keys),
-            "skipped_shape_mismatch_keys": skipped_shape_mismatch_keys,
-            "skipped_unmatched_keys": skipped_unmatched_keys,
-            "prefix": prefix,
-        }
-
-    @staticmethod
-    def _load_parameter_by_key(param: nn.Parameter, state_dict: dict, key: str):
-        if key not in state_dict:
-            raise KeyError(f"No checkpoint key found for parameter '{key}'")
-
-        value = state_dict[key]
-        if not torch.is_tensor(value):
-            raise TypeError(f"Checkpoint entry '{key}' is not a tensor")
-        if tuple(param.shape) != tuple(value.shape):
-            raise RuntimeError(
-                f"Shape mismatch for checkpoint parameter '{key}': "
-                f"expected {tuple(param.shape)}, got {tuple(value.shape)}"
-            )
-
-        with torch.no_grad():
-            param.copy_(value.to(device=param.device, dtype=param.dtype))
-
-        return {
-            "loaded": 1,
-            "missing_keys": [],
-            "unexpected_keys": [],
-        }
-
-    @staticmethod
-    def _state_dict_has_prefix(state_dict: dict, prefix: str) -> bool:
-        for key in state_dict.keys():
-            if key.startswith(prefix):
-                return True
-        return False
-
-    def _load_lss_pretrained_modules(self, ckpt_path: str, strict: bool = False, freeze_modules: bool = True):
-        ckpt_path = os.path.expanduser(str(ckpt_path))
-        if not os.path.isfile(ckpt_path):
-            raise FileNotFoundError(f"LSS pretrained checkpoint not found: {ckpt_path}")
-
-        checkpoint = torch.load(ckpt_path, map_location="cpu")
-        state_dict = self._extract_model_state_dict(checkpoint)
-        report = {}
-
-        report["img_backbone"] = self._load_submodule_by_prefix(
-            self.img_backbone, state_dict, "img_backbone.", strict=strict
-        )
-        if self.with_img_neck:
-            report["img_neck"] = self._load_submodule_by_prefix(
-                self.img_neck, state_dict, "img_neck.", strict=strict
-            )
-        if self.img_view_transformer is None:
-            raise AttributeError("img_view_transformer is required but not found.")
-        if self._state_dict_has_prefix(state_dict, "img_view_transformer."):
-            # NOTE for future query-only test path:
-            # even if depth prediction / lift-splat is skipped later, the query branch
-            # still needs depth_net.bn/reduce_conv/context_* from this checkpoint load.
-            report["img_view_transformer"] = self._load_submodule_by_prefix(
-                self.img_view_transformer,
-                state_dict,
-                "img_view_transformer.",
-                strict=strict,
-            )
-        elif hasattr(self.img_view_transformer, "depth_net") and self._state_dict_has_prefix(
-            state_dict, "img_view_transformer.depth_net."
-        ):
-            report["img_view_transformer.depth_net"] = self._load_submodule_by_prefix(
-                self.img_view_transformer.depth_net,
-                state_dict,
-                "img_view_transformer.depth_net.",
-                strict=strict,
-            )
-        else:
-            raise KeyError(
-                "No checkpoint keys found with prefix 'img_view_transformer.' "
-                "or 'img_view_transformer.depth_net.'"
-            )
-        occ_module_specs = (
-            ("occ_encoder_backbone", self.occ_encoder_backbone, "occ_encoder_backbone."),
-            ("occ_predictor", self.occ_predictor, "occ_predictor."),
-            ("occ_encoder_neck", self.occ_encoder_neck, "occ_encoder_neck."),
-            ("pts_bbox_head", self.pts_bbox_head, "pts_bbox_head."),
-        )
-        for module_name, module, prefix in occ_module_specs:
-            if not self._state_dict_has_prefix(state_dict, prefix):
-                continue
-            report[module_name] = self._load_submodule_by_prefix(
-                module,
-                state_dict,
-                prefix,
-                strict=strict,
-            )
-        if "mean_weight" in state_dict:
-            report["mean_weight"] = self._load_parameter_by_key(self.mean_weight, state_dict, "mean_weight")
-        if "max_weight" in state_dict:
-            report["max_weight"] = self._load_parameter_by_key(self.max_weight, state_dict, "max_weight")
-
-        if getattr(self, "debug_img_bev_alignment_only", False) or self.pretrain_view_transform_only:
-            required_modules = (
-                "occ_encoder_backbone",
-                "occ_predictor",
-                "occ_encoder_neck",
-                "pts_bbox_head",
-                "mean_weight",
-                "max_weight",
-            )
-            missing_required = [name for name in required_modules if name not in report]
-            if len(missing_required) > 0:
-                raise RuntimeError(
-                    "Debug/pretrain occupancy route requires pretrained modules that are missing "
-                    f"from checkpoint {ckpt_path}: {', '.join(missing_required)}"
-                )
-
-        def _has_shape_mismatch(module_name: str) -> bool:
-            module_report = report.get(module_name, {})
-            return len(module_report.get("skipped_shape_mismatch_keys", [])) > 0
-
-        frozen_modules = []
-        freeze_skipped_modules = []
-        if freeze_modules:
-            if not _has_shape_mismatch("img_backbone"):
-                self._freeze_module(self.img_backbone)
-                self._keep_img_backbone_eval = True
-                frozen_modules.append("img_backbone")
-            else:
-                freeze_skipped_modules.append("img_backbone")
-
-            if self.with_img_neck and ("img_neck" in report):
-                if not _has_shape_mismatch("img_neck"):
-                    self._freeze_module(self.img_neck)
-                    self._keep_img_neck_eval = True
-                    frozen_modules.append("img_neck")
-                else:
-                    freeze_skipped_modules.append("img_neck")
-
-            if "img_view_transformer" in report:
-                if not _has_shape_mismatch("img_view_transformer"):
-                    self._freeze_module(self.img_view_transformer)
-                    self._keep_img_view_transformer_eval = True
-                    frozen_modules.append("img_view_transformer")
-                else:
-                    freeze_skipped_modules.append("img_view_transformer")
-            elif "img_view_transformer.depth_net" in report:
-                if not _has_shape_mismatch("img_view_transformer.depth_net"):
-                    self._freeze_module(self.img_view_transformer.depth_net)
-                    self._keep_lss_depthnet_eval = True
-                    frozen_modules.append("img_view_transformer.depth_net")
-                else:
-                    freeze_skipped_modules.append("img_view_transformer.depth_net")
-
-            if "occ_encoder_backbone" in report:
-                if not _has_shape_mismatch("occ_encoder_backbone"):
-                    self._freeze_module(self.occ_encoder_backbone)
-                    self._keep_occ_encoder_backbone_eval = True
-                    frozen_modules.append("occ_encoder_backbone")
-                else:
-                    freeze_skipped_modules.append("occ_encoder_backbone")
-
-            if "occ_predictor" in report:
-                if not _has_shape_mismatch("occ_predictor"):
-                    self._freeze_module(self.occ_predictor)
-                    self._keep_occ_predictor_eval = True
-                    frozen_modules.append("occ_predictor")
-                else:
-                    freeze_skipped_modules.append("occ_predictor")
-
-            if "occ_encoder_neck" in report:
-                if not _has_shape_mismatch("occ_encoder_neck"):
-                    self._freeze_module(self.occ_encoder_neck)
-                    self._keep_occ_encoder_neck_eval = True
-                    frozen_modules.append("occ_encoder_neck")
-                else:
-                    freeze_skipped_modules.append("occ_encoder_neck")
-
-            if "pts_bbox_head" in report:
-                if not _has_shape_mismatch("pts_bbox_head"):
-                    self._freeze_module(self.pts_bbox_head)
-                    self._keep_pts_bbox_head_eval = True
-                    frozen_modules.append("pts_bbox_head")
-                else:
-                    freeze_skipped_modules.append("pts_bbox_head")
-
-            if "mean_weight" in report:
-                self.mean_weight.requires_grad = False
-                frozen_modules.append("mean_weight")
-            if "max_weight" in report:
-                self.max_weight.requires_grad = False
-                frozen_modules.append("max_weight")
-
-        if self._is_main_process():
-            print(f"[EfficientOCF] loaded LSS pretrained modules from {ckpt_path}")
-            for module_name, module_report in report.items():
-                skipped_shape = module_report.get("skipped_shape_mismatch_keys", [])
-                skipped_unmatched = module_report.get("skipped_unmatched_keys", [])
-                print(
-                    f"[EfficientOCF] {module_name}: loaded={module_report['loaded']}, "
-                    f"missing={len(module_report['missing_keys'])}, "
-                    f"unexpected={len(module_report['unexpected_keys'])}, "
-                    f"shape_mismatch={len(skipped_shape)}, "
-                    f"unmatched={len(skipped_unmatched)}, strict={strict}"
-                )
-                if len(skipped_shape) > 0:
-                    sample = ", ".join(skipped_shape[:3])
-                    if len(skipped_shape) > 3:
-                        sample += ", ..."
-                    print(
-                        f"[EfficientOCF][WARN] skipped shape-mismatched keys for prefix "
-                        f"'{module_report.get('prefix', module_name)}' ({len(skipped_shape)}): {sample}"
-                    )
-            if not any(k.startswith("occ_") for k in report.keys()):
-                print("[EfficientOCF] occ encoder weights not found in checkpoint; skipped occ freeze/load.")
-            if freeze_modules:
-                print(f"[EfficientOCF] frozen modules: {', '.join(frozen_modules)}")
-                for module_name in freeze_skipped_modules:
-                    print(
-                        f"[EfficientOCF][WARN] freeze skipped for '{module_name}' because "
-                        "shape-mismatched tensors were skipped during preload."
-                    )
-
     def train(self, mode=True):
         super().train(mode)
-        if self._keep_img_backbone_eval:
-            self.img_backbone.eval()
-        if self._keep_img_neck_eval and hasattr(self, "img_neck"):
-            self.img_neck.eval()
-        if self._keep_img_view_transformer_eval and (self.img_view_transformer is not None):
-            self.img_view_transformer.eval()
-        if self._keep_lss_depthnet_eval and (self.img_view_transformer is not None) and hasattr(self.img_view_transformer, "depth_net"):
-            self.img_view_transformer.depth_net.eval()
-        if self._keep_occ_encoder_backbone_eval and hasattr(self, "occ_encoder_backbone"):
-            self.occ_encoder_backbone.eval()
-        if self._keep_occ_predictor_eval and hasattr(self, "occ_predictor"):
-            self.occ_predictor.eval()
-        if self._keep_occ_encoder_neck_eval and hasattr(self, "occ_encoder_neck"):
-            self.occ_encoder_neck.eval()
-        if self._keep_pts_bbox_head_eval and hasattr(self, "pts_bbox_head"):
-            self.pts_bbox_head.eval()
         return self
-
 
     def image_encoder(self, img):
         imgs = img

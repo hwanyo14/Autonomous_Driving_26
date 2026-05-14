@@ -519,12 +519,9 @@ debug_query_attn_softargmax_vis_max_queries = 16
 model = dict(
     type='EfficientOCF',
 
-    # Runtime and pretrained initialization.
+    # Runtime initialization.
     only_generate_dataset=only_generate_dataset,
     loss_norm=False,
-    lss_pretrained_ckpt_path='',
-    freeze_lss_pretrained=False,
-    lss_pretrained_strict=False,
 
     # Temporal / geometry setup.
     point_cloud_range=point_cloud_range,
