@@ -21,6 +21,7 @@ from .utils_bev_pool import EfficientOCFBEVPoolMixin
 from .utils_gt_prep import EfficientOCFGTPrepMixin
 from .utils_instance_img_debug import EfficientOCFInstanceImgDebugMixin
 from .utils_query_projection import EfficientOCFQueryProjectionMixin
+from .utils_geometry import EfficientOCFGeometryMixin
 
 
 @DETECTORS.register_module()
@@ -33,6 +34,7 @@ class EfficientOCF(
     EfficientOCFMatcherMixin,
     EfficientOCFBEVPoolMixin,
     EfficientOCFGTPrepMixin,
+    EfficientOCFGeometryMixin,
     BEVDepth,
 ):
     def __init__(self, 
@@ -2450,49 +2452,14 @@ class EfficientOCF(
             return_query_cam_gaussian_vis_debug=need_query_cam_gaussian_vis,
             return_query_match_inputs=True,
         )
-        query_attn_bbox_gpu_mem_alloc_mb = 0.0
-        query_attn_bbox_gpu_mem_reserved_mb = 0.0
-        query_attn_bbox_gpu_mem_peak_alloc_mb = 0.0
-        mem_probe_device = None
-        if torch.is_tensor(centers_world) and centers_world.is_cuda:
-            mem_probe_device = centers_world.device
-        elif (
-            isinstance(img_inputs_seq, (list, tuple))
-            and len(img_inputs_seq) > 0
-            and torch.is_tensor(img_inputs_seq[0])
-            and img_inputs_seq[0].is_cuda
-        ):
-            mem_probe_device = img_inputs_seq[0].device
-        if mem_probe_device is not None:
-            query_attn_bbox_gpu_mem_alloc_mb = float(torch.cuda.memory_allocated(mem_probe_device)) / (1024.0 * 1024.0)
-            query_attn_bbox_gpu_mem_reserved_mb = float(torch.cuda.memory_reserved(mem_probe_device)) / (1024.0 * 1024.0)
-            query_attn_bbox_gpu_mem_peak_alloc_mb = float(torch.cuda.max_memory_allocated(mem_probe_device)) / (1024.0 * 1024.0)
-
         # Keep a minimal default loss path until full query-loss branches are enabled.
-        centers_world_loss = centers_world_traj_tq3 if torch.is_tensor(centers_world_traj_tq3) else centers_world
-        gaussian_sigmas_world_loss = (
-            gaussian_sigmas_world_traj_tq3
-            if torch.is_tensor(gaussian_sigmas_world_traj_tq3)
-            else gaussian_sigmas_world
-        )
-        mixture_centers_world_loss = (
-            mixture_centers_world_traj_tqg3
-            if torch.is_tensor(mixture_centers_world_traj_tqg3)
-            else mixture_centers_world_tqg3
-        )
-        mixture_sigmas_world_loss = (
-            mixture_sigmas_world_traj_tqg3
-            if torch.is_tensor(mixture_sigmas_world_traj_tqg3)
-            else mixture_sigmas_world_tqg3
-        )
-        mixture_yaw_loss = (
-            mixture_yaw_traj_tqg if torch.is_tensor(mixture_yaw_traj_tqg) else mixture_yaw_tqg
-        )
-        mixture_weights_loss = (
-            mixture_weights_traj_tqg
-            if torch.is_tensor(mixture_weights_traj_tqg)
-            else mixture_weights_tqg
-        )
+        _pick = self._pick_tensor
+        centers_world_loss = _pick(centers_world_traj_tq3, centers_world)
+        gaussian_sigmas_world_loss = _pick(gaussian_sigmas_world_traj_tq3, gaussian_sigmas_world)
+        mixture_centers_world_loss = _pick(mixture_centers_world_traj_tqg3, mixture_centers_world_tqg3)
+        mixture_sigmas_world_loss = _pick(mixture_sigmas_world_traj_tqg3, mixture_sigmas_world_tqg3)
+        mixture_yaw_loss = _pick(mixture_yaw_traj_tqg, mixture_yaw_tqg)
+        mixture_weights_loss = _pick(mixture_weights_traj_tqg, mixture_weights_tqg)
         expected_traj_horizon = int(self.n_future_frames) + 1
         centers_world_temporal_sup_tq3 = centers_world_loss
         traj_centers_are_present_aligned = bool(
@@ -2537,117 +2504,40 @@ class EfficientOCF(
         mixture_sigmas_world_loss_aligned_tqg3 = mixture_sigmas_world_loss
         mixture_yaw_loss_aligned_tqg = mixture_yaw_loss
         mixture_weights_loss_aligned_tqg = mixture_weights_loss
-        if (
+        _needs_ego_align = (
             torch.is_tensor(centers_world_loss)
             and centers_world_loss.dim() == 3
             and int(centers_world_loss.shape[0]) > 1
             and torch.is_tensor(traj_frame_indices_t)
             and torch.is_tensor(future_egomotion)
             and (not traj_centers_are_present_aligned)
-        ):
-            loss_geom_pack = self._align_query_vis_geometry_to_present_frame(
-                centers_world_tq3=centers_world_loss,
-                traj_frame_indices_t=traj_frame_indices_t,
-                future_egomotion=future_egomotion,
-                gaussian_sigmas_world_tq3=(
-                    gaussian_sigmas_world_loss
-                    if torch.is_tensor(gaussian_sigmas_world_loss)
-                    else None
-                ),
-                mixture_centers_world_tqg3=(
-                    mixture_centers_world_loss
-                    if torch.is_tensor(mixture_centers_world_loss)
-                    else None
-                ),
-                mixture_sigmas_world_tqg3=(
-                    mixture_sigmas_world_loss
-                    if torch.is_tensor(mixture_sigmas_world_loss)
-                    else None
-                ),
-                mixture_yaw_tqg=(
-                    mixture_yaw_loss
-                    if torch.is_tensor(mixture_yaw_loss)
-                    else None
-                ),
-                mixture_weights_tqg=(
-                    mixture_weights_loss
-                    if torch.is_tensor(mixture_weights_loss)
-                    else None
-                ),
+        )
+        if _needs_ego_align:
+            loss_geom_pack = self._align_geom_pack(
+                centers_world_loss, traj_frame_indices_t, future_egomotion,
+                gaussian_sigmas_world_loss, mixture_centers_world_loss,
+                mixture_sigmas_world_loss, mixture_yaw_loss, mixture_weights_loss,
             )
-            if isinstance(loss_geom_pack, dict):
-                centers_world_loss_aligned_tq3 = loss_geom_pack.get(
-                    "centers_world_tq3", centers_world_loss_aligned_tq3
-                )
-                gaussian_sigmas_world_loss_aligned_tq3 = loss_geom_pack.get(
-                    "gaussian_sigmas_world_tq3", gaussian_sigmas_world_loss_aligned_tq3
-                )
-                mixture_centers_world_loss_aligned_tqg3 = loss_geom_pack.get(
-                    "mixture_centers_world_tqg3", mixture_centers_world_loss_aligned_tqg3
-                )
-                mixture_sigmas_world_loss_aligned_tqg3 = loss_geom_pack.get(
-                    "mixture_sigmas_world_tqg3", mixture_sigmas_world_loss_aligned_tqg3
-                )
-                mixture_yaw_loss_aligned_tqg = loss_geom_pack.get(
-                    "mixture_yaw_tqg", mixture_yaw_loss_aligned_tqg
-                )
-                mixture_weights_loss_aligned_tqg = loss_geom_pack.get(
-                    "mixture_weights_tqg", mixture_weights_loss_aligned_tqg
-                )
-        if (
-            torch.is_tensor(centers_world_loss)
-            and centers_world_loss.dim() == 3
-            and int(centers_world_loss.shape[0]) > 1
-            and torch.is_tensor(traj_frame_indices_t)
-            and torch.is_tensor(future_egomotion)
-            and (not traj_centers_are_present_aligned)
-        ):
+            centers_world_loss_aligned_tq3 = loss_geom_pack.get("centers_world_tq3", centers_world_loss_aligned_tq3)
+            gaussian_sigmas_world_loss_aligned_tq3 = loss_geom_pack.get("gaussian_sigmas_world_tq3", gaussian_sigmas_world_loss_aligned_tq3)
+            mixture_centers_world_loss_aligned_tqg3 = loss_geom_pack.get("mixture_centers_world_tqg3", mixture_centers_world_loss_aligned_tqg3)
+            mixture_sigmas_world_loss_aligned_tqg3 = loss_geom_pack.get("mixture_sigmas_world_tqg3", mixture_sigmas_world_loss_aligned_tqg3)
+            mixture_yaw_loss_aligned_tqg = loss_geom_pack.get("mixture_yaw_tqg", mixture_yaw_loss_aligned_tqg)
+            mixture_weights_loss_aligned_tqg = loss_geom_pack.get("mixture_weights_tqg", mixture_weights_loss_aligned_tqg)
+        if _needs_ego_align:
             with torch.no_grad():
-                vis_geom_pack = self._align_query_vis_geometry_to_present_frame(
-                    centers_world_tq3=centers_world_loss.detach(),
-                    traj_frame_indices_t=traj_frame_indices_t.detach(),
-                    future_egomotion=future_egomotion.detach(),
-                    gaussian_sigmas_world_tq3=(
-                        gaussian_sigmas_world_loss.detach()
-                        if torch.is_tensor(gaussian_sigmas_world_loss)
-                        else None
-                    ),
-                    mixture_centers_world_tqg3=(
-                        mixture_centers_world_loss.detach()
-                        if torch.is_tensor(mixture_centers_world_loss)
-                        else None
-                    ),
-                    mixture_sigmas_world_tqg3=(
-                        mixture_sigmas_world_loss.detach()
-                        if torch.is_tensor(mixture_sigmas_world_loss)
-                        else None
-                    ),
-                    mixture_yaw_tqg=(
-                        mixture_yaw_loss.detach()
-                        if torch.is_tensor(mixture_yaw_loss)
-                        else None
-                    ),
-                    mixture_weights_tqg=(
-                        mixture_weights_loss.detach()
-                        if torch.is_tensor(mixture_weights_loss)
-                        else None
-                    ),
+                vis_geom_pack = self._align_geom_pack(
+                    centers_world_loss, traj_frame_indices_t, future_egomotion,
+                    gaussian_sigmas_world_loss, mixture_centers_world_loss,
+                    mixture_sigmas_world_loss, mixture_yaw_loss, mixture_weights_loss,
+                    detach=True,
                 )
-            if isinstance(vis_geom_pack, dict):
-                centers_world_vis_tq3 = vis_geom_pack.get("centers_world_tq3", centers_world_vis_tq3)
-                gaussian_sigmas_world_vis_tq3 = vis_geom_pack.get(
-                    "gaussian_sigmas_world_tq3", gaussian_sigmas_world_vis_tq3
-                )
-                mixture_centers_world_vis_tqg3 = vis_geom_pack.get(
-                    "mixture_centers_world_tqg3", mixture_centers_world_vis_tqg3
-                )
-                mixture_sigmas_world_vis_tqg3 = vis_geom_pack.get(
-                    "mixture_sigmas_world_tqg3", mixture_sigmas_world_vis_tqg3
-                )
-                mixture_yaw_vis_tqg = vis_geom_pack.get("mixture_yaw_tqg", mixture_yaw_vis_tqg)
-                mixture_weights_vis_tqg = vis_geom_pack.get(
-                    "mixture_weights_tqg", mixture_weights_vis_tqg
-                )
+            centers_world_vis_tq3 = vis_geom_pack.get("centers_world_tq3", centers_world_vis_tq3)
+            gaussian_sigmas_world_vis_tq3 = vis_geom_pack.get("gaussian_sigmas_world_tq3", gaussian_sigmas_world_vis_tq3)
+            mixture_centers_world_vis_tqg3 = vis_geom_pack.get("mixture_centers_world_tqg3", mixture_centers_world_vis_tqg3)
+            mixture_sigmas_world_vis_tqg3 = vis_geom_pack.get("mixture_sigmas_world_tqg3", mixture_sigmas_world_vis_tqg3)
+            mixture_yaw_vis_tqg = vis_geom_pack.get("mixture_yaw_tqg", mixture_yaw_vis_tqg)
+            mixture_weights_vis_tqg = vis_geom_pack.get("mixture_weights_tqg", mixture_weights_vis_tqg)
 
         # Build 7-frame visualization tensors (past + present + future) by
         # prepending the lifted past frames to the trajectory horizon.
@@ -2687,78 +2577,13 @@ class EfficientOCF(
             and past_only_count > 0
         )
         if traj_vis_has_present_anchor:
-            past_centers_tq3 = centers_world[:past_only_count].detach().to(
-                device=centers_world_vis_tq3.device,
-                dtype=centers_world_vis_tq3.dtype,
-            )
-            centers_world_vis_full_tq3 = torch.cat(
-                [past_centers_tq3, centers_world_vis_tq3], dim=0
-            ).contiguous()
-            if (
-                torch.is_tensor(gaussian_sigmas_world)
-                and gaussian_sigmas_world.dim() == 3
-                and int(gaussian_sigmas_world.shape[0]) > past_only_count
-                and torch.is_tensor(gaussian_sigmas_world_vis_tq3)
-            ):
-                past_sigmas_tq3 = gaussian_sigmas_world[:past_only_count].detach().to(
-                    device=gaussian_sigmas_world_vis_tq3.device,
-                    dtype=gaussian_sigmas_world_vis_tq3.dtype,
-                )
-                gaussian_sigmas_world_vis_full_tq3 = torch.cat(
-                    [past_sigmas_tq3, gaussian_sigmas_world_vis_tq3], dim=0
-                ).contiguous()
-            if (
-                torch.is_tensor(mixture_centers_world_tqg3)
-                and mixture_centers_world_tqg3.dim() == 4
-                and int(mixture_centers_world_tqg3.shape[0]) > past_only_count
-                and torch.is_tensor(mixture_centers_world_vis_tqg3)
-            ):
-                past_mix_centers_tqg3 = mixture_centers_world_tqg3[:past_only_count].detach().to(
-                    device=mixture_centers_world_vis_tqg3.device,
-                    dtype=mixture_centers_world_vis_tqg3.dtype,
-                )
-                mixture_centers_world_vis_full_tqg3 = torch.cat(
-                    [past_mix_centers_tqg3, mixture_centers_world_vis_tqg3], dim=0
-                ).contiguous()
-            if (
-                torch.is_tensor(mixture_sigmas_world_tqg3)
-                and mixture_sigmas_world_tqg3.dim() == 4
-                and int(mixture_sigmas_world_tqg3.shape[0]) > past_only_count
-                and torch.is_tensor(mixture_sigmas_world_vis_tqg3)
-            ):
-                past_mix_sigmas_tqg3 = mixture_sigmas_world_tqg3[:past_only_count].detach().to(
-                    device=mixture_sigmas_world_vis_tqg3.device,
-                    dtype=mixture_sigmas_world_vis_tqg3.dtype,
-                )
-                mixture_sigmas_world_vis_full_tqg3 = torch.cat(
-                    [past_mix_sigmas_tqg3, mixture_sigmas_world_vis_tqg3], dim=0
-                ).contiguous()
-            if (
-                torch.is_tensor(mixture_yaw_tqg)
-                and mixture_yaw_tqg.dim() == 3
-                and int(mixture_yaw_tqg.shape[0]) > past_only_count
-                and torch.is_tensor(mixture_yaw_vis_tqg)
-            ):
-                past_mix_yaw_tqg = mixture_yaw_tqg[:past_only_count].detach().to(
-                    device=mixture_yaw_vis_tqg.device,
-                    dtype=mixture_yaw_vis_tqg.dtype,
-                )
-                mixture_yaw_vis_full_tqg = torch.cat(
-                    [past_mix_yaw_tqg, mixture_yaw_vis_tqg], dim=0
-                ).contiguous()
-            if (
-                torch.is_tensor(mixture_weights_tqg)
-                and mixture_weights_tqg.dim() == 3
-                and int(mixture_weights_tqg.shape[0]) > past_only_count
-                and torch.is_tensor(mixture_weights_vis_tqg)
-            ):
-                past_mix_weights_tqg = mixture_weights_tqg[:past_only_count].detach().to(
-                    device=mixture_weights_vis_tqg.device,
-                    dtype=mixture_weights_vis_tqg.dtype,
-                )
-                mixture_weights_vis_full_tqg = torch.cat(
-                    [past_mix_weights_tqg, mixture_weights_vis_tqg], dim=0
-                ).contiguous()
+            _ppd = lambda p, t: self._prepend_past_frames(p, past_only_count, t, detach=True)
+            centers_world_vis_full_tq3 = _ppd(centers_world, centers_world_vis_tq3)
+            gaussian_sigmas_world_vis_full_tq3 = _ppd(gaussian_sigmas_world, gaussian_sigmas_world_vis_tq3)
+            mixture_centers_world_vis_full_tqg3 = _ppd(mixture_centers_world_tqg3, mixture_centers_world_vis_tqg3)
+            mixture_sigmas_world_vis_full_tqg3 = _ppd(mixture_sigmas_world_tqg3, mixture_sigmas_world_vis_tqg3)
+            mixture_yaw_vis_full_tqg = _ppd(mixture_yaw_tqg, mixture_yaw_vis_tqg)
+            mixture_weights_vis_full_tqg = _ppd(mixture_weights_tqg, mixture_weights_vis_tqg)
         traj_loss_has_present_anchor = (
             torch.is_tensor(centers_world_loss_aligned_tq3)
             and centers_world_loss_aligned_tq3.dim() == 3
@@ -2769,78 +2594,13 @@ class EfficientOCF(
             and past_only_count > 0
         )
         if traj_loss_has_present_anchor:
-            past_centers_tq3 = centers_world[:past_only_count].to(
-                device=centers_world_loss_aligned_tq3.device,
-                dtype=centers_world_loss_aligned_tq3.dtype,
-            )
-            centers_world_loss_full_tq3 = torch.cat(
-                [past_centers_tq3, centers_world_loss_aligned_tq3], dim=0
-            ).contiguous()
-            if (
-                torch.is_tensor(gaussian_sigmas_world)
-                and gaussian_sigmas_world.dim() == 3
-                and int(gaussian_sigmas_world.shape[0]) > past_only_count
-                and torch.is_tensor(gaussian_sigmas_world_loss_aligned_tq3)
-            ):
-                past_sigmas_tq3 = gaussian_sigmas_world[:past_only_count].to(
-                    device=gaussian_sigmas_world_loss_aligned_tq3.device,
-                    dtype=gaussian_sigmas_world_loss_aligned_tq3.dtype,
-                )
-                gaussian_sigmas_world_loss_full_tq3 = torch.cat(
-                    [past_sigmas_tq3, gaussian_sigmas_world_loss_aligned_tq3], dim=0
-                ).contiguous()
-            if (
-                torch.is_tensor(mixture_centers_world_tqg3)
-                and mixture_centers_world_tqg3.dim() == 4
-                and int(mixture_centers_world_tqg3.shape[0]) > past_only_count
-                and torch.is_tensor(mixture_centers_world_loss_aligned_tqg3)
-            ):
-                past_mix_centers_tqg3 = mixture_centers_world_tqg3[:past_only_count].to(
-                    device=mixture_centers_world_loss_aligned_tqg3.device,
-                    dtype=mixture_centers_world_loss_aligned_tqg3.dtype,
-                )
-                mixture_centers_world_loss_full_tqg3 = torch.cat(
-                    [past_mix_centers_tqg3, mixture_centers_world_loss_aligned_tqg3], dim=0
-                ).contiguous()
-            if (
-                torch.is_tensor(mixture_sigmas_world_tqg3)
-                and mixture_sigmas_world_tqg3.dim() == 4
-                and int(mixture_sigmas_world_tqg3.shape[0]) > past_only_count
-                and torch.is_tensor(mixture_sigmas_world_loss_aligned_tqg3)
-            ):
-                past_mix_sigmas_tqg3 = mixture_sigmas_world_tqg3[:past_only_count].to(
-                    device=mixture_sigmas_world_loss_aligned_tqg3.device,
-                    dtype=mixture_sigmas_world_loss_aligned_tqg3.dtype,
-                )
-                mixture_sigmas_world_loss_full_tqg3 = torch.cat(
-                    [past_mix_sigmas_tqg3, mixture_sigmas_world_loss_aligned_tqg3], dim=0
-                ).contiguous()
-            if (
-                torch.is_tensor(mixture_yaw_tqg)
-                and mixture_yaw_tqg.dim() == 3
-                and int(mixture_yaw_tqg.shape[0]) > past_only_count
-                and torch.is_tensor(mixture_yaw_loss_aligned_tqg)
-            ):
-                past_mix_yaw_tqg = mixture_yaw_tqg[:past_only_count].to(
-                    device=mixture_yaw_loss_aligned_tqg.device,
-                    dtype=mixture_yaw_loss_aligned_tqg.dtype,
-                )
-                mixture_yaw_loss_full_tqg = torch.cat(
-                    [past_mix_yaw_tqg, mixture_yaw_loss_aligned_tqg], dim=0
-                ).contiguous()
-            if (
-                torch.is_tensor(mixture_weights_tqg)
-                and mixture_weights_tqg.dim() == 3
-                and int(mixture_weights_tqg.shape[0]) > past_only_count
-                and torch.is_tensor(mixture_weights_loss_aligned_tqg)
-            ):
-                past_mix_weights_tqg = mixture_weights_tqg[:past_only_count].to(
-                    device=mixture_weights_loss_aligned_tqg.device,
-                    dtype=mixture_weights_loss_aligned_tqg.dtype,
-                )
-                mixture_weights_loss_full_tqg = torch.cat(
-                    [past_mix_weights_tqg, mixture_weights_loss_aligned_tqg], dim=0
-                ).contiguous()
+            _pp = lambda p, t: self._prepend_past_frames(p, past_only_count, t)
+            centers_world_loss_full_tq3 = _pp(centers_world, centers_world_loss_aligned_tq3)
+            gaussian_sigmas_world_loss_full_tq3 = _pp(gaussian_sigmas_world, gaussian_sigmas_world_loss_aligned_tq3)
+            mixture_centers_world_loss_full_tqg3 = _pp(mixture_centers_world_tqg3, mixture_centers_world_loss_aligned_tqg3)
+            mixture_sigmas_world_loss_full_tqg3 = _pp(mixture_sigmas_world_tqg3, mixture_sigmas_world_loss_aligned_tqg3)
+            mixture_yaw_loss_full_tqg = _pp(mixture_yaw_tqg, mixture_yaw_loss_aligned_tqg)
+            mixture_weights_loss_full_tqg = _pp(mixture_weights_tqg, mixture_weights_loss_aligned_tqg)
         use_full7_temporal_sup = bool(
             traj_loss_has_present_anchor
             and torch.is_tensor(centers_world_loss_full_tq3)
@@ -3067,49 +2827,7 @@ class EfficientOCF(
                         query_attn_weights_tqnhw=_query_attn_weights_tqnhw,
                         cam_targets=query_attn_cam_targets,
                     )
-                    if isinstance(query_attn_cam_score_pack, dict):
-                        query_attn_cam_score_pack["dbg_query_attn_cam_enabled"] = centers_world.new_tensor(1.0)
-                        for dbg_key in (
-                            "dbg_query_attn_cam_proj_total_count",
-                            "dbg_query_attn_cam_proj_valid_depth_count",
-                            "dbg_query_attn_cam_proj_inbound_count",
-                            "dbg_query_attn_cam_valid_qcam_count",
-                        ):
-                            dbg_val = query_attn_cam_targets.get(dbg_key, None)
-                            if torch.is_tensor(dbg_val):
-                                query_attn_cam_score_pack[dbg_key] = dbg_val.to(
-                                    device=centers_world.device, dtype=torch.float32
-                                )
-                            elif dbg_val is not None:
-                                query_attn_cam_score_pack[dbg_key] = centers_world.new_tensor(
-                                    float(dbg_val)
-                                )
-                else:
-                    query_attn_cam_score_pack = {
-                        "dbg_query_attn_cam_enabled": centers_world.new_tensor(1.0),
-                        "dbg_query_attn_cam_score_mean": centers_world.new_tensor(0.0),
-                        "dbg_query_attn_cam_metric_raw_mean": centers_world.new_tensor(0.0),
-                        "dbg_query_attn_cam_valid_pair_count": centers_world.new_tensor(0.0),
-                        "dbg_query_attn_cam_nonfinite_skip": centers_world.new_tensor(0.0),
-                        "dbg_query_attn_cam_shape_invalid_skip": centers_world.new_tensor(1.0),
-                        "dbg_query_attn_cam_proj_total_count": centers_world.new_tensor(0.0),
-                        "dbg_query_attn_cam_proj_valid_depth_count": centers_world.new_tensor(0.0),
-                        "dbg_query_attn_cam_proj_inbound_count": centers_world.new_tensor(0.0),
-                        "dbg_query_attn_cam_valid_qcam_count": centers_world.new_tensor(0.0),
-                    }
-        elif self.use_query_attn_cam_gaussian_score:
-            query_attn_cam_score_pack = {
-                "dbg_query_attn_cam_enabled": centers_world.new_tensor(1.0),
-                "dbg_query_attn_cam_score_mean": centers_world.new_tensor(0.0),
-                "dbg_query_attn_cam_metric_raw_mean": centers_world.new_tensor(0.0),
-                "dbg_query_attn_cam_valid_pair_count": centers_world.new_tensor(0.0),
-                "dbg_query_attn_cam_nonfinite_skip": centers_world.new_tensor(0.0),
-                "dbg_query_attn_cam_shape_invalid_skip": centers_world.new_tensor(1.0),
-                "dbg_query_attn_cam_proj_total_count": centers_world.new_tensor(0.0),
-                "dbg_query_attn_cam_proj_valid_depth_count": centers_world.new_tensor(0.0),
-                "dbg_query_attn_cam_proj_inbound_count": centers_world.new_tensor(0.0),
-                "dbg_query_attn_cam_valid_qcam_count": centers_world.new_tensor(0.0),
-            }
+                    pass  # query_attn_cam_score_pack may be None or a valid score dict
         if (
             self.use_gmo_bce_loss
             and (not self.center_only_mode)
@@ -3174,45 +2892,18 @@ class EfficientOCF(
                         (max(0, t_vis - t_keep), int(query_cls_pred_tq.shape[1]))
                     )
                     query_cls_pred_tq = torch.cat([query_cls_pred_tq[:t_keep], pad], dim=0)
+        _d = self._detach_if_tensor
         with torch.no_grad():
             query_vis_bundle = self._build_query_visualization_bundle(
-                centers_world_tq3=(
-                    centers_world_vis_full_tq3.detach()
-                    if torch.is_tensor(centers_world_vis_full_tq3)
-                    else centers_world_vis_full_tq3
-                ),
-                query_cls_scores_qc=(
-                    query_cls_scores_qc.detach()
-                    if torch.is_tensor(query_cls_scores_qc)
-                    else query_cls_scores_qc
-                ),
+                centers_world_tq3=_d(centers_world_vis_full_tq3),
+                query_cls_scores_qc=_d(query_cls_scores_qc),
                 inst_match_result=inst_match_result,
                 gt_segmentation_instance3d_txyz=gt_instance_occ3d_txyz_query_vis,
-                gaussian_sigmas_world_tq3=(
-                    gaussian_sigmas_world_vis_full_tq3.detach()
-                    if torch.is_tensor(gaussian_sigmas_world_vis_full_tq3)
-                    else gaussian_sigmas_world_vis_full_tq3
-                ),
-                mixture_centers_world_tqg3=(
-                    mixture_centers_world_vis_full_tqg3.detach()
-                    if torch.is_tensor(mixture_centers_world_vis_full_tqg3)
-                    else mixture_centers_world_vis_full_tqg3
-                ),
-                mixture_sigmas_world_tqg3=(
-                    mixture_sigmas_world_vis_full_tqg3.detach()
-                    if torch.is_tensor(mixture_sigmas_world_vis_full_tqg3)
-                    else mixture_sigmas_world_vis_full_tqg3
-                ),
-                mixture_yaw_tqg=(
-                    mixture_yaw_vis_full_tqg.detach()
-                    if torch.is_tensor(mixture_yaw_vis_full_tqg)
-                    else mixture_yaw_vis_full_tqg
-                ),
-                mixture_weights_tqg=(
-                    mixture_weights_vis_full_tqg.detach()
-                    if torch.is_tensor(mixture_weights_vis_full_tqg)
-                    else mixture_weights_vis_full_tqg
-                ),
+                gaussian_sigmas_world_tq3=_d(gaussian_sigmas_world_vis_full_tq3),
+                mixture_centers_world_tqg3=_d(mixture_centers_world_vis_full_tqg3),
+                mixture_sigmas_world_tqg3=_d(mixture_sigmas_world_vis_full_tqg3),
+                mixture_yaw_tqg=_d(mixture_yaw_vis_full_tqg),
+                mixture_weights_tqg=_d(mixture_weights_vis_full_tqg),
                 query_attn_cam_score_pack=query_attn_cam_score_pack,
             )
 
