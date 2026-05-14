@@ -1743,3 +1743,195 @@ class EfficientOCFLossMixin:
         else:
             targets[:, mq] = 1.0
         return targets, valid_mask
+
+    def _aggregate_training_losses(
+        self,
+        *,
+        # BEV occupancy loss inputs
+        bev_feats_enc,
+        segmentation_bev,
+        points_occ,
+        img_metas,
+        img_feats,
+        transform,
+        # Pre-computed query loss dicts
+        query_cls_loss,
+        query_depth_loss,
+        query_attn_bbox_loss,
+        matched_gmo_loss,
+        center_match_loss,
+        query_traj_loss,
+        query_attn_cam_score_pack,
+        # Query predictions
+        centers_world,
+        centers_world_dt_gt2p_tq3,
+        gaussian_sigmas_world_loss,
+        mixture_sigmas_world_loss,
+        mixture_weights_loss,
+        # DT loss inputs
+        occ_dt,
+        # GT2P loss inputs
+        gt_inst_center_world_tn3,
+        gt_inst_center_valid_tn,
+    ):
+        """Aggregate all training loss components into a single losses dict."""
+        losses = dict()
+        z = centers_world.sum() * 0.0
+
+        # ---- BEV occupancy loss ----
+        if self.use_lss_bev_occ_loss and (bev_feats_enc is not None) and (segmentation_bev is not None):
+            voxel_feats_seq = []
+            for voxel_feats_stage in bev_feats_enc:
+                bs, sfeatures = voxel_feats_stage.shape[:2]
+                voxel_feats_stage_ = voxel_feats_stage.view(
+                    bs * self.n_future_frames_plus,
+                    sfeatures // self.n_future_frames_plus,
+                    *voxel_feats_stage.shape[2:],
+                )
+                voxel_feats_seq.append(voxel_feats_stage_)
+            losses_occupancy = self.forward_pts_train(
+                voxel_feats_seq, segmentation_bev, points_occ, img_metas,
+                img_feats=img_feats, transform=transform,
+            )
+            losses.update(losses_occupancy)
+
+        # ---- Query classification / feature losses ----
+        if isinstance(query_cls_loss, dict):
+            losses.update(query_cls_loss)
+        else:
+            losses["loss_query_cls"] = z
+        if isinstance(query_depth_loss, dict):
+            losses.update(query_depth_loss)
+        else:
+            losses["loss_query_depth"] = z
+
+        if isinstance(query_attn_bbox_loss, dict):
+            losses.update(
+                {
+                    k: v
+                    for k, v in query_attn_bbox_loss.items()
+                    if not k.startswith("dbg_")
+                    and (
+                        (torch.is_tensor(v) and (torch.is_floating_point(v) or torch.is_complex(v)))
+                        or (
+                            isinstance(v, list)
+                            and all(
+                                torch.is_tensor(v_i) and (torch.is_floating_point(v_i) or torch.is_complex(v_i))
+                                for v_i in v
+                            )
+                        )
+                    )
+                }
+            )
+        else:
+            losses["loss_query_attn_bbox"] = z
+
+        if isinstance(matched_gmo_loss, dict):
+            losses.update(matched_gmo_loss)
+        else:
+            losses["loss_gmo_focal"] = z
+            losses["loss_gmo_dice"] = z
+
+        losses.update(
+            self.query_head.compute_multi_gaussian_sigma_reg_loss(
+                mixture_sigmas_world_tqg3=mixture_sigmas_world_loss,
+                mixture_weights_tqg=mixture_weights_loss,
+            )
+        )
+
+        # ---- Query decorrelation loss ----
+        query_decor_loss = getattr(self.transformer, "last_query_decor_loss", None)
+        losses["loss_query_decor"] = query_decor_loss if torch.is_tensor(query_decor_loss) else z
+
+        # ---- Center match loss ----
+        losses["loss_query_center_match"] = center_match_loss if center_match_loss is not None else z
+
+        # ---- Trajectory loss ----
+        if isinstance(query_traj_loss, dict):
+            losses.update(query_traj_loss)
+        elif query_traj_loss is not None:
+            losses["loss_query_traj"] = query_traj_loss
+        else:
+            losses["loss_query_traj"] = z
+
+        # ---- Hungarian matching cost weights ----
+        losses["dbg_query_sim_match_cost_weight"] = centers_world.new_tensor(
+            float(self.query_sim_match_cost_weight)
+        )
+        losses["dbg_query_soft_assign_cost_weight"] = centers_world.new_tensor(
+            float(self.query_soft_assign_cost_weight)
+        )
+        losses["dbg_query_cls_match_cost_weight"] = centers_world.new_tensor(
+            float(self.query_cls_match_cost_weight)
+        )
+        losses["dbg_query_bev_dice_match_cost_weight"] = centers_world.new_tensor(
+            float(self.query_bev_dice_match_cost_weight)
+        )
+        if isinstance(query_attn_cam_score_pack, dict):
+            losses.update(
+                {
+                    k: v
+                    for k, v in query_attn_cam_score_pack.items()
+                    if not k.startswith("dbg_")
+                    and (
+                        (torch.is_tensor(v) and (torch.is_floating_point(v) or torch.is_complex(v)))
+                        or (
+                            isinstance(v, list)
+                            and all(
+                                torch.is_tensor(v_i) and (torch.is_floating_point(v_i) or torch.is_complex(v_i))
+                                for v_i in v
+                            )
+                        )
+                    )
+                }
+            )
+
+        # ---- DT loss ----
+        if self.use_query_dt_loss:
+            if self.center_only_mode:
+                dt_loss = self.query_head.compute_query_point_dt_loss(
+                    points_world=centers_world_dt_gt2p_tq3, occ_dt=occ_dt,
+                    loss_weight=0.1, mode='bilinear',
+                )
+            else:
+                dt_loss = self.query_head.compute_query_point_dt_loss(
+                    points_world=None,
+                    gaussian_centers_world=centers_world_dt_gt2p_tq3,
+                    gaussian_sigmas_world=gaussian_sigmas_world_loss,
+                    occ_dt=occ_dt, loss_weight=0.1, mode='bilinear',
+                )
+            losses.update(dt_loss)
+
+        # ---- GT2P loss ----
+        gt2p_cooldown_scale = float(self._compute_gt2p_cooldown_scale())
+        if self.use_query_gt2p_instance_labeled_loss:
+            gt2p_inst_weight_eff = float(self.query_gt2p_instance_labeled_loss_weight) * gt2p_cooldown_scale
+            gt2p_instance_labeled_loss = self.query_head.compute_query_gt2p_instance_labeled_loss(
+                gaussian_centers_world=centers_world_dt_gt2p_tq3,
+                gaussian_sigmas_world=gaussian_sigmas_world_loss,
+                gt_inst_center_world_tn3=gt_inst_center_world_tn3,
+                gt_inst_center_valid_tn=gt_inst_center_valid_tn,
+                loss_weight=gt2p_inst_weight_eff,
+                balance_weight=self.query_gt2p_instance_labeled_balance_weight,
+                center_sigma_xyz=self.query_gt2p_instance_labeled_assign_sigma_xyz,
+                sigma_policy=self.query_gt2p_instance_labeled_sigma_policy,
+                tau=self.query_gt2p_instance_labeled_tau,
+            )
+            losses.update(gt2p_instance_labeled_loss)
+
+        # ---- Normalize losses / strip stray dbg entries / namespace ----
+        if self.loss_norm:
+            for loss_key in losses.keys():
+                if loss_key.startswith('loss'):
+                    losses[loss_key] = losses[loss_key] / (losses[loss_key].detach() + 1e-9)
+        _keep_dbg = {
+            "dbg_query_sim_match_cost_weight",
+            "dbg_query_soft_assign_cost_weight",
+            "dbg_query_cls_match_cost_weight",
+            "dbg_query_bev_dice_match_cost_weight",
+        }
+        for k in [k for k in losses if k.startswith("dbg_") and k not in _keep_dbg]:
+            del losses[k]
+        self._namespace_dbg_logs(losses)
+        return losses
+
