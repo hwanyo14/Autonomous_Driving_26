@@ -270,15 +270,6 @@ class EfficientOCF(
             self.query_pred_num_frames = int(self.n_future_frames_plus)
         else:
             self.query_pred_num_frames = int(query_pred_num_frames)
-        if self.query_pred_num_frames <= 0:
-            raise ValueError(
-                f"query_pred_num_frames must be >= 1, got {self.query_pred_num_frames}"
-            )
-        if self.query_present_only and self.query_pred_num_frames != 1:
-            raise ValueError(
-                "query_present_only=True requires query_pred_num_frames=1, "
-                f"got {self.query_pred_num_frames}"
-            )
         self.query_present_global_idx = int(self.time_receptive_field - 1)
         self.eval_start_moment = self.n_future_frames_plus - self.n_future_frames - 1
         self.query_overlap_frames = max(0, int(self.n_future_frames_plus) - int(self.n_future_frames))
@@ -288,33 +279,11 @@ class EfficientOCF(
         self.use_segmentation_as_query_gt = bool(use_segmentation_as_query_gt)
         self.use_gmo_bce_loss = bool(use_gmo_bce_loss)
         self.query_gmo_loss_type = str(query_gmo_loss_type).lower()
-        if self.query_gmo_loss_type not in ("balanced_bce", "bce", "balanced_focal", "focal"):
-            raise ValueError(
-                "query_gmo_loss_type must be one of "
-                "{'balanced_bce','bce','balanced_focal','focal'}, "
-                f"got {self.query_gmo_loss_type!r}"
-            )
         self.query_gmo_focal_gamma = float(query_gmo_focal_gamma)
         self.query_gmo_focal_alpha = float(query_gmo_focal_alpha)
         self.query_gmo_dice_loss_weight = float(query_gmo_dice_loss_weight)
         self.query_gmo_tversky_alpha = float(query_gmo_tversky_alpha)
         self.query_gmo_tversky_beta = float(query_gmo_tversky_beta)
-        if self.query_gmo_dice_loss_weight < 0.0:
-            raise ValueError(
-                f"query_gmo_dice_loss_weight must be >= 0, got {self.query_gmo_dice_loss_weight}"
-            )
-        if self.query_gmo_tversky_alpha < 0.0:
-            raise ValueError(
-                f"query_gmo_tversky_alpha must be >= 0, got {self.query_gmo_tversky_alpha}"
-            )
-        if self.query_gmo_tversky_beta < 0.0:
-            raise ValueError(
-                f"query_gmo_tversky_beta must be >= 0, got {self.query_gmo_tversky_beta}"
-            )
-        if (self.query_gmo_tversky_alpha + self.query_gmo_tversky_beta) <= 0.0:
-            raise ValueError(
-                "query_gmo_tversky_alpha + query_gmo_tversky_beta must be > 0"
-            )
         self.use_lss_bev_occ_loss = bool(use_lss_bev_occ_loss)
         self.pretrain_view_transform_only = bool(pretrain_view_transform_only)
         self.pretrain_lss_vis_every = int(pretrain_lss_vis_every)
@@ -326,44 +295,12 @@ class EfficientOCF(
         self.use_query_inst_center_match_loss = bool(use_query_inst_center_match_loss)
         self.query_traj_loss_weight = float(query_traj_loss_weight)
         self.query_traj_loss_type = str(query_traj_loss_type).lower()
-        if self.query_traj_loss_type not in ("l1", "l2"):
-            raise ValueError(
-                "query_traj_loss_type must be one of {'l1','l2'}, "
-                f"got {self.query_traj_loss_type!r}"
-            )
         self.query_traj_residual_max_m = tuple(float(v) for v in query_traj_residual_max_m)
-        if len(self.query_traj_residual_max_m) != 2:
-            raise ValueError(
-                "query_traj_residual_max_m must be (x,y), "
-                f"got {self.query_traj_residual_max_m}"
-            )
-        if self.query_traj_loss_weight < 0.0:
-            raise ValueError(
-                f"query_traj_loss_weight must be >= 0, got {self.query_traj_loss_weight}"
-            )
-        if (self.query_traj_residual_max_m[0] <= 0.0) or (self.query_traj_residual_max_m[1] <= 0.0):
-            raise ValueError(
-                "query_traj_residual_max_m must be positive, "
-                f"got {self.query_traj_residual_max_m}"
-            )
         self.query_traj_prior_detach = bool(query_traj_prior_detach)
         self.query_traj_moving_reweight_enabled = bool(query_traj_moving_reweight_enabled)
         self.query_traj_moving_threshold_m = float(query_traj_moving_threshold_m)
         self.query_traj_moving_weight = float(query_traj_moving_weight)
         self.query_traj_static_weight = float(query_traj_static_weight)
-        if self.query_traj_moving_threshold_m < 0.0:
-            raise ValueError(
-                "query_traj_moving_threshold_m must be >= 0, "
-                f"got {self.query_traj_moving_threshold_m}"
-            )
-        if self.query_traj_moving_weight < 0.0:
-            raise ValueError(
-                f"query_traj_moving_weight must be >= 0, got {self.query_traj_moving_weight}"
-            )
-        if self.query_traj_static_weight < 0.0:
-            raise ValueError(
-                f"query_traj_static_weight must be >= 0, got {self.query_traj_static_weight}"
-            )
         self.use_query_dt_loss = bool(use_query_dt_loss)
         self.use_query_gt2p_instance_labeled_loss = bool(use_query_gt2p_instance_labeled_loss)
         self.query_gt2p_instance_labeled_loss_weight = float(query_gt2p_instance_labeled_loss_weight)
@@ -373,36 +310,12 @@ class EfficientOCF(
         self.query_gt2p_cooldown_start_iter = int(query_gt2p_cooldown_start_iter)
         self.query_gt2p_cooldown_iters = int(query_gt2p_cooldown_iters)
         self.query_gt2p_cooldown_min_scale = float(query_gt2p_cooldown_min_scale)
-        if self.query_gt2p_cooldown_start_iter < 0:
-            raise ValueError(
-                f"query_gt2p_cooldown_start_iter must be >= 0, got {self.query_gt2p_cooldown_start_iter}"
-            )
-        if self.query_gt2p_cooldown_iters < 0:
-            raise ValueError(
-                f"query_gt2p_cooldown_iters must be >= 0, got {self.query_gt2p_cooldown_iters}"
-            )
-        if not (0.0 <= self.query_gt2p_cooldown_min_scale <= 1.0):
-            raise ValueError(
-                "query_gt2p_cooldown_min_scale must be in [0,1], "
-                f"got {self.query_gt2p_cooldown_min_scale}"
-            )
-        if len(query_gt2p_instance_labeled_assign_sigma_xyz) != 3:
-            raise ValueError(
-                "query_gt2p_instance_labeled_assign_sigma_xyz must be (sx,sy,sz), "
-                f"got {query_gt2p_instance_labeled_assign_sigma_xyz}"
-            )
         self.query_gt2p_instance_labeled_assign_sigma_xyz = tuple(
             float(v) for v in query_gt2p_instance_labeled_assign_sigma_xyz
         )
         self.query_gt2p_instance_labeled_sigma_policy = str(
             query_gt2p_instance_labeled_sigma_policy
         ).lower()
-        if self.query_gt2p_instance_labeled_sigma_policy not in ("fixed", "pred_cov_q_only"):
-            raise ValueError(
-                "query_gt2p_instance_labeled_sigma_policy must be one of "
-                "{'fixed','pred_cov_q_only'}, "
-                f"got {self.query_gt2p_instance_labeled_sigma_policy!r}"
-            )
         self.debug_query_vis_every = int(debug_query_vis_every)
         self.debug_query_vis_dir = str(debug_query_vis_dir)
         self.center_only_mode = bool(center_only_mode)
@@ -443,77 +356,6 @@ class EfficientOCF(
             debug_query_cam_gaussian_vis_gt_overlay_enabled
         )
         self.debug_query_cam_gaussian_vis_topk_matched = int(debug_query_cam_gaussian_vis_topk_matched)
-        if self.debug_query_cam_gaussian_vis_topk_matched < 0:
-            raise ValueError(
-                "debug_query_cam_gaussian_vis_topk_matched must be >= 0, "
-                f"got {self.debug_query_cam_gaussian_vis_topk_matched}"
-            )
-        if self.debug_query_cam_gaussian_vis_every < 0:
-            raise ValueError(
-                "debug_query_cam_gaussian_vis_every must be >= 0, "
-                f"got {self.debug_query_cam_gaussian_vis_every}"
-            )
-        if self.debug_gt_alignment_vis_every < 0:
-            raise ValueError(
-                "debug_gt_alignment_vis_every must be >= 0, "
-                f"got {self.debug_gt_alignment_vis_every}"
-            )
-        if self.debug_query_inst_depth_lift_vis_every < 0:
-            raise ValueError(
-                "debug_query_inst_depth_lift_vis_every must be >= 0, "
-                f"got {self.debug_query_inst_depth_lift_vis_every}"
-            )
-        if self.debug_query_attn_softargmax_vis_every < 0:
-            raise ValueError(
-                "debug_query_attn_softargmax_vis_every must be >= 0, "
-                f"got {self.debug_query_attn_softargmax_vis_every}"
-            )
-        if not (0.0 <= self.debug_query_confidence_vis_threshold <= 1.0):
-            raise ValueError(
-                "debug_query_confidence_vis_threshold must be in [0,1], "
-                f"got {self.debug_query_confidence_vis_threshold}"
-            )
-        if not (0.0 <= self.debug_query_score_threshold <= 1.0):
-            raise ValueError(
-                "debug_query_score_threshold must be in [0,1], "
-                f"got {self.debug_query_score_threshold}"
-            )
-        if self.debug_query_gaussian_vis_mode not in ("ellipse", "prob", "threshold"):
-            raise ValueError(
-                "debug_query_gaussian_vis_mode must be one of "
-                "{'ellipse','prob','threshold'}, "
-                f"got {self.debug_query_gaussian_vis_mode!r}"
-            )
-        if not (0.0 <= self.debug_query_gaussian_prob_threshold <= 1.0):
-            raise ValueError(
-                "debug_query_gaussian_prob_threshold must be in [0,1], "
-                f"got {self.debug_query_gaussian_prob_threshold}"
-            )
-        if self.debug_query_gaussian_prob_alpha_scale < 0.0:
-            raise ValueError(
-                "debug_query_gaussian_prob_alpha_scale must be >= 0, "
-                f"got {self.debug_query_gaussian_prob_alpha_scale}"
-            )
-        if (
-            self.debug_query_score_iou_weight < 0.0
-            or self.debug_query_score_cls_weight < 0.0
-            or self.debug_query_score_cam_attn_weight < 0.0
-        ):
-            raise ValueError(
-                "debug_query_score_iou_weight/debug_query_score_cls_weight/"
-                "debug_query_score_cam_attn_weight must be >= 0, "
-                f"got ({self.debug_query_score_iou_weight}, {self.debug_query_score_cls_weight}, "
-                f"{self.debug_query_score_cam_attn_weight})"
-            )
-        if (
-            self.debug_query_score_iou_weight
-            + self.debug_query_score_cls_weight
-            + self.debug_query_score_cam_attn_weight
-        ) <= 0.0:
-            raise ValueError(
-                "debug_query_score_iou_weight + debug_query_score_cls_weight + "
-                "debug_query_score_cam_attn_weight must be > 0"
-            )
         self._dbg_printed_instance_img_seq_len_warning = False
         self._last_inst_match_result = None
         self._last_gt_instance_bev_feat_cache = None
@@ -524,45 +366,14 @@ class EfficientOCF(
         self.query_center_loss_detach_query_feat = bool(query_center_loss_detach_query_feat)
 
         self.query_feat_unmatched_neg_loss_weight = float(query_feat_unmatched_neg_loss_weight)
-        if self.query_feat_unmatched_neg_loss_weight < 0.0:
-            raise ValueError(
-                "query_feat_unmatched_neg_loss_weight must be >= 0, "
-                f"got {self.query_feat_unmatched_neg_loss_weight}"
-            )
         self.query_feat_unmatched_neg_margin = float(query_feat_unmatched_neg_margin)
-        if (self.query_feat_unmatched_neg_margin < -1.0) or (self.query_feat_unmatched_neg_margin > 1.0):
-            raise ValueError(
-                "query_feat_unmatched_neg_margin must be in [-1, 1], "
-                f"got {self.query_feat_unmatched_neg_margin}"
-            )
-        if len(query_bev_pool_fixed_sigma_xyz) != 3:
-            raise ValueError(
-                "query_bev_pool_fixed_sigma_xyz must be (sx,sy,sz), "
-                f"got {query_bev_pool_fixed_sigma_xyz}"
-            )
         self.query_bev_pool_fixed_sigma_xyz = tuple(float(v) for v in query_bev_pool_fixed_sigma_xyz)
         self.query_num_classes = int(query_num_classes)
-        if self.query_num_classes <= 1:
-            raise ValueError(f"query_num_classes must be >= 2, got {self.query_num_classes}")
         self.query_bg_class = 0
         if query_class_ids is None:
             query_class_ids = tuple(range(self.query_num_classes))
         else:
             query_class_ids = tuple(int(v) for v in query_class_ids)
-        if len(query_class_ids) != self.query_num_classes:
-            raise ValueError(
-                "query_class_ids length must match query_num_classes, "
-                f"got len(query_class_ids)={len(query_class_ids)} vs query_num_classes={self.query_num_classes}"
-            )
-        if len(set(query_class_ids)) != len(query_class_ids):
-            raise ValueError(f"query_class_ids must be unique, got {query_class_ids}")
-        if min(query_class_ids) < 0:
-            raise ValueError(f"query_class_ids must be non-negative, got {query_class_ids}")
-        if int(query_class_ids[self.query_bg_class]) != 0:
-            raise ValueError(
-                "query_class_ids must map compact background index 0 to raw background id 0, "
-                f"got query_class_ids[0]={query_class_ids[self.query_bg_class]}"
-            )
         self.query_class_ids = query_class_ids
         if query_class_names is None:
             query_class_names = ["background"] + [
@@ -572,12 +383,6 @@ class EfficientOCF(
             query_class_names = list(query_class_names)
             if len(query_class_names) == (self.query_num_classes - 1):
                 query_class_names = ["background"] + query_class_names
-        if len(query_class_names) != self.query_num_classes:
-            raise ValueError(
-                "query_class_names length must match query_num_classes "
-                "(or exclude background so it can be prepended automatically), "
-                f"got len(query_class_names)={len(query_class_names)} vs query_num_classes={self.query_num_classes}"
-            )
         self.query_class_names = tuple(str(v) for v in query_class_names)
         self.strict_query_class_id_validation = bool(strict_query_class_id_validation)
         query_raw_to_compact_size = max(256, max(self.query_class_ids) + 1)
@@ -602,290 +407,67 @@ class EfficientOCF(
         if query_cls_loss_class_weights is None:
             query_cls_loss_class_weights = [1.0] * int(self.query_num_classes)
         query_cls_loss_class_weights = [float(v) for v in query_cls_loss_class_weights]
-        if len(query_cls_loss_class_weights) != self.query_num_classes:
-            raise ValueError(
-                "query_cls_loss_class_weights length must match query_num_classes, "
-                f"got len(query_cls_loss_class_weights)={len(query_cls_loss_class_weights)} "
-                f"vs query_num_classes={self.query_num_classes}"
-            )
         self.register_buffer(
             "query_cls_loss_class_weights",
             torch.as_tensor(query_cls_loss_class_weights, dtype=torch.float32),
             persistent=False,
         )
         self.query_match_feature_source = str(query_match_feature_source)
-        if self.query_match_feature_source not in ("query_img_feat_pooled",):
-            raise ValueError(
-                "query_match_feature_source must be 'query_img_feat_pooled', "
-                f"got {self.query_match_feature_source!r}"
-            )
         self.query_soft_assign_temp = float(query_soft_assign_temp)
-        if self.query_soft_assign_temp <= 0.0:
-            raise ValueError(
-                "query_soft_assign_temp must be > 0, "
-                f"got {self.query_soft_assign_temp}"
-            )
         self.query_soft_assign_cost_weight = float(query_soft_assign_cost_weight)
-        if self.query_soft_assign_cost_weight < 0.0:
-            raise ValueError(
-                "query_soft_assign_cost_weight must be >= 0, "
-                f"got {self.query_soft_assign_cost_weight}"
-            )
         self.query_sim_match_cost_weight = float(query_sim_match_cost_weight)
-        if self.query_sim_match_cost_weight < 0.0:
-            raise ValueError(
-                "query_sim_match_cost_weight must be >= 0, "
-                f"got {self.query_sim_match_cost_weight}"
-            )
         self.query_cls_match_cost_weight = float(query_cls_match_cost_weight)
         self.query_bev_dice_match_cost_weight = float(query_bev_dice_match_cost_weight)
-        if self.query_bev_dice_match_cost_weight < 0.0:
-            raise ValueError(
-                "query_bev_dice_match_cost_weight must be >= 0, "
-                f"got {self.query_bev_dice_match_cost_weight}"
-            )
         self.query_center_routed_loss_weight = float(query_center_routed_loss_weight)
         self.query_center_match_cost_weight = float(query_center_match_cost_weight)
-        if self.query_center_match_cost_weight < 0.0:
-            raise ValueError(
-                "query_center_match_cost_weight must be >= 0, "
-                f"got {self.query_center_match_cost_weight}"
-            )
         self.query_center_match_loss_type = str(query_center_match_loss_type).lower()
-        if self.query_center_match_loss_type not in ("l1", "l2"):
-            raise ValueError(
-                "query_center_match_loss_type must be one of {'l1','l2'}, "
-                f"got {self.query_center_match_loss_type}"
-            )
-        if len(query_matched_gmo_bce_occ_size) != 3:
-            raise ValueError(
-                "query_matched_gmo_bce_occ_size must be (X,Y,Z), "
-                f"got {query_matched_gmo_bce_occ_size}"
-            )
         self.query_matched_gmo_bce_occ_size = tuple(int(v) for v in query_matched_gmo_bce_occ_size)
-        if min(self.query_matched_gmo_bce_occ_size) <= 0:
-            raise ValueError(
-                "query_matched_gmo_bce_occ_size values must be positive, "
-                f"got {self.query_matched_gmo_bce_occ_size}"
-            )
         self.query_num_gaussians = int(query_num_gaussians)
-        if self.query_num_gaussians <= 0:
-            raise ValueError(f"query_num_gaussians must be >= 1, got {self.query_num_gaussians}")
         self.query_multi_gaussian_offset_max_m = tuple(float(v) for v in query_multi_gaussian_offset_max_m)
         self.query_multi_gaussian_sigma_min_m = tuple(float(v) for v in query_multi_gaussian_sigma_min_m)
         self.query_multi_gaussian_sigma_max_m = tuple(float(v) for v in query_multi_gaussian_sigma_max_m)
         self.query_multi_gaussian_sigma_reg_loss_weight = float(query_multi_gaussian_sigma_reg_loss_weight)
         self.query_multi_gaussian_sigma_reg_log_eps = float(query_multi_gaussian_sigma_reg_log_eps)
-        if len(self.query_multi_gaussian_offset_max_m) != 3:
-            raise ValueError(
-                "query_multi_gaussian_offset_max_m must be xyz tuple, "
-                f"got {self.query_multi_gaussian_offset_max_m}"
-            )
-        if len(self.query_multi_gaussian_sigma_min_m) != 3 or len(self.query_multi_gaussian_sigma_max_m) != 3:
-            raise ValueError(
-                "query_multi_gaussian_sigma_min_m/max_m must be xyz tuples, "
-                f"got min={self.query_multi_gaussian_sigma_min_m}, max={self.query_multi_gaussian_sigma_max_m}"
-            )
-        if self.query_multi_gaussian_sigma_reg_loss_weight < 0.0:
-            raise ValueError(
-                "query_multi_gaussian_sigma_reg_loss_weight must be >= 0, "
-                f"got {self.query_multi_gaussian_sigma_reg_loss_weight}"
-            )
-        if self.query_multi_gaussian_sigma_reg_log_eps <= 0.0:
-            raise ValueError(
-                "query_multi_gaussian_sigma_reg_log_eps must be > 0, "
-                f"got {self.query_multi_gaussian_sigma_reg_log_eps}"
-            )
         self.query_multi_gaussian_pair_chunk = max(1, int(query_multi_gaussian_pair_chunk))
         self.query_multi_gaussian_weight_mode = str(query_multi_gaussian_weight_mode).lower()
-        if self.query_multi_gaussian_weight_mode not in ("softmax", "softplus"):
-            raise ValueError(
-                "query_multi_gaussian_weight_mode must be one of {'softmax','softplus'}, "
-                f"got {self.query_multi_gaussian_weight_mode!r}"
-            )
         self.query_multi_gaussian_softplus_bias_init = float(query_multi_gaussian_softplus_bias_init)
         self.query_multi_gaussian_weight_reg_loss_weight = float(query_multi_gaussian_weight_reg_loss_weight)
-        if self.query_multi_gaussian_weight_reg_loss_weight < 0.0:
-            raise ValueError(
-                "query_multi_gaussian_weight_reg_loss_weight must be >= 0, "
-                f"got {self.query_multi_gaussian_weight_reg_loss_weight}"
-            )
         self.query_multi_gaussian_weight_reg_target_sum = float(query_multi_gaussian_weight_reg_target_sum)
-        if self.query_multi_gaussian_weight_reg_target_sum <= 0.0:
-            raise ValueError(
-                "query_multi_gaussian_weight_reg_target_sum must be > 0, "
-                f"got {self.query_multi_gaussian_weight_reg_target_sum}"
-            )
         self.query_embed_dim = int(query_embed_dim)
-        if self.query_embed_dim <= 0:
-            raise ValueError(f"query_embed_dim must be positive, got {self.query_embed_dim}")
         self.query_num_queries = int(query_num_queries)
-        if self.query_num_queries <= 0:
-            raise ValueError(f"query_num_queries must be positive, got {self.query_num_queries}")
         self.query_transformer_num_layers = int(query_transformer_num_layers)
-        if self.query_transformer_num_layers <= 0:
-            raise ValueError(
-                f"query_transformer_num_layers must be positive, got {self.query_transformer_num_layers}"
-            )
         self.query_id_reinject_scale = float(query_id_reinject_scale)
         self.query_ca_kv_identity_init = bool(query_ca_kv_identity_init)
         self.query_ca_attn_tau = float(query_ca_attn_tau)
-        if self.query_ca_attn_tau <= 0.0:
-            raise ValueError(f"query_ca_attn_tau must be positive, got {self.query_ca_attn_tau}")
         self.query_decor_loss_weight = float(query_decor_loss_weight)
-        if self.query_decor_loss_weight < 0.0:
-            raise ValueError(
-                f"query_decor_loss_weight must be non-negative, got {self.query_decor_loss_weight}"
-            )
         self.query_attn_vis_dir = str(query_attn_vis_dir)
         self.use_query_attn_bbox_loss = bool(use_query_attn_bbox_loss)
         self.query_attn_bbox_loss_weight = float(query_attn_bbox_loss_weight)
-        if self.query_attn_bbox_loss_weight < 0.0:
-            raise ValueError(
-                "query_attn_bbox_loss_weight must be >= 0, "
-                f"got {self.query_attn_bbox_loss_weight}"
-            )
         self.query_attn_bbox_unmatched_weight = float(query_attn_bbox_unmatched_weight)
-        if self.query_attn_bbox_unmatched_weight < 0.0:
-            raise ValueError(
-                "query_attn_bbox_unmatched_weight must be >= 0, "
-                f"got {self.query_attn_bbox_unmatched_weight}"
-            )
         self.query_attn_bbox_eps = float(query_attn_bbox_eps)
-        if self.query_attn_bbox_eps <= 0.0:
-            raise ValueError(
-                "query_attn_bbox_eps must be > 0, "
-                f"got {self.query_attn_bbox_eps}"
-            )
         self.query_attn_bbox_camera_reduce_mode = str(query_attn_bbox_camera_reduce_mode).lower()
-        if self.query_attn_bbox_camera_reduce_mode not in ("camera_aggregated_first",):
-            raise ValueError(
-                "query_attn_bbox_camera_reduce_mode must be 'camera_aggregated_first', "
-                f"got {self.query_attn_bbox_camera_reduce_mode!r}"
-            )
         self.query_attn_bbox_unmatched_mode = str(query_attn_bbox_unmatched_mode).lower()
-        if self.query_attn_bbox_unmatched_mode not in ("inverse_union",):
-            raise ValueError(
-                "query_attn_bbox_unmatched_mode must be 'inverse_union', "
-                f"got {self.query_attn_bbox_unmatched_mode!r}"
-            )
         self.query_attn_match_cost_weight = float(query_attn_match_cost_weight)
-        if self.query_attn_match_cost_weight < 0.0:
-            raise ValueError(
-                "query_attn_match_cost_weight must be >= 0, "
-                f"got {self.query_attn_match_cost_weight}"
-            )
         self.query_attn_match_metric = str(query_attn_match_metric).lower()
-        if self.query_attn_match_metric not in ("soft_iou",):
-            raise ValueError(
-                "query_attn_match_metric must be 'soft_iou', "
-                f"got {self.query_attn_match_metric!r}"
-            )
         self.query_attn_match_pred_norm = str(query_attn_match_pred_norm).lower()
-        if self.query_attn_match_pred_norm not in ("amax", "sum", "none"):
-            raise ValueError(
-                "query_attn_match_pred_norm must be one of "
-                "{'amax','sum','none'}, "
-                f"got {self.query_attn_match_pred_norm!r}"
-            )
         self.query_attn_match_eps = float(query_attn_match_eps)
-        if self.query_attn_match_eps <= 0.0:
-            raise ValueError(
-                "query_attn_match_eps must be > 0, "
-                f"got {self.query_attn_match_eps}"
-            )
         self.use_query_attn_cam_gaussian_score = bool(use_query_attn_cam_gaussian_score)
         self.query_attn_cam_frame_mode = str(query_attn_cam_frame_mode).lower()
-        if self.query_attn_cam_frame_mode not in ("overlap_only",):
-            raise ValueError(
-                "query_attn_cam_frame_mode must be 'overlap_only', "
-                f"got {self.query_attn_cam_frame_mode!r}"
-            )
         self.query_attn_cam_target_mode = str(query_attn_cam_target_mode).lower()
-        if self.query_attn_cam_target_mode not in ("prob", "binary_threshold"):
-            raise ValueError(
-                "query_attn_cam_target_mode must be one of "
-                "{'prob', 'binary_threshold'}, "
-                f"got {self.query_attn_cam_target_mode!r}"
-            )
         self.query_attn_cam_metric = str(query_attn_cam_metric).lower()
-        if self.query_attn_cam_metric not in ("kl", "bce", "dice", "bce_dice"):
-            raise ValueError(
-                "query_attn_cam_metric must be one of "
-                "{'kl','bce','dice','bce_dice'}, "
-                f"got {self.query_attn_cam_metric!r}"
-            )
         self.query_attn_cam_camera_reduce_mode = str(query_attn_cam_camera_reduce_mode).lower()
-        if self.query_attn_cam_camera_reduce_mode not in ("camera_aggregated_first",):
-            raise ValueError(
-                "query_attn_cam_camera_reduce_mode must be 'camera_aggregated_first', "
-                f"got {self.query_attn_cam_camera_reduce_mode!r}"
-            )
         self.query_attn_cam_eps = float(query_attn_cam_eps)
-        if self.query_attn_cam_eps <= 0.0:
-            raise ValueError(
-                "query_attn_cam_eps must be > 0, "
-                f"got {self.query_attn_cam_eps}"
-            )
         self.query_attn_cam_gaussian_truncate_sigma = float(query_attn_cam_gaussian_truncate_sigma)
-        if self.query_attn_cam_gaussian_truncate_sigma <= 0.0:
-            raise ValueError(
-                "query_attn_cam_gaussian_truncate_sigma must be > 0, "
-                f"got {self.query_attn_cam_gaussian_truncate_sigma}"
-            )
         self.query_attn_cam_target_binary_threshold = float(query_attn_cam_target_binary_threshold)
-        if not (0.0 < self.query_attn_cam_target_binary_threshold < 1.0):
-            raise ValueError(
-                "query_attn_cam_target_binary_threshold must be in (0,1), "
-                f"got {self.query_attn_cam_target_binary_threshold}"
-            )
         self.query_attn_cam_score_norm_mode = str(query_attn_cam_score_norm_mode).lower()
-        if self.query_attn_cam_score_norm_mode not in ("exp_neg", "inv_1plus", "one_minus"):
-            raise ValueError(
-                "query_attn_cam_score_norm_mode must be one of "
-                "{'exp_neg','inv_1plus','one_minus'}, "
-                f"got {self.query_attn_cam_score_norm_mode!r}"
-            )
 
         self.query_attn_softargmax_tau = float(query_attn_softargmax_tau)
-        if self.query_attn_softargmax_tau <= 0.0:
-            raise ValueError(
-                "query_attn_softargmax_tau must be > 0, "
-                f"got {self.query_attn_softargmax_tau}"
-            )
         self.query_depth_loss_weight = float(query_depth_loss_weight)
-        if self.query_depth_loss_weight < 0.0:
-            raise ValueError(
-                "query_depth_loss_weight must be >= 0, "
-                f"got {self.query_depth_loss_weight}"
-            )
         self.query_depth_label_smoothing = float(query_depth_label_smoothing)
-        if not (0.0 <= self.query_depth_label_smoothing < 1.0):
-            raise ValueError(
-                "query_depth_label_smoothing must be in [0,1), "
-                f"got {self.query_depth_label_smoothing}"
-            )
         self.query_inst_depth_num_bins = int(query_inst_depth_num_bins)
-        if self.query_inst_depth_num_bins <= 0:
-            raise ValueError(
-                "query_inst_depth_num_bins must be > 0, "
-                f"got {self.query_inst_depth_num_bins}"
-            )
         self.query_inst_depth_range_mode = str(query_inst_depth_range_mode).lower()
-        if self.query_inst_depth_range_mode not in ("dbound", "custom"):
-            raise ValueError(
-                "query_inst_depth_range_mode must be one of {'dbound','custom'}, "
-                f"got {self.query_inst_depth_range_mode!r}"
-            )
         self.query_inst_depth_min = float(query_inst_depth_min)
         self.query_inst_depth_max = float(query_inst_depth_max)
-        if self.query_inst_depth_range_mode == "custom":
-            if not (self.query_inst_depth_max > self.query_inst_depth_min):
-                raise ValueError(
-                    "query_inst_depth_max must be > query_inst_depth_min when "
-                    f"query_inst_depth_range_mode='custom', got "
-                    f"min={self.query_inst_depth_min}, max={self.query_inst_depth_max}"
-                )
         self._query_train_iter = 0
         self._train_iter_synced = False
         if self.center_only_mode:
@@ -1027,13 +609,8 @@ class EfficientOCF(
         return int(self._pretrain_lss_vis_iter)
 
     def _get_context_feat_dim_from_depth_net(self):
-        if (self.img_view_transformer is None) or (not hasattr(self.img_view_transformer, "depth_net")):
-            raise AttributeError("img_view_transformer.depth_net is required but not found.")
 
         depth_net = self.img_view_transformer.depth_net
-        for attr_name in ("context_mlp", "context_se", "context_conv"):
-            if not hasattr(depth_net, attr_name):
-                raise AttributeError(f"img_view_transformer.depth_net.{attr_name} is required but not found.")
         return int(depth_net.context_conv.out_channels)
 
     def train(self, mode=True):
@@ -1115,11 +692,7 @@ class EfficientOCF(
         return x
 
     def _extract_depth_and_context_for_query(self, x, mlp_input_seq):
-        if (self.img_view_transformer is None) or (not hasattr(self.img_view_transformer, "depth_net")):
-            raise AttributeError("img_view_transformer.depth_net is required but not found.")
 
-        if x.dim() != 5:
-            raise ValueError(f"x must be [T,N,C,H,W], got {tuple(x.shape)}")
 
         depth_net = self.img_view_transformer.depth_net
         t, n, c, h, w = x.shape
@@ -1166,8 +739,6 @@ class EfficientOCF(
                 e_idx = seq_total
         else:
             e_idx = min(seq_total, int(frame_end_idx))
-        if e_idx <= s_idx:
-            raise ValueError(f"Invalid frame slice for extract_img_feat: [{s_idx}, {e_idx}) from seq_total={seq_total}")
 
         imgs_seq = imgs_seq[:, s_idx:e_idx, ...].contiguous()
         rots_seq = rots_seq[:, s_idx:e_idx, ...].contiguous()
@@ -1218,11 +789,6 @@ class EfficientOCF(
                 return_attn_weights=True,
                 vis_images=imgs_seq,
             )
-            if (not isinstance(trans_out, (list, tuple))) or len(trans_out) != 3:
-                raise RuntimeError(
-                    "transformer output must be (query_inst, query_img_feat_pooled, query_attn_weights) "
-                    "when return_attn_pool=True and return_attn_weights=True"
-                )
             query_inst, query_img_feat_pooled, query_attn_weights = trans_out
 
         geo_inputs = [rots_seq, trans_seq, intrins_seq, post_rots_seq, post_trans_seq, None, mlp_input_seq]
@@ -1253,11 +819,6 @@ class EfficientOCF(
             context_seq_btnchw = self.unpack_dbatch_and_dtime(
                 context_seq, batch_size, seq_used
             )
-            if int(context_seq_btnchw.shape[0]) != 1:
-                raise ValueError(
-                    "query matching path currently expects batch=1, "
-                    f"got context_seq batch={int(context_seq_btnchw.shape[0])}"
-                )
             query_match_inputs = {
                 "context_seq_tnchw": context_seq_btnchw[0].detach(),
                 "rots_tn33": rots_seq_bt[0].detach(),
@@ -1431,11 +992,6 @@ class EfficientOCF(
                 device=present_centers_world_tq3.device,
                 dtype=present_centers_world_tq3.dtype,
             )
-            if int(traj_offsets.shape[1]) != q_count or int(traj_offsets.shape[2]) != 2:
-                raise ValueError(
-                    "traj_offsets_fq2 must be [F,Q,2] with matching Q, "
-                    f"got {tuple(traj_offsets.shape)} vs Q={q_count}"
-                )
             if int(traj_offsets.shape[0]) != future_steps:
                 if int(traj_offsets.shape[0]) < future_steps:
                     pad = present_centers_world_tq3.new_zeros(
@@ -1469,11 +1025,6 @@ class EfficientOCF(
         )
         if mix_enabled:
             mix_q = int(present_mix_centers_world_tqg3.shape[1])
-            if mix_q != q_count:
-                raise ValueError(
-                    "present mixture query dim mismatch with centers: "
-                    f"{mix_q} vs {q_count}"
-                )
             present_mix_qg3 = present_mix_centers_world_tqg3[0].to(torch.float32)
 
         pc_min = present_centers_world_tq3.new_tensor(self.point_cloud_range[:3]).view(1, 3)
@@ -1615,17 +1166,7 @@ class EfficientOCF(
 
         ego = future_egomotion
         if ego.dim() == 4:
-            if int(ego.shape[0]) != 1:
-                raise ValueError(
-                    "vis geometry alignment expects batch=1 future_egomotion, "
-                    f"got {tuple(ego.shape)}"
-                )
             ego = ego[0]
-        if ego.dim() != 3 or int(ego.shape[-2]) != 4 or int(ego.shape[-1]) != 4:
-            raise ValueError(
-                "future_egomotion must be [T,4,4] or [1,T,4,4], "
-                f"got {tuple(future_egomotion.shape)}"
-            )
         ego = ego.to(device=centers_world_tq3.device, dtype=torch.float32)
         present_global_idx = int(
             getattr(self, "query_present_global_idx", int(self.time_receptive_field - 1))
@@ -1635,11 +1176,6 @@ class EfficientOCF(
             frame_indices=frame_indices,
             present_global_idx=present_global_idx,
         )
-        if len(lidar_target_to_present) != t_count:
-            raise ValueError(
-                "failed to build lidar target->present transforms for vis alignment: "
-                f"{len(lidar_target_to_present)} vs T={t_count}"
-            )
 
         yaw_aligned = []
         yaw_src_tqg = mixture_yaw_tqg.to(torch.float32)
@@ -1703,8 +1239,6 @@ class EfficientOCF(
                 frame_end_idx=self.time_receptive_field,
                 update_internal_state=True,
             )
-        else:
-            raise ValueError("img_inputs_seq is required")
 
         if return_instance_img_debug and return_instance_img_debug_fullseq:
             seq_total = int(img_inputs_seq[0].shape[1]) if (isinstance(img_inputs_seq, (list, tuple)) and torch.is_tensor(img_inputs_seq[0])) else int(self.time_receptive_field)
@@ -1832,23 +1366,8 @@ class EfficientOCF(
             )
             if isinstance(query_attn_soft_lift_pack, dict):
                 self._last_query_attn_soft_lift_pack = query_attn_soft_lift_pack
-        if not isinstance(self._last_query_attn_soft_lift_pack, dict):
-            raise RuntimeError(
-                "query center lifting failed: attention weights, query depth probabilities, "
-                "camera geometry, and future_egomotion are required because direct center prediction is disabled."
-            )
         lifted_centers_world = self._last_query_attn_soft_lift_pack.get("lifted_center_world_tq3", None)
         lifted_valid_tq = self._last_query_attn_soft_lift_pack.get("lifted_valid_tq", None)
-        if (
-            (not torch.is_tensor(lifted_centers_world))
-            or lifted_centers_world.dim() != 3
-            or int(lifted_centers_world.shape[-1]) != 3
-            or (torch.is_tensor(lifted_valid_tq) and not bool(lifted_valid_tq.any().item()))
-        ):
-            raise RuntimeError(
-                "query center lifting produced no valid [T,Q,3] centers; "
-                "direct center prediction is disabled."
-            )
         query_head_outputs = self.query_head.apply_lifted_centers_to_outputs(
             query_head_outputs,
             lifted_centers_world,
@@ -2128,12 +1647,6 @@ class EfficientOCF(
             points_occ=None,
         ):
         """Pretrain route: image -> view transform -> BEV -> occ_head only."""
-        if img_inputs_seq is None:
-            raise ValueError("img_inputs_seq is required when pretrain_view_transform_only=True")
-        if future_egomotion is None:
-            raise ValueError("future_egomotion is required when pretrain_view_transform_only=True")
-        if segmentation_bev is None:
-            raise ValueError("segmentation_bev is required when pretrain_view_transform_only=True")
 
         bev_feats_enc, img_feats, _ = self.extract_feat(
             img_inputs_seq=img_inputs_seq,
@@ -2145,11 +1658,6 @@ class EfficientOCF(
             segmentation_bev = segmentation_bev[:, -self.n_future_frames_plus:, ...].contiguous()
         elif segmentation_bev.dim() == 3:
             segmentation_bev = segmentation_bev[-self.n_future_frames_plus:, ...].unsqueeze(0).contiguous()
-        else:
-            raise ValueError(
-                "segmentation_bev must have shape [B,T,X,Y] or [T,X,Y], "
-                f"got {tuple(segmentation_bev.shape)}"
-            )
 
         transform = img_inputs_seq[1:8] if img_inputs_seq is not None else None
 

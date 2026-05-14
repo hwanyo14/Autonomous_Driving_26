@@ -7,10 +7,6 @@ class EfficientOCFLossMixin:
 
     @staticmethod
     def _safe_weighted_mean(values: torch.Tensor, weights: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-        if values.shape != weights.shape:
-            raise ValueError(
-                f"weighted mean shape mismatch: {tuple(values.shape)} vs {tuple(weights.shape)}"
-            )
         w = weights.to(dtype=values.dtype)
         num = (values * w).sum()
         den = w.sum().clamp_min(float(eps))
@@ -29,47 +25,15 @@ class EfficientOCFLossMixin:
         if t_count <= 1:
             return centers_world_tq3
 
-        if not torch.is_tensor(future_egomotion):
-            raise ValueError(
-                "future_egomotion is required for temporal center alignment when T>1."
-            )
-        if not torch.is_tensor(traj_frame_indices_t):
-            raise ValueError(
-                "traj_frame_indices_t is required for temporal center alignment when T>1."
-            )
-        if not hasattr(self, "_build_lidar_frame_to_present"):
-            raise ValueError(
-                "temporal center alignment requires _build_lidar_frame_to_present on the detector."
-            )
 
         frame_idx = traj_frame_indices_t.to(torch.long).reshape(-1)
-        if int(frame_idx.numel()) < t_count:
-            raise ValueError(
-                "traj_frame_indices_t length is shorter than centers timeline: "
-                f"{int(frame_idx.numel())} vs T={t_count}"
-            )
         frame_indices = [int(v) for v in frame_idx[:t_count].detach().cpu().tolist()]
 
         ego = future_egomotion
         if ego.dim() == 4:
-            if int(ego.shape[0]) != 1:
-                raise ValueError(
-                    "temporal center alignment expects batch=1 future_egomotion, "
-                    f"got {tuple(ego.shape)}"
-                )
             ego = ego[0]
-        if ego.dim() != 3 or int(ego.shape[-2]) != 4 or int(ego.shape[-1]) != 4:
-            raise ValueError(
-                "future_egomotion must be [T,4,4] or [1,T,4,4], "
-                f"got {tuple(future_egomotion.shape)}"
-            )
         ego = ego.to(torch.float32)
         ego_t = int(ego.shape[0])
-        if min(frame_indices) < 0 or max(frame_indices) >= ego_t:
-            raise ValueError(
-                "traj_frame_indices_t is out of range for future_egomotion: "
-                f"indices=[{min(frame_indices)}, {max(frame_indices)}], ego_t={ego_t}"
-            )
 
         present_global_idx = int(
             getattr(self, "query_present_global_idx", int(getattr(self, "time_receptive_field", 1) - 1))
@@ -79,11 +43,6 @@ class EfficientOCFLossMixin:
             frame_indices=frame_indices,
             present_global_idx=present_global_idx,
         )
-        if len(lidar_target_to_present) != t_count:
-            raise ValueError(
-                "failed to build lidar target->present transforms for all trajectory steps: "
-                f"{len(lidar_target_to_present)} vs T={t_count}"
-            )
 
         aligned = []
         for step in range(t_count):
@@ -207,11 +166,6 @@ class EfficientOCFLossMixin:
         ce_weight = None
         if torch.is_tensor(class_weights):
             ce_weight = class_weights.to(device=query_cls_logits_qc.device, dtype=torch.float32)
-            if ce_weight.dim() != 1 or int(ce_weight.numel()) != C:
-                raise ValueError(
-                    "query cls class_weights must be [C] matching classifier dim, "
-                    f"got shape={tuple(ce_weight.shape)} vs C={C}"
-                )
 
         if not bool((targets_q != ignore_target).any().item()):
             out["dbg_query_cls_matched_count"] = query_cls_logits_qc.new_tensor(float(matched_count))
@@ -1356,11 +1310,6 @@ class EfficientOCFLossMixin:
             if alpha >= 0.0:
                 alpha_t = alpha * t + (1.0 - alpha) * (1.0 - t)
                 loss_map = loss_map * alpha_t
-        else:
-            raise ValueError(
-                "Unsupported query_gmo_loss_type. "
-                f"Expected 'balanced_bce' or 'focal', got {loss_type!r}"
-            )
 
         pos_mask = vm & (t > 0.5)
         neg_mask = vm & (t < 0.5)

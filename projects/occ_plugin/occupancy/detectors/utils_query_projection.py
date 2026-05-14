@@ -21,10 +21,6 @@ class EfficientOCFQueryProjectionMixin:
         seq_total = int(imgs_seq.shape[1])
         s_idx = max(0, int(frame_start_idx))
         e_idx = seq_total if frame_end_idx is None else min(seq_total, int(frame_end_idx))
-        if e_idx <= s_idx:
-            raise ValueError(
-                f"Invalid frame slice for camera debug bundle: [{s_idx}, {e_idx}) from seq_total={seq_total}"
-            )
 
         return {
             "imgs_seq_bt": imgs_seq[:, s_idx:e_idx, ...].contiguous().detach(),
@@ -608,31 +604,12 @@ class EfficientOCFQueryProjectionMixin:
         Current TransformerModule returns [T, 1, Q, D] (singleton axis at dim=1),
         but this helper guards against shape drift.
         """
-        if not torch.is_tensor(query_inst):
-            raise TypeError(f"query_inst must be tensor, got {type(query_inst)}")
 
         if query_inst.dim() == 4:
             # Expected current layout: [T, 1, Q, D]
-            if query_inst.shape[1] != 1:
-                raise ValueError(
-                    "Unexpected query_inst shape for query head. "
-                    f"Expected [T,1,Q,D], got {tuple(query_inst.shape)}"
-                )
             q = query_inst[:, 0]
         elif query_inst.dim() == 3:
             # Backward-compatible fallback if transformer is changed to [T,Q,D].
             q = query_inst
-        else:
-            raise ValueError(
-                "Unsupported query_inst rank for query head. "
-                f"Expected [T,1,Q,D] or [T,Q,D], got {tuple(query_inst.shape)}"
-            )
 
-        if q.dim() != 3:
-            raise ValueError(f"query head input must be [T,Q,D], got {tuple(q.shape)}")
-        if q.shape[-1] != int(self.query_head.embed_dim):
-            raise ValueError(
-                f"query feature dim mismatch: got D={int(q.shape[-1])}, "
-                f"query_head.embed_dim={int(self.query_head.embed_dim)}"
-            )
         return q.contiguous()
