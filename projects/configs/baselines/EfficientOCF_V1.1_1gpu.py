@@ -337,7 +337,7 @@ val_config['test_capacity'] = 100
 # In our work we use 8 NVIDIA A100 GPUs.
 data = dict(
     samples_per_gpu=1,
-    workers_per_gpu=2,
+    workers_per_gpu=1,
     train=train_config,
     # val=test_config,
     val=val_config,
@@ -379,8 +379,6 @@ my_voxel_out_indices = (0, 1, 2, 3)
 
 # Query matching / auxiliary losses.
 gn_cfg = dict(type='GN', num_groups=16, requires_grad=True)
-query_feat_align_loss_weight = 0.0
-
 use_query_attn_bbox_loss = True
 query_attn_bbox_loss_weight = 1.0
 query_attn_bbox_unmatched_weight = 0.25
@@ -397,11 +395,7 @@ query_attn_cam_gaussian_truncate_sigma = 1.777
 query_attn_cam_target_binary_threshold = 0.5
 query_attn_cam_score_norm_mode = "exp_neg"
 
-use_query_cam_proj_consistency_loss = False
-query_cam_proj_consistency_loss_weight = 1.0
-query_cam_proj_consistency_metric = "bce"
-query_cam_proj_consistency_eps = 1e-6
-query_cam_proj_consistency_pred_norm = "amax"
+
 query_attn_softargmax_tau = 1.0
 query_depth_loss_weight = 1.0
 query_depth_label_smoothing = 0.0
@@ -432,22 +426,23 @@ query_bev_dice_match_cost_weight = 0.0
 query_attn_match_cost_weight = 0.5
 
 query_embed_dim = bev_feat_dim
-query_num_queries = 200
+query_num_queries = 100
 query_transformer_num_layers = 1
 query_id_reinject_scale = 0.2
 query_ca_kv_identity_init = False
 query_ca_attn_tau = 1.0
 query_decor_loss_weight = 1.0
-query_attn_vis_dir = "./work_dirs/query_attn_vis_tmp"
+query_attn_vis_dir = "./work_dirs/query_attn_vis_no_pretrain"
 
 query_center_match_cost_weight = 4.0
 query_center_match_loss_type = 'l1'
 query_center_routed_loss_weight = 0.3
-query_traj_loss_weight = 0.1
+query_traj_loss_weight = 0.5
 query_traj_loss_type = 'l1'
-query_traj_residual_max_m = (8.0, 8.0)
+query_traj_residual_max_m = (15.0, 15.0)
+query_traj_prior_detach = True
 query_traj_moving_reweight_enabled = True
-query_traj_moving_threshold_m = 0.5
+query_traj_moving_threshold_m = 0.8
 query_traj_moving_weight = 5.0
 query_traj_static_weight = 1.0
 
@@ -466,7 +461,7 @@ query_multi_gaussian_softplus_bias_init = -2.0
 query_multi_gaussian_weight_reg_loss_weight = 1e-3
 query_multi_gaussian_weight_reg_target_sum = 1.0
 
-query_gmo_loss_type = 'bce'
+query_gmo_loss_type = 'focal'
 query_gmo_focal_gamma = 2.0
 query_gmo_focal_alpha = 0.25
 query_gmo_dice_loss_weight = 0.5
@@ -497,26 +492,26 @@ debug_query_score_iou_weight = 0.0
 debug_query_score_cls_weight = 0.6
 debug_query_score_cam_attn_weight = 0.4
 debug_instance_img_vis_every = 0
-debug_instance_img_vis_dir = "./work_dirs/instance_img_debug_vis_tmp"
+debug_instance_img_vis_dir = "./work_dirs/instance_img_debug_vis_no_pretrain"
 debug_instance_img_vis_max_instances = 24
 debug_query_cam_gaussian_vis_enabled = True
 debug_query_cam_gaussian_vis_every = 48
-debug_query_cam_gaussian_vis_dir = "./work_dirs/query_cam_gaussian_vis_tmp"
+debug_query_cam_gaussian_vis_dir = "./work_dirs/query_cam_gaussian_vis_no_pretrain"
 debug_query_cam_gaussian_vis_max_queries = 50
 debug_query_cam_gaussian_vis_max_frames = 3
 debug_query_cam_gaussian_vis_gt_overlay_enabled = True
 debug_query_cam_gaussian_vis_topk_matched = 8
 debug_gt_alignment_vis_every = 0
-debug_gt_alignment_vis_dir = "./work_dirs/gt_alignment_vis_tmp"
+debug_gt_alignment_vis_dir = "./work_dirs/gt_alignment_vis_no_pretrain"
 debug_gt_alignment_vis_max_frames = 7
 debug_query_inst_depth_lift_vis_every = 48
-debug_query_inst_depth_lift_vis_dir = "./work_dirs/query_inst_depth_lift_vis_tmp"
+debug_query_inst_depth_lift_vis_dir = "./work_dirs/query_inst_depth_lift_vis_no_pretrain"
 debug_query_inst_depth_lift_vis_max_frames = 2
 debug_query_inst_depth_lift_vis_max_cams = 2
 debug_query_inst_depth_lift_vis_max_instances = 12
 debug_query_attn_softargmax_vis_enabled = True
 debug_query_attn_softargmax_vis_every = 48
-debug_query_attn_softargmax_vis_dir = "./work_dirs/query_attn_softargmax_vis_tmp"
+debug_query_attn_softargmax_vis_dir = "./work_dirs/query_attn_softargmax_vis_no_pretrain"
 debug_query_attn_softargmax_vis_max_frames = 2
 debug_query_attn_softargmax_vis_max_cams = 3
 debug_query_attn_softargmax_vis_max_queries = 16
@@ -546,7 +541,7 @@ model = dict(
     # Pretrain-only visualization.
     pretrain_view_transform_only=False,  # True: image->view_transform->BEV->occ_head only
     pretrain_lss_vis_every=0,  # >0 to save LSS-BEV occupancy visualization periodically
-    pretrain_lss_vis_dir="./work_dirs/tmp_vis",
+    pretrain_lss_vis_dir="./work_dirs/no_pretrain_vis",
     pretrain_lss_vis_prob_thr=0.5,
     pretrain_lss_vis_max_frames=6,
 
@@ -574,7 +569,6 @@ model = dict(
     query_gt2p_cooldown_min_scale=query_gt2p_cooldown_min_scale,
 
     # Query matching / class constraints.
-    query_feat_align_loss_weight=query_feat_align_loss_weight,
     query_class_ids=query_class_ids,
     query_class_names=query_class_names,
     strict_query_class_id_validation=strict_query_class_id_validation,
@@ -630,11 +624,6 @@ model = dict(
     query_attn_cam_gaussian_truncate_sigma=query_attn_cam_gaussian_truncate_sigma,
     query_attn_cam_target_binary_threshold=query_attn_cam_target_binary_threshold,
     query_attn_cam_score_norm_mode=query_attn_cam_score_norm_mode,
-    use_query_cam_proj_consistency_loss=use_query_cam_proj_consistency_loss,
-    query_cam_proj_consistency_loss_weight=query_cam_proj_consistency_loss_weight,
-    query_cam_proj_consistency_metric=query_cam_proj_consistency_metric,
-    query_cam_proj_consistency_eps=query_cam_proj_consistency_eps,
-    query_cam_proj_consistency_pred_norm=query_cam_proj_consistency_pred_norm,
     query_attn_softargmax_tau=query_attn_softargmax_tau,
     query_depth_loss_weight=query_depth_loss_weight,
     query_depth_label_smoothing=query_depth_label_smoothing,
@@ -648,6 +637,7 @@ model = dict(
     query_traj_loss_weight=query_traj_loss_weight,
     query_traj_loss_type=query_traj_loss_type,
     query_traj_residual_max_m=query_traj_residual_max_m,
+    query_traj_prior_detach=query_traj_prior_detach,
     query_traj_moving_reweight_enabled=query_traj_moving_reweight_enabled,
     query_traj_moving_threshold_m=query_traj_moving_threshold_m,
     query_traj_moving_weight=query_traj_moving_weight,
@@ -655,7 +645,7 @@ model = dict(
 
     # Debug controls.
     debug_query_vis_every=8,
-    debug_query_vis_dir="./work_dirs/query_debug_vis_tmp",
+    debug_query_vis_dir="./work_dirs/query_debug_vis_no_pretrain",
     center_only_mode=center_only_mode,
     debug_query_center_marker_radius=debug_query_center_marker_radius,
     debug_query_confidence_vis_threshold=debug_query_confidence_vis_threshold,
@@ -696,10 +686,6 @@ model = dict(
     debug_query_attn_softargmax_vis_max_frames=debug_query_attn_softargmax_vis_max_frames,
     debug_query_attn_softargmax_vis_max_cams=debug_query_attn_softargmax_vis_max_cams,
     debug_query_attn_softargmax_vis_max_queries=debug_query_attn_softargmax_vis_max_queries,
-    debug_print_segmentation_cls_instance3d=True,
-    debug_loss_grad_enabled=False,
-    debug_loss_grad_every=0,
-    debug_loss_grad_include_dt=False,
 
     # Backbone / neck / head.
     img_backbone=dict(
@@ -779,7 +765,7 @@ model = dict(
 # Learning policy params ******************************************
 optimizer = dict(
     type='AdamW',
-    lr=5e-4,
+    lr=3e-4,
     paramwise_cfg=dict(
         custom_keys={
             'img_backbone': dict(lr_mult=0.1),
@@ -799,8 +785,8 @@ optimizer_config = dict(
 lr_config = dict(
     policy='CosineAnnealing',
     warmup='linear',
-    # warmup_iters=4000,
-    warmup_iters=800,
+    warmup_iters=4000,
+    # warmup_iters=800,
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
 )

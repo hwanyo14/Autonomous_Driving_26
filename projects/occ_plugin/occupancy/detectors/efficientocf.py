@@ -112,14 +112,9 @@ class EfficientOCF(
             debug_query_attn_softargmax_vis_max_frames=2,
             debug_query_attn_softargmax_vis_max_cams=3,
             debug_query_attn_softargmax_vis_max_queries=16,
-            debug_print_segmentation_cls_instance3d=False,
-            debug_loss_grad_enabled=False,
-            debug_loss_grad_every=0,
-            debug_loss_grad_include_dt=False,
             query_feat_cosine_threshold=0.30,
             query_center_distance_threshold_m=1.50,
             query_center_loss_detach_query_feat=False,
-            query_feat_align_loss_weight=0.1,
             query_feat_unmatched_neg_loss_weight=0.0,
             query_feat_unmatched_neg_margin=0.2,
             query_bev_pool_fixed_sigma_xyz=(4.0, 4.0, 1.5),
@@ -186,11 +181,6 @@ class EfficientOCF(
             query_attn_cam_gaussian_truncate_sigma=3.0,
             query_attn_cam_target_binary_threshold=0.5,
             query_attn_cam_score_norm_mode="exp_neg",
-            use_query_cam_proj_consistency_loss=False,
-            query_cam_proj_consistency_loss_weight=1.0,
-            query_cam_proj_consistency_metric="bce",
-            query_cam_proj_consistency_eps=1e-6,
-            query_cam_proj_consistency_pred_norm="amax",
             query_attn_softargmax_tau=1.0,
             query_depth_loss_weight=1.0,
             query_depth_label_smoothing=0.0,
@@ -235,7 +225,7 @@ class EfficientOCF(
             "query_quality_min_soft_weight",
             "query_feat_softmax_temp",
             "query_feat_query_agg",
-            "query_feat_align_target",
+
             "query_routing_warmup_iters",
             "height_encoder_backbone",
             "height_predictor",
@@ -527,17 +517,7 @@ class EfficientOCF(
                 "debug_query_score_iou_weight + debug_query_score_cls_weight + "
                 "debug_query_score_cam_attn_weight must be > 0"
             )
-        self.debug_print_segmentation_cls_instance3d = bool(debug_print_segmentation_cls_instance3d)
-        self._dbg_printed_segmentation_cls_instance3d = False
         self._dbg_printed_instance_img_seq_len_warning = False
-        self.debug_loss_grad_enabled = bool(debug_loss_grad_enabled)
-        self.debug_loss_grad_every = int(debug_loss_grad_every)
-        if self.debug_loss_grad_enabled:
-            self.debug_loss_grad_every = max(1, self.debug_loss_grad_every)
-        else:
-            self.debug_loss_grad_every = 0
-        self.debug_loss_grad_include_dt = bool(debug_loss_grad_include_dt)
-        self._dbg_grad_iter = 0
         self._last_inst_match_result = None
         self._last_gt_instance_bev_feat_cache = None
         self._last_query_inst_depth_target_pack = None
@@ -545,7 +525,7 @@ class EfficientOCF(
         self.query_feat_cosine_threshold = float(query_feat_cosine_threshold)
         self.query_center_distance_threshold_m = float(query_center_distance_threshold_m)
         self.query_center_loss_detach_query_feat = bool(query_center_loss_detach_query_feat)
-        self.query_feat_align_loss_weight = float(query_feat_align_loss_weight)
+
         self.query_feat_unmatched_neg_loss_weight = float(query_feat_unmatched_neg_loss_weight)
         if self.query_feat_unmatched_neg_loss_weight < 0.0:
             raise ValueError(
@@ -869,33 +849,7 @@ class EfficientOCF(
                 "{'exp_neg','inv_1plus','one_minus'}, "
                 f"got {self.query_attn_cam_score_norm_mode!r}"
             )
-        self.use_query_cam_proj_consistency_loss = bool(use_query_cam_proj_consistency_loss)
-        self.query_cam_proj_consistency_loss_weight = float(query_cam_proj_consistency_loss_weight)
-        if self.query_cam_proj_consistency_loss_weight < 0.0:
-            raise ValueError(
-                "query_cam_proj_consistency_loss_weight must be >= 0, "
-                f"got {self.query_cam_proj_consistency_loss_weight}"
-            )
-        self.query_cam_proj_consistency_metric = str(query_cam_proj_consistency_metric).lower()
-        if self.query_cam_proj_consistency_metric not in ("bce", "dice", "bce_dice", "kl"):
-            raise ValueError(
-                "query_cam_proj_consistency_metric must be one of "
-                "{'bce','dice','bce_dice','kl'}, "
-                f"got {self.query_cam_proj_consistency_metric!r}"
-            )
-        self.query_cam_proj_consistency_eps = float(query_cam_proj_consistency_eps)
-        if self.query_cam_proj_consistency_eps <= 0.0:
-            raise ValueError(
-                "query_cam_proj_consistency_eps must be > 0, "
-                f"got {self.query_cam_proj_consistency_eps}"
-            )
-        self.query_cam_proj_consistency_pred_norm = str(query_cam_proj_consistency_pred_norm).lower()
-        if self.query_cam_proj_consistency_pred_norm not in ("amax", "sum", "none"):
-            raise ValueError(
-                "query_cam_proj_consistency_pred_norm must be one of "
-                "{'amax','sum','none'}, "
-                f"got {self.query_cam_proj_consistency_pred_norm!r}"
-            )
+
         self.query_attn_softargmax_tau = float(query_attn_softargmax_tau)
         if self.query_attn_softargmax_tau <= 0.0:
             raise ValueError(
@@ -2160,7 +2114,6 @@ class EfficientOCF(
         if (
             (
                 self.use_query_attn_bbox_loss
-                or self.use_query_cam_proj_consistency_loss
                 or (self.query_attn_match_cost_weight > 0.0)
             )
             and return_query_match_inputs
@@ -2569,7 +2522,6 @@ class EfficientOCF(
         # Pre-computed query loss dicts
         query_cls_loss,
         query_depth_loss,
-        query_feat_align_loss,
         query_attn_bbox_loss,
         matched_gmo_loss,
         center_match_loss,
@@ -2582,7 +2534,6 @@ class EfficientOCF(
         query_attn_bbox_gpu_mem_reserved_mb,
         query_attn_bbox_gpu_mem_peak_alloc_mb,
         query_attn_cam_score_pack,
-        query_cam_proj_consistency_loss,
         # Query predictions
         centers_world,
         centers_world_loss,
@@ -2659,30 +2610,6 @@ class EfficientOCF(
                 float(self.query_depth_label_smoothing)
             )
 
-        if isinstance(query_feat_align_loss, dict):
-            losses.update(
-                {
-                    k: v
-                    for k, v in query_feat_align_loss.items()
-                    if (
-                        torch.is_tensor(v)
-                        and (torch.is_floating_point(v) or torch.is_complex(v))
-                    )
-                    or (
-                        isinstance(v, list)
-                        and all(
-                            torch.is_tensor(v_i)
-                            and (torch.is_floating_point(v_i) or torch.is_complex(v_i))
-                            for v_i in v
-                        )
-                    )
-                }
-            )
-        else:
-            losses["loss_query_feat_align"] = z
-            losses["dbg_query_feat_align_matched"] = z
-            losses["dbg_query_feat_align_unmatched_neg"] = z
-
         if isinstance(query_attn_bbox_loss, dict):
             losses.update(
                 {
@@ -2715,32 +2642,6 @@ class EfficientOCF(
             losses["dbg_query_attn_bbox_nonfinite_skip"] = z
             losses["dbg_query_attn_bbox_no_matched_pairs"] = z
             losses["dbg_query_attn_bbox_empty_gt_mask"] = z
-
-        if isinstance(query_cam_proj_consistency_loss, dict):
-            losses.update(
-                {
-                    k: v
-                    for k, v in query_cam_proj_consistency_loss.items()
-                    if (
-                        torch.is_tensor(v)
-                        and (torch.is_floating_point(v) or torch.is_complex(v))
-                    )
-                    or (
-                        isinstance(v, list)
-                        and all(
-                            torch.is_tensor(v_i)
-                            and (torch.is_floating_point(v_i) or torch.is_complex(v_i))
-                            for v_i in v
-                        )
-                    )
-                }
-            )
-        else:
-            losses["loss_query_cam_proj_consistency"] = z
-            losses["dbg_query_cam_proj_consistency_valid_pair_count"] = z
-            losses["dbg_query_cam_proj_consistency_raw_mean"] = z
-            losses["dbg_query_cam_proj_consistency_shape_invalid_skip"] = z
-            losses["dbg_query_cam_proj_consistency_nonfinite_skip"] = z
 
         if isinstance(matched_gmo_loss, dict):
             losses.update(matched_gmo_loss)
@@ -2838,25 +2739,6 @@ class EfficientOCF(
         losses["dbg_query_attn_bbox_gpu_mem_peak_alloc_mb"] = centers_world.new_tensor(
             float(query_attn_bbox_gpu_mem_peak_alloc_mb)
         )
-        metric_code = {
-            "bce": 0.0,
-            "dice": 1.0,
-            "bce_dice": 2.0,
-            "kl": 3.0,
-        }.get(str(getattr(self, "query_cam_proj_consistency_metric", "bce")).lower(), -1.0)
-        pred_norm_code = {
-            "amax": 0.0,
-            "sum": 1.0,
-            "none": 2.0,
-        }.get(str(getattr(self, "query_cam_proj_consistency_pred_norm", "amax")).lower(), -1.0)
-        losses["dbg_query_cam_proj_consistency_enabled"] = centers_world.new_tensor(
-            float(1.0 if self.use_query_cam_proj_consistency_loss else 0.0)
-        )
-        losses["dbg_query_cam_proj_consistency_weight"] = centers_world.new_tensor(
-            float(self.query_cam_proj_consistency_loss_weight)
-        )
-        losses["dbg_query_cam_proj_consistency_metric"] = centers_world.new_tensor(float(metric_code))
-        losses["dbg_query_cam_proj_consistency_pred_norm"] = centers_world.new_tensor(float(pred_norm_code))
         if isinstance(query_attn_cam_score_pack, dict):
             losses.update(
                 {
@@ -2953,9 +2835,6 @@ class EfficientOCF(
             else z
         )
 
-        # ---- Hungarian cost-mix diagnostics ----
-        self._add_hungarian_cost_diagnostics(losses, inst_match_result, z)
-
         # ---- DT loss ----
         if self.use_query_dt_loss:
             if self.center_only_mode:
@@ -2979,7 +2858,6 @@ class EfficientOCF(
         )
         losses["dbg_query_gt2p_cooldown_scale"] = centers_world.new_tensor(gt2p_cooldown_scale)
         gt2p_instance_labeled_loss = None
-        gt2p_unlabeled_loss = None
         losses["dbg_query_gt2p_inst_loss_weight_eff"] = z
         losses["dbg_query_gt2p_unlabeled_loss_weight_eff"] = z
         if self.use_query_gt2p_instance_labeled_loss:
@@ -2999,141 +2877,12 @@ class EfficientOCF(
             losses.update(gt2p_instance_labeled_loss)
 
         # ---- Debug grad norms / normalization / namespace ----
-        self._maybe_add_debug_grad_norms(
-            losses=losses,
-            gmo_dice_loss=matched_gmo_loss,
-            gt2p_unlabeled_loss=gt2p_unlabeled_loss,
-            gt2p_instance_labeled_loss=gt2p_instance_labeled_loss,
-            inter_query_repel_loss=None,
-            dt_loss=locals().get("dt_loss", None),
-        )
         if self.loss_norm:
             for loss_key in losses.keys():
                 if loss_key.startswith('loss'):
                     losses[loss_key] = losses[loss_key] / (losses[loss_key].detach() + 1e-9)
         self._namespace_dbg_logs(losses)
         return losses
-
-    def _add_hungarian_cost_diagnostics(self, losses, inst_match_result, z):
-        """Add Hungarian matching cost-mix diagnostics to losses dict."""
-        losses["dbg_query_match_cost_feat_mean"] = z
-        losses["dbg_query_match_cost_cls_mean"] = z
-        losses["dbg_query_match_cost_center_mean"] = z
-        losses["dbg_query_match_cost_soft_mean"] = z
-        losses["dbg_query_match_cost_bev_dice_mean"] = z
-        losses["dbg_query_match_cost_attn_iou_mean"] = z
-        losses["dbg_query_match_cost_total_mean"] = z
-        losses["dbg_query_match_cost_feat_ratio"] = z
-        losses["dbg_query_match_cost_cls_ratio"] = z
-        losses["dbg_query_match_cost_center_ratio"] = z
-        losses["dbg_query_match_cost_soft_ratio"] = z
-        losses["dbg_query_match_cost_bev_dice_ratio"] = z
-        losses["dbg_query_match_cost_attn_iou_ratio"] = z
-        losses["dbg_query_match_cost_feat_matched_mean"] = z
-        losses["dbg_query_match_cost_cls_matched_mean"] = z
-        losses["dbg_query_match_cost_center_matched_mean"] = z
-        losses["dbg_query_match_cost_soft_matched_mean"] = z
-        losses["dbg_query_match_cost_bev_dice_matched_mean"] = z
-        losses["dbg_query_match_cost_attn_iou_matched_mean"] = z
-        losses["dbg_query_match_cost_total_matched_mean"] = z
-        losses["dbg_query_soft_assign_row_sum_mean"] = z
-        losses["dbg_query_soft_assign_max_prob_mean"] = z
-        losses["dbg_query_soft_assign_entropy_mean"] = z
-        losses["dbg_query_match_mode_feat_center_only"] = z
-        losses["dbg_query_match_legacy_cost_disabled"] = z
-        losses["dbg_query_match_center_frame_t_only"] = z
-        losses["dbg_query_match_center_metric_l1"] = z
-        losses["dbg_query_match_center_frame_index"] = z
-
-        if not isinstance(inst_match_result, dict):
-            return
-
-        cost_feat_contrib_qn = inst_match_result.get("cost_feat_contrib_qn", None)
-        cost_cls_contrib_qn = inst_match_result.get("cost_cls_contrib_qn", None)
-        cost_center_contrib_qn = inst_match_result.get("cost_center_contrib_qn", None)
-        cost_soft_contrib_qn = inst_match_result.get("cost_soft_contrib_qn", None)
-        cost_bev_dice_contrib_qn = inst_match_result.get("cost_bev_dice_contrib_qn", None)
-        cost_attn_iou_contrib_qn = inst_match_result.get("cost_attn_iou_contrib_qn", None)
-        cost_total_qn = inst_match_result.get("cost_qn", None)
-        soft_assign_qn = inst_match_result.get("soft_assign_qn", None)
-        center_frame_idx = inst_match_result.get("center_frame_idx", None)
-        matched_query_idx = inst_match_result.get("matched_query_idx", None)
-        matched_inst_idx = inst_match_result.get("matched_inst_idx", None)
-
-        def _matrix_mean(x_qn):
-            if (not torch.is_tensor(x_qn)) or x_qn.numel() <= 0:
-                return z
-            x = x_qn.to(torch.float32)
-            finite = torch.isfinite(x)
-            return x[finite].mean() if bool(finite.any().item()) else z
-
-        def _matched_mean(x_qn):
-            if (
-                (not torch.is_tensor(x_qn))
-                or x_qn.dim() != 2
-                or x_qn.numel() <= 0
-                or (not torch.is_tensor(matched_query_idx))
-                or (not torch.is_tensor(matched_inst_idx))
-                or matched_query_idx.numel() <= 0
-                or matched_query_idx.numel() != matched_inst_idx.numel()
-            ):
-                return z
-            q_idx = matched_query_idx.to(device=x_qn.device, dtype=torch.long)
-            n_idx = matched_inst_idx.to(device=x_qn.device, dtype=torch.long)
-            keep = (q_idx >= 0) & (q_idx < x_qn.shape[0]) & (n_idx >= 0) & (n_idx < x_qn.shape[1])
-            if not bool(keep.any().item()):
-                return z
-            vals = x_qn[q_idx[keep], n_idx[keep]].to(torch.float32)
-            finite = torch.isfinite(vals)
-            return vals[finite].mean() if bool(finite.any().item()) else z
-
-        feat_mean = _matrix_mean(cost_feat_contrib_qn)
-        cls_mean = _matrix_mean(cost_cls_contrib_qn)
-        center_mean = _matrix_mean(cost_center_contrib_qn)
-        soft_mean = _matrix_mean(cost_soft_contrib_qn)
-        bev_dice_mean = _matrix_mean(cost_bev_dice_contrib_qn)
-        attn_iou_mean = _matrix_mean(cost_attn_iou_contrib_qn)
-        total_mean = _matrix_mean(cost_total_qn)
-
-        mix_sum = (feat_mean + cls_mean + center_mean + soft_mean + bev_dice_mean + attn_iou_mean).clamp_min(1e-6)
-        losses["dbg_query_match_cost_feat_mean"] = feat_mean
-        losses["dbg_query_match_cost_cls_mean"] = cls_mean
-        losses["dbg_query_match_cost_center_mean"] = center_mean
-        losses["dbg_query_match_cost_soft_mean"] = soft_mean
-        losses["dbg_query_match_cost_bev_dice_mean"] = bev_dice_mean
-        losses["dbg_query_match_cost_attn_iou_mean"] = attn_iou_mean
-        losses["dbg_query_match_cost_total_mean"] = total_mean
-        losses["dbg_query_match_cost_feat_ratio"] = feat_mean / mix_sum
-        losses["dbg_query_match_cost_cls_ratio"] = cls_mean / mix_sum
-        losses["dbg_query_match_cost_center_ratio"] = center_mean / mix_sum
-        losses["dbg_query_match_cost_soft_ratio"] = soft_mean / mix_sum
-        losses["dbg_query_match_cost_bev_dice_ratio"] = bev_dice_mean / mix_sum
-        losses["dbg_query_match_cost_attn_iou_ratio"] = attn_iou_mean / mix_sum
-        losses["dbg_query_match_cost_feat_matched_mean"] = _matched_mean(cost_feat_contrib_qn)
-        losses["dbg_query_match_cost_cls_matched_mean"] = _matched_mean(cost_cls_contrib_qn)
-        losses["dbg_query_match_cost_center_matched_mean"] = _matched_mean(cost_center_contrib_qn)
-        losses["dbg_query_match_cost_soft_matched_mean"] = _matched_mean(cost_soft_contrib_qn)
-        losses["dbg_query_match_cost_bev_dice_matched_mean"] = _matched_mean(cost_bev_dice_contrib_qn)
-        losses["dbg_query_match_cost_attn_iou_matched_mean"] = _matched_mean(cost_attn_iou_contrib_qn)
-        losses["dbg_query_match_cost_total_matched_mean"] = _matched_mean(cost_total_qn)
-        losses["dbg_query_match_mode_feat_center_only"] = z.new_tensor(1.0)
-        losses["dbg_query_match_legacy_cost_disabled"] = z.new_tensor(1.0)
-        losses["dbg_query_match_center_frame_t_only"] = z.new_tensor(1.0)
-        losses["dbg_query_match_center_metric_l1"] = z.new_tensor(1.0)
-        if torch.is_tensor(center_frame_idx):
-            losses["dbg_query_match_center_frame_index"] = center_frame_idx.to(
-                device=z.device, dtype=torch.float32
-            )
-        elif center_frame_idx is not None:
-            losses["dbg_query_match_center_frame_index"] = z.new_tensor(float(center_frame_idx))
-        if torch.is_tensor(soft_assign_qn) and soft_assign_qn.dim() == 2 and soft_assign_qn.numel() > 0:
-            soft_qn = soft_assign_qn.to(torch.float32)
-            row_sum_q = soft_qn.sum(dim=1)
-            max_prob_q = soft_qn.max(dim=1).values
-            entropy_q = -(soft_qn * soft_qn.clamp_min(1e-8).log()).sum(dim=1)
-            losses["dbg_query_soft_assign_row_sum_mean"] = row_sum_q.mean()
-            losses["dbg_query_soft_assign_max_prob_mean"] = max_prob_q.mean()
-            losses["dbg_query_soft_assign_entropy_mean"] = entropy_q.mean()
 
     def _build_query_visualization_bundle(
         self,
@@ -3535,35 +3284,6 @@ class EfficientOCF(
         )
         self._last_query_gt_temporal_local_idx = int(gt_query_local_idx) if gt_query_local_idx is not None else -1
         self._last_query_gt_temporal_source_layout = str(gt_query_source_layout)
-
-        if self._is_main_process() and (not getattr(self, "_dbg_printed_gt_depth_summary", False)):
-            if isinstance(img_inputs_seq, (list, tuple)) and len(img_inputs_seq) > 6 and torch.is_tensor(img_inputs_seq[6]):
-                gt_depths_seq = img_inputs_seq[6]
-                valid_depth_mask = gt_depths_seq > 0
-                valid_depth_count = int(valid_depth_mask.sum().item())
-                if valid_depth_count > 0:
-                    valid_depth_values = gt_depths_seq[valid_depth_mask]
-                    valid_depth_min = float(valid_depth_values.min().item())
-                    valid_depth_max = float(valid_depth_values.max().item())
-                else:
-                    valid_depth_min = None
-                    valid_depth_max = None
-                print(
-                    "[EfficientOCF][gt-depth] "
-                    f"shape={tuple(gt_depths_seq.shape)}, "
-                    f"dtype={gt_depths_seq.dtype}, "
-                    f"device={gt_depths_seq.device}, "
-                    f"nonzero_count={valid_depth_count}, "
-                    f"valid_min={valid_depth_min}, "
-                    f"valid_max={valid_depth_max}",
-                    flush=True,
-                )
-            else:
-                print(
-                    "[EfficientOCF][gt-depth] img_inputs_seq[6] missing or not a tensor",
-                    flush=True,
-                )
-            self._dbg_printed_gt_depth_summary = True
 
         # LSS view transform pretrain route
         if self.pretrain_view_transform_only:
@@ -4167,10 +3887,8 @@ class EfficientOCF(
             traj_loss_present_local_idx = int(_query_present_local_idx)
         query_cls_loss = None
         query_depth_loss = None
-        query_feat_align_loss = None
         query_attn_bbox_loss = None
         query_attn_cam_score_pack = None
-        query_cam_proj_consistency_loss = None
         query_inst_depth_target_pack = None
         matched_gmo_loss = None
         center_match_loss = None
@@ -4400,216 +4118,6 @@ class EfficientOCF(
                 "dbg_query_attn_cam_valid_qcam_count": centers_world.new_tensor(0.0),
             }
         if (
-            self.use_query_cam_proj_consistency_loss
-            and isinstance(inst_match_result, dict)
-            and isinstance(query_match_inputs, dict)
-            and torch.is_tensor(mixture_centers_world_loss)
-            and torch.is_tensor(mixture_sigmas_world_loss)
-            and torch.is_tensor(mixture_yaw_loss)
-            and torch.is_tensor(mixture_weights_loss)
-            and torch.is_tensor(gt_instance_occ3d_txyz_query)
-        ):
-            query_cam_proj_inputs = query_match_inputs
-            query_cam_proj_attn_t_idx_t = None
-            query_cam_proj_query_t_idx_t = None
-            query_cam_proj_inputs_rebuilt = False
-            if isinstance(img_inputs_seq, (list, tuple)) and len(img_inputs_seq) > 0 and torch.is_tensor(img_inputs_seq[0]):
-                seq_total = int(img_inputs_seq[0].shape[1])
-                t_proj = min(
-                    int(mixture_centers_world_loss.shape[0]),
-                    int(gt_instance_occ3d_txyz_query.shape[0]),
-                    seq_total,
-                )
-                if t_proj > 0:
-                    if bool(getattr(self, "query_present_only", False)):
-                        proj_start = max(
-                            0,
-                            min(seq_total - 1, int(getattr(self, "query_present_global_idx", int(self.time_receptive_field - 1)))),
-                        )
-                        proj_end = proj_start + 1
-                        t_proj = 1
-                    else:
-                        proj_start = max(0, seq_total - t_proj)
-                        proj_end = seq_total
-                    query_cam_proj_inputs_full = self._build_query_cam_proj_inputs_from_raw(
-                        img_inputs_seq,
-                        query_match_inputs_ref=query_match_inputs,
-                        frame_start_idx=proj_start,
-                        frame_end_idx=proj_end,
-                    )
-                    if isinstance(query_cam_proj_inputs_full, dict):
-                        query_cam_proj_inputs = query_cam_proj_inputs_full
-                        query_cam_proj_inputs_rebuilt = True
-                        full_t_idx = torch.arange(
-                            t_proj,
-                            device=centers_world.device,
-                            dtype=torch.long,
-                        )
-                        query_cam_proj_attn_t_idx_t = full_t_idx
-                        query_cam_proj_query_t_idx_t = full_t_idx
-
-            matched_query_idx = inst_match_result.get("matched_query_idx", None)
-            matched_inst_idx = inst_match_result.get("matched_inst_idx", None)
-            matched_gt_pool_ids_n = inst_match_result.get("gt_ids_n", None)
-            if (
-                torch.is_tensor(matched_query_idx)
-                and torch.is_tensor(matched_inst_idx)
-                and torch.is_tensor(matched_gt_pool_ids_n)
-                and matched_query_idx.numel() > 0
-                and matched_query_idx.numel() == matched_inst_idx.numel()
-                and matched_gt_pool_ids_n.numel() > 0
-            ):
-                mq = matched_query_idx.to(device=centers_world.device, dtype=torch.long).reshape(-1)
-                mi = matched_inst_idx.to(device=centers_world.device, dtype=torch.long).reshape(-1)
-                gt_pool_ids = matched_gt_pool_ids_n.to(device=centers_world.device, dtype=torch.long).reshape(-1)
-                q_total = int(mixture_centers_world_loss.shape[1])
-                n_total = int(gt_pool_ids.numel())
-                keep = (mq >= 0) & (mq < q_total) & (mi >= 0) & (mi < n_total)
-                if bool(keep.any().item()):
-                    mq = mq[keep]
-                    mi = mi[keep]
-                    gt_ids_for_match = gt_pool_ids.index_select(0, mi)
-                    pred_proj = self._project_query_gaussians_to_cam_maps(
-                        mixture_centers_world_tqg3=mixture_centers_world_loss,
-                        mixture_sigmas_world_tqg3=mixture_sigmas_world_loss,
-                        mixture_yaw_tqg=mixture_yaw_loss,
-                        mixture_weights_tqg=mixture_weights_loss,
-                        future_egomotion=future_egomotion,
-                        query_match_inputs=query_cam_proj_inputs,
-                        query_idx_subset=mq,
-                        attn_t_idx_t=query_cam_proj_attn_t_idx_t,
-                        query_t_idx_t=query_cam_proj_query_t_idx_t,
-                    )
-                    if isinstance(pred_proj, dict):
-                        pred_map_tknhw = pred_proj.get("gauss_proj_tqnhw", None)
-                        pred_valid_tkn = pred_proj.get("gauss_valid_tqn", None)
-                        pred_query_idx_k = pred_proj.get("query_idx_q", None)
-                        pred_attn_t_idx_t = pred_proj.get("attn_t_idx_t", None)
-                        if (
-                            torch.is_tensor(pred_map_tknhw)
-                            and torch.is_tensor(pred_valid_tkn)
-                            and pred_map_tknhw.dim() == 5
-                            and pred_valid_tkn.dim() == 3
-                            and int(pred_map_tknhw.shape[1]) == int(pred_valid_tkn.shape[1])
-                        ):
-                            if (
-                                (not torch.is_tensor(pred_query_idx_k))
-                                or int(pred_query_idx_k.numel()) != int(pred_map_tknhw.shape[1])
-                            ):
-                                pred_query_idx_k = mq
-                            pred_query_idx_k = pred_query_idx_k.to(device=centers_world.device, dtype=torch.long).reshape(-1)
-
-                            q_to_gt_id = {
-                                int(q.item()): int(gt_ids_for_match[idx].item())
-                                for idx, q in enumerate(mq)
-                            }
-                            keep_local_k = []
-                            gt_ids_aligned = []
-                            for k_idx, q_idx in enumerate(pred_query_idx_k.tolist()):
-                                gt_id = q_to_gt_id.get(int(q_idx), None)
-                                if gt_id is None:
-                                    continue
-                                keep_local_k.append(k_idx)
-                                gt_ids_aligned.append(int(gt_id))
-                            if len(keep_local_k) > 0:
-                                if len(keep_local_k) != int(pred_query_idx_k.numel()):
-                                    keep_k = torch.as_tensor(
-                                        keep_local_k, device=centers_world.device, dtype=torch.long
-                                    )
-                                    pred_map_tknhw = pred_map_tknhw.index_select(1, keep_k)
-                                    pred_valid_tkn = pred_valid_tkn.index_select(1, keep_k)
-                                    pred_query_idx_k = pred_query_idx_k.index_select(0, keep_k)
-                                gt_ids_aligned_k = torch.as_tensor(
-                                    gt_ids_aligned, device=centers_world.device, dtype=torch.long
-                                )
-
-                                gt_map_tknhw = None
-                                gt_valid_tkn = None
-                                if (not query_cam_proj_inputs_rebuilt) and isinstance(_query_attn_bbox_targets, dict):
-                                    gt_cam_full = _query_attn_bbox_targets.get("gt_inst_cam_mask_tnnhw", None)
-                                    gt_cam_valid_full = _query_attn_bbox_targets.get("gt_inst_cam_valid_tnn", None)
-                                    gt_ids_full = _query_attn_bbox_targets.get("gt_inst_ids_n", None)
-                                    if (
-                                        torch.is_tensor(gt_cam_full)
-                                        and torch.is_tensor(gt_cam_valid_full)
-                                        and torch.is_tensor(gt_ids_full)
-                                        and gt_cam_full.dim() == 5
-                                        and gt_cam_valid_full.dim() == 3
-                                        and int(gt_cam_full.shape[1]) == int(gt_ids_full.numel())
-                                        and int(gt_cam_valid_full.shape[1]) == int(gt_ids_full.numel())
-                                    ):
-                                        id_to_col = {
-                                            int(gid): int(col)
-                                            for col, gid in enumerate(gt_ids_full.to(torch.long).tolist())
-                                        }
-                                        full_cols = []
-                                        missing = False
-                                        for gid in gt_ids_aligned_k.tolist():
-                                            col = id_to_col.get(int(gid), None)
-                                            if col is None:
-                                                missing = True
-                                                break
-                                            full_cols.append(int(col))
-                                        if (not missing) and len(full_cols) == int(gt_ids_aligned_k.numel()):
-                                            col_idx = torch.as_tensor(
-                                                full_cols, device=gt_cam_full.device, dtype=torch.long
-                                            )
-                                            gt_map_tknhw = gt_cam_full.index_select(1, col_idx)
-                                            gt_valid_tkn = gt_cam_valid_full.index_select(1, col_idx)
-                                            if torch.is_tensor(pred_attn_t_idx_t):
-                                                attn_idx = pred_attn_t_idx_t.to(
-                                                    device=gt_map_tknhw.device, dtype=torch.long
-                                                ).reshape(-1)
-                                                if bool(
-                                                    ((attn_idx >= 0) & (attn_idx < int(gt_map_tknhw.shape[0]))).all().item()
-                                                ):
-                                                    gt_map_tknhw = gt_map_tknhw.index_select(0, attn_idx)
-                                                    gt_valid_tkn = gt_valid_tkn.index_select(0, attn_idx)
-                                                else:
-                                                    gt_map_tknhw = None
-                                                    gt_valid_tkn = None
-
-                                if gt_map_tknhw is None or gt_valid_tkn is None:
-                                    gt_proj = self._project_gt_instances_to_cam_masks(
-                                        segmentation_instance3d_txyz=gt_instance_occ3d_txyz_query,
-                                        future_egomotion=future_egomotion,
-                                        gt_inst_ids_n=gt_ids_aligned_k,
-                                        query_match_inputs=query_cam_proj_inputs,
-                                        attn_t_idx_t=pred_attn_t_idx_t,
-                                        fallback_segmentation_instance3d_txyz=gt_segmentation_instance3d_txyz_query,
-                                    )
-                                    if isinstance(gt_proj, dict):
-                                        gt_map_tknhw = gt_proj.get("gt_inst_cam_mask_tnnhw", None)
-                                        gt_valid_tkn = gt_proj.get("gt_inst_cam_valid_tnn", None)
-
-                                if (
-                                    torch.is_tensor(gt_map_tknhw)
-                                    and torch.is_tensor(gt_valid_tkn)
-                                    and gt_map_tknhw.dim() == 5
-                                    and gt_valid_tkn.dim() == 3
-                                ):
-                                    query_cam_proj_consistency_loss = self._compute_query_cam_proj_consistency_loss(
-                                        pred_proj_tknhw=pred_map_tknhw,
-                                        pred_valid_tkn=pred_valid_tkn,
-                                        gt_bbox_tknhw=gt_map_tknhw.to(
-                                            device=pred_map_tknhw.device, dtype=torch.float32
-                                        ),
-                                        gt_bbox_valid_tkn=gt_valid_tkn.to(
-                                            device=pred_map_tknhw.device, dtype=torch.bool
-                                        ),
-                                        metric=self.query_cam_proj_consistency_metric,
-                                        pred_norm=self.query_cam_proj_consistency_pred_norm,
-                                        eps=self.query_cam_proj_consistency_eps,
-                                        weight=self.query_cam_proj_consistency_loss_weight,
-                                    )
-        if (not self.use_query_attn_bbox_loss) and float(self.query_feat_align_loss_weight) > 0.0:
-            query_feat_align_loss = self._compute_query_feat_align_loss(
-                query_future_feat_tqd=q_sel_tqd,
-                inst_match_result=inst_match_result,
-                gt_inst_bev_feat_tnd=g_sel_tnd,
-                gt_inst_bev_feat_valid_tn=g_sel_valid_tn,
-            )
-        if (
             self.use_gmo_bce_loss
             and (not self.center_only_mode)
             and torch.is_tensor(mixture_centers_world_match_tqg3)
@@ -4810,7 +4318,6 @@ class EfficientOCF(
             transform=transform,
             query_cls_loss=query_cls_loss,
             query_depth_loss=query_depth_loss,
-            query_feat_align_loss=query_feat_align_loss,
             query_attn_bbox_loss=query_attn_bbox_loss,
             matched_gmo_loss=matched_gmo_loss,
             center_match_loss=center_match_loss,
@@ -4823,7 +4330,7 @@ class EfficientOCF(
             query_attn_bbox_gpu_mem_reserved_mb=query_attn_bbox_gpu_mem_reserved_mb,
             query_attn_bbox_gpu_mem_peak_alloc_mb=query_attn_bbox_gpu_mem_peak_alloc_mb,
             query_attn_cam_score_pack=query_attn_cam_score_pack,
-            query_cam_proj_consistency_loss=query_cam_proj_consistency_loss,
+
             centers_world=centers_world,
             centers_world_loss=centers_world_loss,
             centers_world_dt_gt2p_tq3=centers_world_dt_gt2p_tq3,

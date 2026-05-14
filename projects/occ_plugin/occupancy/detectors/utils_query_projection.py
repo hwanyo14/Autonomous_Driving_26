@@ -37,60 +37,6 @@ class EfficientOCFQueryProjectionMixin:
             "frame_end_idx_exclusive": int(e_idx),
         }
 
-    def _build_query_cam_proj_inputs_from_raw(
-        self,
-        img_inputs_seq,
-        query_match_inputs_ref: dict,
-        frame_start_idx=0,
-        frame_end_idx=None,
-    ):
-        if (
-            (not isinstance(img_inputs_seq, (list, tuple)))
-            or len(img_inputs_seq) < 6
-            or (not isinstance(query_match_inputs_ref, dict))
-        ):
-            return None
-
-        imgs_seq, rots_seq, trans_seq, intrins_seq, post_rots_seq, post_trans_seq = img_inputs_seq[:6]
-        if not all(
-            torch.is_tensor(v)
-            for v in (imgs_seq, rots_seq, trans_seq, intrins_seq, post_rots_seq, post_trans_seq)
-        ):
-            return None
-
-        context_seq_tnchw = query_match_inputs_ref.get("context_seq_tnchw", None)
-        if (not torch.is_tensor(context_seq_tnchw)) or context_seq_tnchw.dim() != 5:
-            return None
-
-        seq_total = int(imgs_seq.shape[1])
-        s_idx = max(0, int(frame_start_idx))
-        e_idx = seq_total if frame_end_idx is None else min(seq_total, int(frame_end_idx))
-        if e_idx <= s_idx:
-            raise ValueError(
-                f"Invalid frame slice for query cam projection inputs: [{s_idx}, {e_idx}) from seq_total={seq_total}"
-            )
-
-        rots_tn33 = rots_seq[0, s_idx:e_idx, ...].contiguous().detach()
-        trans_tn3 = trans_seq[0, s_idx:e_idx, ...].contiguous().detach()
-        intrins_tn33 = intrins_seq[0, s_idx:e_idx, ...].contiguous().detach()
-        post_rots_tn33 = post_rots_seq[0, s_idx:e_idx, ...].contiguous().detach()
-        post_trans_tn3 = post_trans_seq[0, s_idx:e_idx, ...].contiguous().detach()
-
-        return {
-            "rots_tn33": rots_tn33,
-            "trans_tn3": trans_tn3,
-            "intrins_tn33": intrins_tn33,
-            "post_rots_tn33": post_rots_tn33,
-            "post_trans_tn3": post_trans_tn3,
-            "img_h": int(imgs_seq.shape[-2]),
-            "img_w": int(imgs_seq.shape[-1]),
-            "frame_start_idx": int(s_idx),
-            "frame_end_idx_exclusive": int(e_idx),
-            "feat_h": int(context_seq_tnchw.shape[-2]),
-            "feat_w": int(context_seq_tnchw.shape[-1]),
-            "n_cam": int(rots_tn33.shape[1]),
-        }
-
     @staticmethod
     def _normalize_attention_prob_spatial_tqnhw(
         attn_tqnhw: torch.Tensor,
