@@ -1,4 +1,4 @@
-# Agent Instructions For Codex
+# Agent Instructions For Claude Code
 
 - 항상 필요한만큼만 최소 수정으로 진행할 것
 - 코드 구현의 redundant를 최대한 줄이고 가독성 좋게 작성할 것
