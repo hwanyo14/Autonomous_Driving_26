@@ -60,11 +60,6 @@ class EfficientOCF(
             query_gmo_tversky_alpha=0.7,
             query_gmo_tversky_beta=0.3,
             use_lss_bev_occ_loss=True,
-            pretrain_view_transform_only=False,
-            pretrain_lss_vis_every=0,
-            pretrain_lss_vis_dir="./work_dirs/lss_pretrain_vis",
-            pretrain_lss_vis_prob_thr=0.5,
-            pretrain_lss_vis_max_frames=6,
             use_query_gmo_dice_loss=True,
             use_query_inst_center_match_loss=True,
             use_query_dt_loss=True,
@@ -287,12 +282,6 @@ class EfficientOCF(
         self.query_gmo_tversky_alpha = float(query_gmo_tversky_alpha)
         self.query_gmo_tversky_beta = float(query_gmo_tversky_beta)
         self.use_lss_bev_occ_loss = bool(use_lss_bev_occ_loss)
-        self.pretrain_view_transform_only = bool(pretrain_view_transform_only)
-        self.pretrain_lss_vis_every = int(pretrain_lss_vis_every)
-        self.pretrain_lss_vis_dir = str(pretrain_lss_vis_dir)
-        self.pretrain_lss_vis_prob_thr = float(pretrain_lss_vis_prob_thr)
-        self.pretrain_lss_vis_max_frames = int(pretrain_lss_vis_max_frames)
-        self._pretrain_lss_vis_iter = 0
         self.use_query_gmo_dice_loss = bool(use_query_gmo_dice_loss)
         self.use_query_inst_center_match_loss = bool(use_query_inst_center_match_loss)
         self.query_traj_loss_weight = float(query_traj_loss_weight)
@@ -593,7 +582,6 @@ class EfficientOCF(
             step += 1
         step = max(0, step)
         self._query_train_iter = step
-        self._pretrain_lss_vis_iter = step
         self._train_iter_synced = True
         if hasattr(self, "query_head") and hasattr(self.query_head, "set_train_iteration"):
             self.query_head.set_train_iteration(step, one_based=True)
@@ -604,11 +592,6 @@ class EfficientOCF(
         if not self._train_iter_synced and advance_if_unsynced:
             self._query_train_iter += 1
         return int(self._query_train_iter)
-
-    def _get_pretrain_vis_iteration(self, advance_if_unsynced: bool = False) -> int:
-        if not self._train_iter_synced and advance_if_unsynced:
-            self._pretrain_lss_vis_iter += 1
-        return int(self._pretrain_lss_vis_iter)
 
     def _get_context_feat_dim_from_depth_net(self):
 
@@ -1639,54 +1622,6 @@ class EfficientOCF(
             return losses, outs
         return losses
 
-    def _forward_train_view_transform_pretrain(
-            self,
-            img_inputs_seq=None,
-            future_egomotion=None,
-            segmentation_bev=None,
-            img_metas=None,
-            points_occ=None,
-        ):
-        """Pretrain route: image -> view transform -> BEV -> occ_head only."""
-
-        bev_feats_enc, img_feats, _ = self.extract_feat(
-            img_inputs_seq=img_inputs_seq,
-            img_metas=img_metas,
-            future_egomotion=future_egomotion,
-        )
-
-        if segmentation_bev.dim() >= 4:
-            segmentation_bev = segmentation_bev[:, -self.n_future_frames_plus:, ...].contiguous()
-        elif segmentation_bev.dim() == 3:
-            segmentation_bev = segmentation_bev[-self.n_future_frames_plus:, ...].unsqueeze(0).contiguous()
-
-        transform = img_inputs_seq[1:8] if img_inputs_seq is not None else None
-
-        voxel_feats_seq = []
-        for voxel_feats_stage in bev_feats_enc:
-            bs, sfeatures = voxel_feats_stage.shape[:2]
-            voxel_feats_stage_ = voxel_feats_stage.view(
-                bs * self.n_future_frames_plus,
-                sfeatures // self.n_future_frames_plus,
-                *voxel_feats_stage.shape[2:],
-            )
-            voxel_feats_seq.append(voxel_feats_stage_)
-
-        losses, occ_outs = self.forward_pts_train(
-            voxel_feats=voxel_feats_seq,
-            segmentation_bev=segmentation_bev,
-            points_occ=points_occ,
-            img_metas=img_metas,
-            transform=transform,
-            img_feats=img_feats,
-            return_outs=True,
-        )
-        self._maybe_save_lss_pretrain_occ_vis(
-            output_voxels=occ_outs.get("output_voxels", None),
-            target_voxels=segmentation_bev,
-        )
-        return losses
-
     def forward_train(self,
             img_inputs_seq=None,
             segmentation=None,
@@ -1764,16 +1699,6 @@ class EfficientOCF(
         )
         self._last_query_gt_temporal_local_idx = int(gt_query_local_idx) if gt_query_local_idx is not None else -1
         self._last_query_gt_temporal_source_layout = str(gt_query_source_layout)
-
-        # LSS view transform pretrain route
-        if self.pretrain_view_transform_only:
-            return self._forward_train_view_transform_pretrain(
-                img_inputs_seq=img_inputs_seq,
-                future_egomotion=future_egomotion,
-                segmentation_bev=segmentation_bev,
-                img_metas=img_metas,
-                points_occ=points_occ,
-            )
 
         cur_train_iter = self._get_query_train_iteration(advance_if_unsynced=True)
         need_query_cam_gaussian_vis = bool(
@@ -2500,4 +2425,5 @@ class EfficientOCF(
             occ_dt=occ_dt,
             gt_inst_center_world_tn3=gt_inst_center_world_tn3,
             gt_inst_center_valid_tn=gt_inst_center_valid_tn,
+            inst_match_result=inst_match_result,
         )

@@ -1773,6 +1773,8 @@ class EfficientOCFLossMixin:
         # GT2P loss inputs
         gt_inst_center_world_tn3,
         gt_inst_center_valid_tn,
+        # Hungarian match pack
+        inst_match_result=None,
     ):
         """Aggregate all training loss components into a single losses dict."""
         losses = dict()
@@ -1854,7 +1856,7 @@ class EfficientOCFLossMixin:
         else:
             losses["loss_query_traj"] = z
 
-        # ---- Hungarian matching cost weights ----
+        # ---- Hungarian matching cost diagnostics ----
         losses["dbg_query_sim_match_cost_weight"] = centers_world.new_tensor(
             float(self.query_sim_match_cost_weight)
         )
@@ -1864,9 +1866,107 @@ class EfficientOCFLossMixin:
         losses["dbg_query_cls_match_cost_weight"] = centers_world.new_tensor(
             float(self.query_cls_match_cost_weight)
         )
+        losses["dbg_query_center_match_cost_weight"] = centers_world.new_tensor(
+            float(getattr(self, "query_center_match_cost_weight", 0.0))
+        )
         losses["dbg_query_bev_dice_match_cost_weight"] = centers_world.new_tensor(
             float(self.query_bev_dice_match_cost_weight)
         )
+        losses["dbg_query_attn_match_cost_weight"] = centers_world.new_tensor(
+            float(getattr(self, "query_attn_match_cost_weight", 0.0))
+        )
+
+        if isinstance(inst_match_result, dict):
+            cost_qn = inst_match_result.get("cost_qn", None)
+            matched_query_idx = inst_match_result.get("matched_query_idx", None)
+            matched_inst_idx = inst_match_result.get("matched_inst_idx", None)
+
+            if torch.is_tensor(cost_qn) and cost_qn.dim() == 2 and int(cost_qn.numel()) > 0:
+                cost_qn_f32 = cost_qn.to(torch.float32)
+                finite_mask_qn = torch.isfinite(cost_qn_f32)
+                finite_vals = cost_qn_f32[finite_mask_qn]
+                if int(finite_vals.numel()) > 0:
+                    total_mean = finite_vals.mean()
+                else:
+                    total_mean = z
+
+                matched_vals = None
+                if (
+                    torch.is_tensor(matched_query_idx)
+                    and torch.is_tensor(matched_inst_idx)
+                    and int(matched_query_idx.numel()) > 0
+                    and int(matched_query_idx.numel()) == int(matched_inst_idx.numel())
+                ):
+                    mq = matched_query_idx.to(device=cost_qn_f32.device, dtype=torch.long).reshape(-1)
+                    mi = matched_inst_idx.to(device=cost_qn_f32.device, dtype=torch.long).reshape(-1)
+                    keep = (
+                        (mq >= 0)
+                        & (mi >= 0)
+                        & (mq < int(cost_qn_f32.shape[0]))
+                        & (mi < int(cost_qn_f32.shape[1]))
+                    )
+                    if bool(keep.any().item()):
+                        mq = mq[keep]
+                        mi = mi[keep]
+                        matched_raw = cost_qn_f32[mq, mi]
+                        matched_vals = matched_raw[torch.isfinite(matched_raw)]
+
+                if torch.is_tensor(matched_vals) and int(matched_vals.numel()) > 0:
+                    matched_mean = matched_vals.mean()
+                else:
+                    matched_mean = z
+
+                losses["dbg_query_match_cost_total_mean"] = total_mean
+                losses["dbg_query_match_cost_matched_mean"] = matched_mean
+                losses["dbg_query_match_cost_total_pair_count"] = cost_qn_f32.new_tensor(float(finite_vals.numel()))
+                losses["dbg_query_match_cost_matched_pair_count"] = cost_qn_f32.new_tensor(
+                    float(0 if matched_vals is None else int(matched_vals.numel()))
+                )
+
+                eps = float(1e-9)
+                total_mean_safe = total_mean.detach().abs().clamp_min(eps) if torch.is_tensor(total_mean) else cost_qn_f32.new_tensor(eps)
+                matched_mean_safe = matched_mean.detach().abs().clamp_min(eps) if torch.is_tensor(matched_mean) else cost_qn_f32.new_tensor(eps)
+
+                contrib_map = {
+                    "feat": inst_match_result.get("cost_feat_contrib_qn", None),
+                    "soft": inst_match_result.get("cost_soft_contrib_qn", None),
+                    "cls": inst_match_result.get("cost_cls_contrib_qn", None),
+                    "center": inst_match_result.get("cost_center_contrib_qn", None),
+                    "bev_dice": inst_match_result.get("cost_bev_dice_contrib_qn", None),
+                    "attn": inst_match_result.get("cost_attn_iou_contrib_qn", None),
+                }
+                for name, contrib_qn in contrib_map.items():
+                    if torch.is_tensor(contrib_qn) and tuple(contrib_qn.shape) == tuple(cost_qn_f32.shape):
+                        contrib_f32 = contrib_qn.to(torch.float32)
+                        contrib_total_vals = contrib_f32[finite_mask_qn & torch.isfinite(contrib_f32)]
+                        comp_total_mean = contrib_total_vals.mean() if int(contrib_total_vals.numel()) > 0 else z
+
+                        comp_matched_mean = z
+                        if (
+                            torch.is_tensor(matched_query_idx)
+                            and torch.is_tensor(matched_inst_idx)
+                            and int(matched_query_idx.numel()) > 0
+                            and int(matched_query_idx.numel()) == int(matched_inst_idx.numel())
+                        ):
+                            mq = matched_query_idx.to(device=contrib_f32.device, dtype=torch.long).reshape(-1)
+                            mi = matched_inst_idx.to(device=contrib_f32.device, dtype=torch.long).reshape(-1)
+                            keep = (
+                                (mq >= 0)
+                                & (mi >= 0)
+                                & (mq < int(contrib_f32.shape[0]))
+                                & (mi < int(contrib_f32.shape[1]))
+                            )
+                            if bool(keep.any().item()):
+                                comp_matched = contrib_f32[mq[keep], mi[keep]]
+                                comp_matched = comp_matched[torch.isfinite(comp_matched)]
+                                if int(comp_matched.numel()) > 0:
+                                    comp_matched_mean = comp_matched.mean()
+
+                        losses[f"dbg_query_match_cost_{name}_total_mean"] = comp_total_mean
+                        losses[f"dbg_query_match_cost_{name}_matched_mean"] = comp_matched_mean
+                        losses[f"dbg_query_match_cost_{name}_ratio_total"] = comp_total_mean / total_mean_safe
+                        losses[f"dbg_query_match_cost_{name}_ratio_matched"] = comp_matched_mean / matched_mean_safe
+
         if isinstance(query_attn_cam_score_pack, dict):
             losses.update(
                 {
@@ -1928,9 +2028,16 @@ class EfficientOCFLossMixin:
             "dbg_query_sim_match_cost_weight",
             "dbg_query_soft_assign_cost_weight",
             "dbg_query_cls_match_cost_weight",
+            "dbg_query_center_match_cost_weight",
             "dbg_query_bev_dice_match_cost_weight",
+            "dbg_query_attn_match_cost_weight",
         }
-        for k in [k for k in losses if k.startswith("dbg_") and k not in _keep_dbg]:
+        for k in [
+            k for k in losses
+            if k.startswith("dbg_")
+            and (k not in _keep_dbg)
+            and (not k.startswith("dbg_query_match_cost_"))
+        ]:
             del losses[k]
         self._namespace_dbg_logs(losses)
         return losses

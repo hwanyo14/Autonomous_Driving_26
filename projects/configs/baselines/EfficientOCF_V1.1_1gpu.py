@@ -535,13 +535,6 @@ model = dict(
     gmo_ids=(2, 3, 4, 5, 6, 7, 9, 10),
     use_segmentation_as_query_gt=True,
 
-    # Pretrain-only visualization.
-    pretrain_view_transform_only=False,  # True: image->view_transform->BEV->occ_head only
-    pretrain_lss_vis_every=0,  # >0 to save LSS-BEV occupancy visualization periodically
-    pretrain_lss_vis_dir="./work_dirs/no_pretrain_vis",
-    pretrain_lss_vis_prob_thr=0.5,
-    pretrain_lss_vis_max_frames=6,
-
     # Query losses.
     use_gmo_bce_loss=True,
     query_gmo_loss_type=query_gmo_loss_type,
