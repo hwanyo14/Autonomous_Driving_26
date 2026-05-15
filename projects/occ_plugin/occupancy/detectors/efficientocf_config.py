@@ -8,7 +8,6 @@ MODEL_CFG_DEFAULTS = {
     "query_gmo_dice_loss_weight": 0.5,
     "query_gmo_tversky_alpha": 0.7,
     "query_gmo_tversky_beta": 0.3,
-    "use_lss_bev_occ_loss": True,
     "use_query_gmo_dice_loss": True,
     "use_query_inst_center_match_loss": True,
     "use_query_dt_loss": True,
@@ -163,7 +162,6 @@ def apply_model_cfg(self, cfg):
     self.query_gmo_dice_loss_weight = float(cfg["query_gmo_dice_loss_weight"])
     self.query_gmo_tversky_alpha = float(cfg["query_gmo_tversky_alpha"])
     self.query_gmo_tversky_beta = float(cfg["query_gmo_tversky_beta"])
-    self.use_lss_bev_occ_loss = bool(cfg["use_lss_bev_occ_loss"])
     self.use_query_gmo_dice_loss = bool(cfg["use_query_gmo_dice_loss"])
     self.use_query_inst_center_match_loss = bool(cfg["use_query_inst_center_match_loss"])
     self.use_query_dt_loss = bool(cfg["use_query_dt_loss"])

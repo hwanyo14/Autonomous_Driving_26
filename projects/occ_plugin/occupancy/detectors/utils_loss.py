@@ -1747,13 +1747,6 @@ class EfficientOCFLossMixin:
     def _aggregate_training_losses(
         self,
         *,
-        # BEV occupancy loss inputs
-        bev_feats_enc,
-        segmentation_bev,
-        points_occ,
-        img_metas,
-        img_feats,
-        transform,
         # Pre-computed query loss dicts
         query_cls_loss,
         query_depth_loss,
@@ -1779,23 +1772,6 @@ class EfficientOCFLossMixin:
         """Aggregate all training loss components into a single losses dict."""
         losses = dict()
         z = centers_world.sum() * 0.0
-
-        # ---- BEV occupancy loss ----
-        if self.use_lss_bev_occ_loss and (bev_feats_enc is not None) and (segmentation_bev is not None):
-            voxel_feats_seq = []
-            for voxel_feats_stage in bev_feats_enc:
-                bs, sfeatures = voxel_feats_stage.shape[:2]
-                voxel_feats_stage_ = voxel_feats_stage.view(
-                    bs * self.n_future_frames_plus,
-                    sfeatures // self.n_future_frames_plus,
-                    *voxel_feats_stage.shape[2:],
-                )
-                voxel_feats_seq.append(voxel_feats_stage_)
-            losses_occupancy = self.forward_pts_train(
-                voxel_feats_seq, segmentation_bev, points_occ, img_metas,
-                img_feats=img_feats, transform=transform,
-            )
-            losses.update(losses_occupancy)
 
         # ---- Query classification / feature losses ----
         if isinstance(query_cls_loss, dict):
@@ -2041,4 +2017,3 @@ class EfficientOCFLossMixin:
             del losses[k]
         self._namespace_dbg_logs(losses)
         return losses
-

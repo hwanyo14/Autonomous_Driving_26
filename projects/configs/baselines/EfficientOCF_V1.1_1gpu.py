@@ -354,35 +354,14 @@ grid_config = {
     'dbound': [2.0, 58.0, 0.5],
 }
 
-# BEV / neck channel setup.
 bev_feat_dim = 64
-voxel_channels = [
-    bev_feat_dim * time_receptive_field,
-    bev_feat_dim * 2 * time_receptive_field,
-    bev_feat_dim * 4 * time_receptive_field,
-    bev_feat_dim * 8 * time_receptive_field,
-]
-pred_channels = [bev_feat_dim, bev_feat_dim * 2, bev_feat_dim * 4, bev_feat_dim * 8]
-decoder_channels = [
-    bev_feat_dim * n_future_frames_plus,
-    bev_feat_dim * 2 * n_future_frames_plus,
-    bev_feat_dim * 4 * n_future_frames_plus,
-    bev_feat_dim * 8 * n_future_frames_plus,
-]
-
-# Backbone/head wiring.
 numC_Trans = bev_feat_dim
-occ_encoder_input_channel = (numC_Trans + 6) * time_receptive_field
-voxel_out_channel = bev_feat_dim * (n_future_frames_plus)
-voxel_out_channel_per_frame = bev_feat_dim
-my_voxel_out_indices = (0, 1, 2, 3)
 
 gn_cfg = dict(type='GN', num_groups=16, requires_grad=True)
 model_cfg = dict(
     use_segmentation_as_query_gt=True,
     use_gmo_bce_loss=True,
     query_gmo_loss_type='focal',
-    use_lss_bev_occ_loss=False,
     query_gt2p_instance_labeled_tau=0.3,
     query_gt2p_cooldown_iters=4000,
     query_class_ids=query_class_ids,
@@ -484,46 +463,6 @@ model = dict(
         data_config=data_config,
         numC_Trans=numC_Trans,
         vp_megvii=False,
-    ),
-    occ_encoder_backbone=dict(
-        type='CustomResNet2D',
-        depth=18,
-        n_input_channels=occ_encoder_input_channel,
-        block_inplanes=voxel_channels,
-        out_indices=my_voxel_out_indices,
-        norm_cfg=gn_cfg,
-    ),
-    occ_predictor=dict(
-        type='Predictor',
-        n_input_channels=pred_channels,
-        in_timesteps=time_receptive_field,
-        out_timesteps=n_future_frames_plus,
-        norm_cfg=gn_cfg,
-    ),
-    occ_encoder_neck=dict(
-        type='FPN',
-        in_channels=decoder_channels,
-        out_channels=voxel_out_channel,
-        num_outs=4,
-        norm_cfg=gn_cfg,
-    ),
-    pts_bbox_head=dict(
-        type='OccHead',
-        norm_cfg=gn_cfg,
-        soft_weights=True,
-        final_occ_size=occ_size,
-        fine_topk=15000,
-        empty_idx=empty_idx,
-        num_level=len(my_voxel_out_indices),
-        in_channels=[voxel_out_channel_per_frame] * len(my_voxel_out_indices),
-        out_channel=num_cls,
-        point_cloud_range=point_cloud_range,
-        loss_weight_cfg=dict(
-            loss_voxel_ce_weight=1.0,
-            loss_voxel_sem_scal_weight=1.0,
-            loss_voxel_geo_scal_weight=1.0,
-            loss_voxel_lovasz_weight=1.0,
-        ),
     ),
     empty_idx=empty_idx,
 )

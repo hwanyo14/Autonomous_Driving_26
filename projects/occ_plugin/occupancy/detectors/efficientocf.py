@@ -6,9 +6,7 @@ import torch
 import torch.nn as nn
 
 from mmdet.models import DETECTORS
-from mmcv.runner import force_fp32
 from .bevdepth import BEVDepth
-from mmdet3d.models import builder
 from projects.occ_plugin.occupancy.image2bev.transformer import TransformerModule
 from projects.occ_plugin.occupancy.dense_heads.query_head import QueryHead
 from projects.occ_plugin.occupancy.dense_heads.voxelizer import SoftVoxelizerOneAdd
@@ -46,9 +44,6 @@ class EfficientOCF(
         self,
         only_generate_dataset=False,
         empty_idx=0,
-        occ_encoder_backbone=None,
-        occ_predictor=None,
-        occ_encoder_neck=None,
         loss_norm=False,
         point_cloud_range=None,
         time_receptive_field=None,
@@ -63,9 +58,6 @@ class EfficientOCF(
     ):
         '''
         EfficientNet is our end-to-end baseline for 4D camera-only occupancy forecasting
-        
-        there is one stream for the forecasting task with aggregated voxel features as inputs:
-            occ_encoder_backbone -> occ_predictor -> occ_encoder_neck -> pts_bbox_head
         
         time_receptive_field: number of historical frames used for forecasting (including the present one), default: 3
         n_future_frames: number of forecasted future frames, default: 4
@@ -140,10 +132,6 @@ class EfficientOCF(
             query_decor_loss_weight=self.query_decor_loss_weight,
             attn_vis_dir=self.query_attn_vis_dir,
         )
-
-        self.occ_encoder_backbone = builder.build_backbone(occ_encoder_backbone)
-        self.occ_predictor = builder.build_neck(occ_predictor)
-        self.occ_encoder_neck = builder.build_neck(occ_encoder_neck)
 
         self.point_cloud_range = point_cloud_range
         self.spatial_extent3d = (self.point_cloud_range[3]-self.point_cloud_range[0], \
@@ -286,42 +274,6 @@ class EfficientOCF(
             'resnet_last': resnet_last,
         }
     
-    @force_fp32()
-    def occ_encoder(self, x):
-        b, t, _, _, _ = x.shape
-        x = x.reshape(b, -1, *x.shape[3:])
-        x = self.occ_encoder_backbone(x)
-        x = self.occ_predictor(x)
-        x = self.occ_encoder_neck(x)
-
-        return x
-
-    def mat2pose_vec(self, matrix: torch.Tensor):
-        """
-        Converts a 4x4 pose matrix into a 6-dof pose vector
-        Args:
-            matrix (ndarray): 4x4 pose matrix
-        Returns:
-            vector (ndarray): 6-dof pose vector comprising translation components (tx, ty, tz) and
-            rotation components (rx, ry, rz)
-        """
-
-        # M[1, 2] = -sinx*cosy, M[2, 2] = +cosx*cosy
-        rotx = torch.atan2(-matrix[..., 1, 2], matrix[..., 2, 2])
-
-        # M[0, 2] = +siny, M[1, 2] = -sinx*cosy, M[2, 2] = +cosx*cosy
-        cosy = torch.sqrt(matrix[..., 1, 2] ** 2 + matrix[..., 2, 2] ** 2)
-        roty = torch.atan2(matrix[..., 0, 2], cosy)
-
-        # M[0, 0] = +cosy*cosz, M[0, 1] = -cosy*sinz
-        rotz = torch.atan2(-matrix[..., 0, 1], matrix[..., 0, 0])
-
-        rotation = torch.stack((rotx, roty, rotz), dim=-1)
-
-        # Extract translation params
-        translation = matrix[..., :3, 3]
-        return torch.cat((translation, rotation), dim=-1)
-
     def pack_dbatch_and_dtime(self, x):
         b = x.shape[0]
         s = x.shape[1]
@@ -847,7 +799,6 @@ class EfficientOCF(
         gt_segmentation_instance3d_txyz_for_attn=None,
         fallback_segmentation_instance3d_txyz_for_attn=None,
         voxelize=True,
-        return_bev_occ_feats=False,
         return_instance_img_debug=False,
         return_instance_img_debug_fullseq=True,
         return_query_cam_gaussian_vis_debug=False,
@@ -1125,47 +1076,6 @@ class EfficientOCF(
                     weights=None,
                 )
 
-        bev_feats_enc = None
-        bev_feats_src = None
-        if return_bev_occ_feats and (voxel_feats is not None):
-            voxel_feats = self.unpack_dbatch_and_dtime(
-                voxel_feats, self.batch_size, self.time_receptive_field
-            )
-            voxel_feats = self.cumulative_warp_occ(voxel_feats.clone(), future_egomotion)
-            seq_src = int(voxel_feats.shape[1])
-
-            future_egomotion_vec = self.mat2pose_vec(future_egomotion)
-            batch_size, sequence_length, nbr_pose_channels = future_egomotion_vec.shape
-            dx, dy, dz = voxel_feats.shape[-3:]
-
-            # Source BEV features: warped-only (before egomotion-channel concat).
-            src_max_feats = self.voxel2bev_maxpooling(voxel_feats)
-            src_mean_feats = self.voxel2bev(voxel_feats)
-            src_bev_feats = src_max_feats * self.max_weight + src_mean_feats * self.mean_weight
-            bev_feats_src = [src_bev_feats.reshape(batch_size, seq_src * int(src_bev_feats.shape[2]), *src_bev_feats.shape[3:])]
-
-            future_egomotions_spatial = future_egomotion_vec.view(
-                batch_size, sequence_length, nbr_pose_channels, 1, 1, 1
-            ).expand(batch_size, sequence_length, nbr_pose_channels, dx, dy, dz)
-
-            # at time 0, no egomotion so feed zero vector
-            future_egomotions_spatial = torch.cat(
-                [
-                    torch.zeros_like(future_egomotions_spatial[:, :1]),
-                    future_egomotions_spatial[:, :(self.time_receptive_field - 1)],
-                ],
-                dim=1,
-            )
-            voxel_feats = torch.cat([voxel_feats, future_egomotions_spatial], dim=-4)
-
-            max_feats = self.voxel2bev_maxpooling(voxel_feats)
-            mean_feats = self.voxel2bev(voxel_feats)
-            bev_feats = max_feats * self.max_weight + mean_feats * self.mean_weight
-            bev_feats_enc = self.occ_encoder(bev_feats)
-
-            if type(bev_feats_enc) is not tuple:
-                bev_feats_enc = [bev_feats_enc]
-
         return (
             pred_occ,
             center_logits,
@@ -1181,8 +1091,6 @@ class EfficientOCF(
             query_depth_probs_tqd,
             query_img_feat_pooled,
             query_future_feat_tqd,
-            bev_feats_src,
-            bev_feats_enc,
             query_attn_weights,
             query_attn_bbox_targets,
             instance_img_debug_bundle,
@@ -1201,84 +1109,6 @@ class EfficientOCF(
         )
 
 
-    def extract_feat(self, img_inputs_seq, img_metas, future_egomotion):
-        '''
-        Extract voxel features from input sequential images
-        '''
-        voxel_feats = None
-        depth, img_feats = None, None
-
-        if img_inputs_seq is not None:
-            _, _, depth, img_feats, voxel_feats, _, _, _ = self.extract_img_feat(
-                img_inputs_seq,
-                img_metas,
-                run_query_transformer=False,
-            )
-        if depth is not None:
-            depth = depth.view(-1, self.n_cam, *depth.shape[-3:])
-        
-        voxel_feats = self.unpack_dbatch_and_dtime(voxel_feats, self.batch_size, self.time_receptive_field)
-
-        voxel_feats = self.cumulative_warp_occ(voxel_feats.clone(), future_egomotion)
-
-        # egomotion-aware
-        future_egomotion_vec = self.mat2pose_vec(future_egomotion)
-        batch_size, sequence_length, nbr_pose_channels = future_egomotion_vec.shape
-        dx, dy, dz = voxel_feats.shape[-3:]
-
-        future_egomotions_spatial = future_egomotion_vec.view(batch_size, sequence_length, nbr_pose_channels, 1, 1, 1).expand(batch_size, sequence_length, nbr_pose_channels, dx, dy, dz)
-        
-        # at time 0, no egomotion so feed zero vector
-        future_egomotions_spatial = torch.cat([torch.zeros_like(future_egomotions_spatial[:, :1]),
-                                            future_egomotions_spatial[:, :(self.time_receptive_field-1)]], dim=1)
-        voxel_feats = torch.cat([voxel_feats, future_egomotions_spatial], dim=-4)
-        
-        max_feats = self.voxel2bev_maxpooling(voxel_feats) # max pooling
-        mean_feats = self.voxel2bev(voxel_feats) # average pooling
-        bev_feats = max_feats * self.max_weight + mean_feats * self.mean_weight
-
-        bev_feats_enc = self.occ_encoder(bev_feats)
-        if type(bev_feats_enc) is not tuple:
-            bev_feats_enc = [bev_feats_enc]
-
-        return bev_feats_enc, img_feats, depth
-    
-    def voxel2bev(self, voxel_feats):
-        bev_feats = torch.mean(voxel_feats,-1)
-        return bev_feats
-
-    def voxel2bev_maxpooling(self, voxel_feats):
-        bev_feats = torch.max(voxel_feats,-1).values
-        return bev_feats
-    
-    @force_fp32(apply_to=('voxel_feats'))
-    def forward_pts_train(
-            self,
-            voxel_feats,
-            segmentation_bev=None,
-            points_occ=None,
-            img_metas=None,
-            transform=None,
-            img_feats=None,
-            return_outs=False,
-        ):
-        outs = self.pts_bbox_head(
-            voxel_feats=voxel_feats,
-            points=points_occ,
-            img_metas=img_metas,
-            img_feats=img_feats,
-            transform=transform,)
-        
-        losses = self.pts_bbox_head.loss(
-            output_voxels=outs['output_voxels'],
-            target_voxels=segmentation_bev,
-            target_points=points_occ,
-            img_metas=img_metas,)
-
-        if return_outs:
-            return losses, outs
-        return losses
-
     def forward_train(self,
             img_inputs_seq=None,
             segmentation=None,
@@ -1292,7 +1122,6 @@ class EfficientOCF(
             gt_instance_centers_valid=None,
             gt_instance_ids=None,
             img_metas=None,
-            points_occ=None,
             occ_dt=None,
             **kwargs,
         ):
@@ -1489,8 +1318,6 @@ class EfficientOCF(
             query_depth_probs_tqd,
             query_img_feat_pooled_tqd,
             _query_future_feat_tqd,
-            _bev_feats_src,
-            bev_feats_enc,
             _query_attn_weights_tqnhw,
             _query_attn_bbox_targets,
             instance_img_debug_bundle,
@@ -1513,7 +1340,6 @@ class EfficientOCF(
             gt_segmentation_instance3d_txyz_for_attn=gt_instance_occ3d_txyz_primary,
             fallback_segmentation_instance3d_txyz_for_attn=gt_segmentation_instance3d_txyz,
             voxelize=False,
-            return_bev_occ_feats=True,
             return_instance_img_debug=need_instance_img_debug,
             return_instance_img_debug_fullseq=need_instance_img_debug_fullseq,
             return_query_cam_gaussian_vis_debug=need_query_cam_gaussian_vis,
@@ -1974,16 +1800,6 @@ class EfficientOCF(
                 query_attn_cam_score_pack=query_attn_cam_score_pack,
             )
 
-        # LSS view transform -> BEV feature -> occ head (2D occupancy) training route.
-        if segmentation_bev is not None:
-            if segmentation_bev.dim() >= 4:
-                segmentation_bev = segmentation_bev[:, -self.n_future_frames_plus:, ...].contiguous()
-            elif segmentation_bev.dim() == 3:
-                segmentation_bev = segmentation_bev[-self.n_future_frames_plus:, ...].unsqueeze(0).contiguous()
-
-        transform = img_inputs_seq[1:8] if img_inputs_seq is not None else None
-
-        
         # Save query debug visualization regardless of individual loss switches.
         with torch.no_grad():
             self.query_head.maybe_save_query_debug_vis(
@@ -2061,12 +1877,6 @@ class EfficientOCF(
         )
 
         return self._aggregate_training_losses(
-            bev_feats_enc=bev_feats_enc,
-            segmentation_bev=segmentation_bev,
-            points_occ=points_occ,
-            img_metas=img_metas,
-            img_feats=img_feats,
-            transform=transform,
             query_cls_loss=query_cls_loss,
             query_depth_loss=query_depth_loss,
             query_attn_bbox_loss=query_attn_bbox_loss,
