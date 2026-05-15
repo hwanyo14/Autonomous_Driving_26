@@ -803,6 +803,7 @@ class EfficientOCF(
         return_instance_img_debug_fullseq=True,
         return_query_cam_gaussian_vis_debug=False,
         return_query_match_inputs=False,
+        defer_trajectory=False,
     ):
         '''
         Extract voxel features from input sequential images
@@ -964,6 +965,7 @@ class EfficientOCF(
             query_head_outputs,
             lifted_centers_world,
             detach_query_for_center=self.query_center_loss_detach_query_feat,
+            defer_trajectory=defer_trajectory,
         )
         centers_world = query_head_outputs["centers_world_tq3"]
         center_logits = query_head_outputs["center_logits_tq3"]
@@ -980,6 +982,7 @@ class EfficientOCF(
         else:
             query_present_local_idx = 0
         traj_offsets_fq2 = query_head_outputs.get("traj_offsets_fq2", None)
+        traj_motion_input_tqd2 = query_head_outputs.get("traj_motion_input_tqd2", None)
 
         present_centers_world_tq3 = centers_world.narrow(0, query_present_local_idx, 1).contiguous()
         present_sigmas_world_tq3 = (
@@ -1106,6 +1109,7 @@ class EfficientOCF(
             mixture_sigmas_world_traj_tqg3,
             mixture_yaw_traj_tqg,
             mixture_weights_traj_tqg,
+            traj_motion_input_tqd2,
         )
 
 
@@ -1333,6 +1337,7 @@ class EfficientOCF(
             mixture_sigmas_world_traj_tqg3,
             mixture_yaw_traj_tqg,
             mixture_weights_traj_tqg,
+            traj_motion_input_tqd2,
         ) = self.extract_feat_query(
             img_inputs_seq=img_inputs_seq,
             img_metas=img_metas,
@@ -1344,6 +1349,7 @@ class EfficientOCF(
             return_instance_img_debug_fullseq=need_instance_img_debug_fullseq,
             return_query_cam_gaussian_vis_debug=need_query_cam_gaussian_vis,
             return_query_match_inputs=True,
+            defer_trajectory=bool(getattr(self, "query_traj_matched_only", False)),
         )
         # Keep a minimal default loss path until full query-loss branches are enabled.
         _pick = self._pick_tensor
@@ -1642,6 +1648,79 @@ class EfficientOCF(
             matched_query_idx = inst_match_result.get("matched_query_idx", None)
             if torch.is_tensor(matched_query_idx):
                 num_matched_queries = int(matched_query_idx.numel())
+
+        # Deferred trajectory prediction: run traj head only on matched queries,
+        # scatter results back to [F, Q=100, 2] with zeros for unmatched.
+        if bool(getattr(self, "query_traj_matched_only", False)) and torch.is_tensor(traj_motion_input_tqd2):
+            _n_future = int(self.n_future_frames)
+            _q_total = int(centers_world.shape[1]) if torch.is_tensor(centers_world) else 0
+            _mqi = inst_match_result.get("matched_query_idx", None) if isinstance(inst_match_result, dict) else None
+            if torch.is_tensor(_mqi) and _mqi.numel() > 0 and _q_total > 0:
+                _motion_skd = traj_motion_input_tqd2.index_select(1, _mqi)
+                _feat_tkd = _query_future_feat_tqd.index_select(1, _mqi)
+                _, _traj_fk2 = self.query_head._predict_trajectory_from_inputs(_motion_skd, _feat_tkd)
+                _traj_offsets_fq2 = traj_motion_input_tqd2.new_zeros(_n_future, _q_total, 2)
+                _traj_offsets_fq2.index_copy_(1, _mqi, _traj_fk2)
+            elif _q_total > 0:
+                _traj_offsets_fq2 = traj_motion_input_tqd2.new_zeros(_n_future, _q_total, 2)
+
+            # Rebuild vis geometry with real (matched) traj offsets —
+            # must update all positional vis tensors (centers + mixture) so that
+            # Gaussian positions stay consistent with query center positions.
+            if (
+                torch.is_tensor(_traj_offsets_fq2)
+                and torch.is_tensor(centers_world)
+                and int(centers_world.shape[0]) > _query_present_local_idx
+            ):
+                def _safe_narrow(t, idx):
+                    return (
+                        t.narrow(0, idx, 1).contiguous()
+                        if torch.is_tensor(t) and t.dim() >= 3 and int(t.shape[0]) > idx
+                        else None
+                    )
+                _present_c  = _safe_narrow(centers_world, _query_present_local_idx)
+                _present_sg = _safe_narrow(gaussian_sigmas_world, _query_present_local_idx)
+                _present_mc = _safe_narrow(mixture_centers_world_tqg3, _query_present_local_idx)
+                _present_ms = _safe_narrow(mixture_sigmas_world_tqg3, _query_present_local_idx)
+                _present_my = _safe_narrow(mixture_yaw_tqg, _query_present_local_idx)
+                _present_mw = _safe_narrow(mixture_weights_tqg, _query_present_local_idx)
+                _traj_geom_real = self._build_query_trajectory_geometry_from_present(
+                    present_centers_world_tq3=_present_c,
+                    present_sigmas_world_tq3=_present_sg,
+                    present_mix_centers_world_tqg3=_present_mc,
+                    present_mix_sigmas_world_tqg3=_present_ms,
+                    present_mix_yaw_tqg=_present_my,
+                    present_mix_weights_tqg=_present_mw,
+                    traj_offsets_fq2=_traj_offsets_fq2,
+                )
+                _ctraj_real = _traj_geom_real.get("centers_world_tq3", None)
+                if torch.is_tensor(_ctraj_real):
+                    if not traj_centers_are_present_aligned:
+                        _ctraj_real = self._align_query_centers_to_present_frame(
+                            centers_world_tq3=_ctraj_real,
+                            future_egomotion=future_egomotion,
+                            traj_frame_indices_t=traj_frame_indices_t,
+                        )
+                    if traj_vis_has_present_anchor:
+                        _ppd_v = lambda p, t: self._prepend_past_frames(
+                            p, past_only_count, t, detach=True
+                        )
+                        centers_world_vis_full_tq3 = _ppd_v(centers_world, _ctraj_real)
+                        _sg = _traj_geom_real.get("sigmas_world_tq3", None)
+                        if torch.is_tensor(_sg):
+                            gaussian_sigmas_world_vis_full_tq3 = _ppd_v(gaussian_sigmas_world, _sg)
+                        _mc = _traj_geom_real.get("mix_centers_world_tqg3", None)
+                        if torch.is_tensor(_mc):
+                            mixture_centers_world_vis_full_tqg3 = _ppd_v(mixture_centers_world_tqg3, _mc)
+                        _ms = _traj_geom_real.get("mix_sigmas_world_tqg3", None)
+                        if torch.is_tensor(_ms):
+                            mixture_sigmas_world_vis_full_tqg3 = _ppd_v(mixture_sigmas_world_tqg3, _ms)
+                        _my = _traj_geom_real.get("mix_yaw_tqg", None)
+                        if torch.is_tensor(_my):
+                            mixture_yaw_vis_full_tqg = _ppd_v(mixture_yaw_tqg, _my)
+                        _mw = _traj_geom_real.get("mix_weights_tqg", None)
+                        if torch.is_tensor(_mw):
+                            mixture_weights_vis_full_tqg = _ppd_v(mixture_weights_tqg, _mw)
 
         query_cls_loss = self._compute_query_cls_loss(
             query_cls_logits_qc=query_cls_logits_qc,

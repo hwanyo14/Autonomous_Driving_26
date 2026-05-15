@@ -41,6 +41,7 @@ MODEL_CFG_DEFAULTS = {
     "query_cls_match_cost_weight": 0.0,
     "query_bev_dice_match_cost_weight": 0.0,
     "query_center_routed_loss_weight": 0.1,
+    "query_traj_matched_only": True,
     "query_traj_loss_weight": 0.0,
     "query_traj_loss_type": "l1",
     "query_traj_residual_max_m": (8.0, 8.0),
@@ -216,6 +217,7 @@ def apply_model_cfg(self, cfg):
     self.query_cls_match_cost_weight = float(cfg["query_cls_match_cost_weight"])
     self.query_bev_dice_match_cost_weight = float(cfg["query_bev_dice_match_cost_weight"])
     self.query_center_routed_loss_weight = float(cfg["query_center_routed_loss_weight"])
+    self.query_traj_matched_only = bool(cfg["query_traj_matched_only"])
     self.query_traj_loss_weight = float(cfg["query_traj_loss_weight"])
     self.query_traj_loss_type = str(cfg["query_traj_loss_type"]).lower()
     self.query_traj_residual_max_m = tuple(float(v) for v in cfg["query_traj_residual_max_m"])

@@ -686,6 +686,7 @@ class QueryHead(nn.Module):
         outputs: dict,
         centers_world: torch.Tensor,
         detach_query_for_center: bool = None,
+        defer_trajectory: bool = False,
     ) -> dict:
         if not isinstance(outputs, dict):
             raise TypeError("outputs must be a dict returned by QueryHead.forward")
@@ -727,10 +728,11 @@ class QueryHead(nn.Module):
                 query_feat_tqd=query_feat_tqd,
                 centers_world_tq3=centers_world,
             )
-            traj_logits_fq2, traj_offsets_fq2 = self._predict_trajectory_from_inputs(
-                motion_input_tqd2=traj_motion_input_tqd2,
-                query_feat_tqd=query_feat_tqd,
-            )
+            if not defer_trajectory:
+                traj_logits_fq2, traj_offsets_fq2 = self._predict_trajectory_from_inputs(
+                    motion_input_tqd2=traj_motion_input_tqd2,
+                    query_feat_tqd=query_feat_tqd,
+                )
 
         outputs = dict(outputs)
         outputs.update({
