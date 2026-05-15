@@ -377,307 +377,83 @@ voxel_out_channel = bev_feat_dim * (n_future_frames_plus)
 voxel_out_channel_per_frame = bev_feat_dim
 my_voxel_out_indices = (0, 1, 2, 3)
 
-# Query matching / auxiliary losses.
 gn_cfg = dict(type='GN', num_groups=16, requires_grad=True)
-use_query_attn_bbox_loss = True
-query_attn_bbox_loss_weight = 1.0
-query_attn_bbox_unmatched_weight = 0.25
-query_attn_bbox_eps = 1e-6
+model_cfg = dict(
+    use_segmentation_as_query_gt=True,
+    use_gmo_bce_loss=True,
+    query_gmo_loss_type='focal',
+    use_lss_bev_occ_loss=False,
+    query_gt2p_instance_labeled_tau=0.3,
+    query_gt2p_cooldown_iters=4000,
+    query_class_ids=query_class_ids,
+    query_class_names=query_class_names,
+    strict_query_class_id_validation=strict_query_class_id_validation,
+    query_num_classes=len(query_class_ids),
+    query_cls_loss_class_weights=[0.1] + [1.0] * (len(query_class_ids) - 1),
+    query_attn_match_cost_weight=0.5,
+    query_embed_dim=bev_feat_dim,
+    query_id_reinject_scale=0.2,
+    query_decor_loss_weight=1.0,
+    use_query_attn_bbox_loss=True,
+    query_attn_cam_gaussian_truncate_sigma=1.777,
+    query_center_match_cost_weight=4.0,
+    query_center_routed_loss_weight=0.3,
+    query_traj_loss_weight=0.5,
+    query_traj_residual_max_m=(15.0, 15.0),
+    query_traj_moving_reweight_enabled=True,
+    query_traj_moving_threshold_m=0.8,
+    query_matched_gmo_bce_occ_size=(64, 64, 20),
+    query_num_gaussians=16,
+    query_multi_gaussian_offset_max_m=(3.0, 3.0, 0.7),
+    query_multi_gaussian_sigma_min_m=(0.15, 0.15, 0.15),
+    query_multi_gaussian_sigma_max_m=(1.0, 1.0, 1.0),
+    query_multi_gaussian_sigma_reg_loss_weight=0.01,
+    query_multi_gaussian_weight_mode='softplus',
+)
 
-use_query_attn_cam_gaussian_score = False
-query_attn_cam_frame_mode = "overlap_only"
-query_attn_cam_target_mode = "prob"
-query_attn_cam_metric = "kl"
-query_attn_cam_camera_reduce_mode = "camera_aggregated_first"
-query_attn_cam_eps = 1e-6
-# Originally 3.0. 1.777 keeps roughly prob > 0.5 area for visualization.
-query_attn_cam_gaussian_truncate_sigma = 1.777
-query_attn_cam_target_binary_threshold = 0.5
-query_attn_cam_score_norm_mode = "exp_neg"
+debug_cfg = dict(
+    debug_query_vis_every=8,
+    debug_query_cam_gaussian_vis_enabled=True,
+    debug_query_cam_gaussian_vis_every=48,
+    debug_query_inst_depth_lift_vis_every=48,
+    debug_query_attn_softargmax_vis_every=(
+        48
+    ),
+)
 
-
-query_attn_softargmax_tau = 1.0
-query_depth_loss_weight = 1.0
-query_depth_label_smoothing = 0.0
-query_inst_depth_num_bins = 64
-query_inst_depth_range_mode = "dbound"
-
-center_only_mode = False
-
-# Query classifier uses a compact contiguous label space:
-# 0=background, then valid foreground raw ids [2,3,4,5,6,7,9,10].
-query_num_classes = len(query_class_ids)
-query_cls_loss_weight = 1.0
-query_cls_loss_class_weights = [0.1] + [1.0] * (query_num_classes - 1)
-
-query_attn_match_metric="soft_iou"
-query_attn_match_pred_norm="amax"
-query_attn_match_eps=1e-6
-
-query_match_feature_source = 'query_img_feat_pooled'
-query_soft_assign_temp = 0.10
-# Hungarian cost 미사용(legacy diagnostics only)
-query_soft_assign_cost_weight = 0.0
-query_sim_match_cost_weight = 1.0
-# Hungarian cost 미사용(legacy diagnostics only)
-query_cls_match_cost_weight = 0.0
-# Hungarian cost 미사용(legacy diagnostics only)
-query_bev_dice_match_cost_weight = 0.0
-query_attn_match_cost_weight = 0.5
-
-query_embed_dim = bev_feat_dim
-query_num_queries = 100
-query_transformer_num_layers = 1
-query_id_reinject_scale = 0.2
-query_ca_kv_identity_init = False
-query_ca_attn_tau = 1.0
-query_decor_loss_weight = 1.0
-query_attn_vis_dir = "./work_dirs/query_attn_vis_no_pretrain"
-
-query_center_match_cost_weight = 4.0
-query_center_match_loss_type = 'l1'
-query_center_routed_loss_weight = 0.3
-query_traj_loss_weight = 0.5
-query_traj_loss_type = 'l1'
-query_traj_residual_max_m = (15.0, 15.0)
-query_traj_prior_detach = True
-query_traj_moving_reweight_enabled = True
-query_traj_moving_threshold_m = 0.8
-query_traj_moving_weight = 5.0
-query_traj_static_weight = 1.0
-
-# query_matched_gmo_bce_occ_size = (128, 128, 40)
-query_matched_gmo_bce_occ_size = (64, 64, 20)
-
-query_num_gaussians = 16
-query_multi_gaussian_offset_max_m = (3.0, 3.0, 0.7)
-query_multi_gaussian_sigma_min_m = (0.15, 0.15, 0.15)
-query_multi_gaussian_sigma_max_m = (1.0, 1.0, 1.0)
-query_multi_gaussian_sigma_reg_loss_weight = 0.01
-query_multi_gaussian_sigma_reg_log_eps = 1e-6
-query_multi_gaussian_pair_chunk = 8
-query_multi_gaussian_weight_mode = 'softplus'
-query_multi_gaussian_softplus_bias_init = -2.0
-query_multi_gaussian_weight_reg_loss_weight = 1e-3
-query_multi_gaussian_weight_reg_target_sum = 1.0
-
-query_gmo_loss_type = 'focal'
-query_gmo_focal_gamma = 2.0
-query_gmo_focal_alpha = 0.25
-query_gmo_dice_loss_weight = 0.5
-query_gmo_tversky_alpha = 0.7
-query_gmo_tversky_beta = 0.3
-
-use_query_gt2p_instance_labeled_loss = False
-query_gt2p_instance_labeled_loss_weight = 0.1
-query_gt2p_instance_labeled_balance_weight = 0.25
-query_gt2p_instance_labeled_tau = 0.3
-query_gt2p_instance_labeled_assign_sigma_xyz = (4.0, 4.0, 1.5)
-query_gt2p_instance_labeled_sigma_policy = 'fixed'  # Ignored when center_only_mode=True.
-query_gt2p_cooldown_enabled = False
-query_gt2p_cooldown_start_iter = 0
-query_gt2p_cooldown_iters = 4000
-query_gt2p_cooldown_min_scale = 0.0
-
-# Debug / visualization controls.
-debug_query_center_marker_radius = 3
-debug_query_confidence_vis_threshold = 0.5
-debug_query_objectness_vis_threshold = 0.5
-debug_query_gaussian_vis_mode = 'prob'
-debug_query_gaussian_prob_threshold = 0.5
-debug_query_gaussian_prob_alpha_scale = 4.0
-debug_query_score_topk = 50
-debug_query_score_threshold = 0.5
-debug_query_score_iou_weight = 0.0
-debug_query_score_cls_weight = 0.6
-debug_query_score_cam_attn_weight = 0.4
-debug_instance_img_vis_every = 0
-debug_instance_img_vis_dir = "./work_dirs/instance_img_debug_vis_no_pretrain"
-debug_instance_img_vis_max_instances = 24
-debug_query_cam_gaussian_vis_enabled = True
-debug_query_cam_gaussian_vis_every = 48
-debug_query_cam_gaussian_vis_dir = "./work_dirs/query_cam_gaussian_vis_no_pretrain"
-debug_query_cam_gaussian_vis_max_queries = 50
-debug_query_cam_gaussian_vis_max_frames = 3
-debug_query_cam_gaussian_vis_gt_overlay_enabled = True
-debug_query_cam_gaussian_vis_topk_matched = 8
-debug_gt_alignment_vis_every = 0
-debug_gt_alignment_vis_dir = "./work_dirs/gt_alignment_vis_no_pretrain"
-debug_gt_alignment_vis_max_frames = 7
-debug_query_inst_depth_lift_vis_every = 48
-debug_query_inst_depth_lift_vis_dir = "./work_dirs/query_inst_depth_lift_vis_no_pretrain"
-debug_query_inst_depth_lift_vis_max_frames = 2
-debug_query_inst_depth_lift_vis_max_cams = 2
-debug_query_inst_depth_lift_vis_max_instances = 12
-debug_query_attn_softargmax_vis_enabled = True
-debug_query_attn_softargmax_vis_every = 48
-debug_query_attn_softargmax_vis_dir = "./work_dirs/query_attn_softargmax_vis_no_pretrain"
-debug_query_attn_softargmax_vis_max_frames = 2
-debug_query_attn_softargmax_vis_max_cams = 3
-debug_query_attn_softargmax_vis_max_queries = 16
+visualization_cfg = dict(
+    debug_query_vis_dir="./work_dirs/query_debug_vis_no_pretrain",
+    debug_query_gaussian_vis_mode='prob',
+    debug_query_score_iou_weight=0.0,
+    debug_query_score_cls_weight=0.6,
+    debug_query_score_cam_attn_weight=0.4,
+    debug_instance_img_vis_dir="./work_dirs/instance_img_debug_vis_no_pretrain",
+    debug_instance_img_vis_max_frames=n_future_frames_plus,
+    debug_query_cam_gaussian_vis_dir="./work_dirs/query_cam_gaussian_vis_no_pretrain",
+    debug_query_cam_gaussian_vis_max_frames=3,
+    debug_query_cam_gaussian_vis_gt_overlay_enabled=True,
+    debug_query_cam_gaussian_vis_topk_matched=8,
+    debug_gt_alignment_vis_dir="./work_dirs/gt_alignment_vis_no_pretrain",
+    debug_query_inst_depth_lift_vis_dir="./work_dirs/query_inst_depth_lift_vis_no_pretrain",
+    debug_query_inst_depth_lift_vis_max_frames=2,
+    debug_query_inst_depth_lift_vis_max_instances=12,
+    debug_query_attn_softargmax_vis_dir="./work_dirs/query_attn_softargmax_vis_no_pretrain",
+    query_attn_vis_dir="./work_dirs/query_attn_vis_no_pretrain",
+)
 
 model = dict(
     type='EfficientOCF',
-
-    # Runtime initialization.
     only_generate_dataset=only_generate_dataset,
     loss_norm=False,
-
-    # Temporal / geometry setup.
     point_cloud_range=point_cloud_range,
     time_receptive_field=time_receptive_field,
     n_future_frames=n_future_frames,
     n_future_frames_plus=n_future_frames_plus,
     query_present_only=query_present_only,
     query_pred_num_frames=query_pred_num_frames,
-
-    # Query supervision source.
-    gmo_ids=(2, 3, 4, 5, 6, 7, 9, 10),
-    use_segmentation_as_query_gt=True,
-
-    # Query losses.
-    use_gmo_bce_loss=True,
-    query_gmo_loss_type=query_gmo_loss_type,
-    query_gmo_focal_gamma=query_gmo_focal_gamma,
-    query_gmo_focal_alpha=query_gmo_focal_alpha,
-    use_lss_bev_occ_loss=False,
-    use_query_gmo_dice_loss=True,
-    query_gmo_dice_loss_weight=query_gmo_dice_loss_weight,
-    query_gmo_tversky_alpha=query_gmo_tversky_alpha,
-    query_gmo_tversky_beta=query_gmo_tversky_beta,
-    use_query_inst_center_match_loss=True,
-    use_query_dt_loss=True,
-    use_query_gt2p_instance_labeled_loss=use_query_gt2p_instance_labeled_loss,
-    query_gt2p_instance_labeled_loss_weight=query_gt2p_instance_labeled_loss_weight,
-    query_gt2p_instance_labeled_balance_weight=query_gt2p_instance_labeled_balance_weight,
-    query_gt2p_instance_labeled_tau=query_gt2p_instance_labeled_tau,
-    query_gt2p_instance_labeled_assign_sigma_xyz=query_gt2p_instance_labeled_assign_sigma_xyz,
-    query_gt2p_instance_labeled_sigma_policy=query_gt2p_instance_labeled_sigma_policy,
-    query_gt2p_cooldown_enabled=query_gt2p_cooldown_enabled,
-    query_gt2p_cooldown_start_iter=query_gt2p_cooldown_start_iter,
-    query_gt2p_cooldown_iters=query_gt2p_cooldown_iters,
-    query_gt2p_cooldown_min_scale=query_gt2p_cooldown_min_scale,
-
-    # Query matching / class constraints.
-    query_class_ids=query_class_ids,
-    query_class_names=query_class_names,
-    strict_query_class_id_validation=strict_query_class_id_validation,
-    query_num_classes=query_num_classes,
-    query_cls_loss_weight=query_cls_loss_weight,
-    query_cls_loss_class_weights=query_cls_loss_class_weights,
-    query_match_feature_source=query_match_feature_source,
-    query_soft_assign_temp=query_soft_assign_temp,
-    query_soft_assign_cost_weight=query_soft_assign_cost_weight,
-    query_sim_match_cost_weight=query_sim_match_cost_weight,
-    query_cls_match_cost_weight=query_cls_match_cost_weight,
-    query_bev_dice_match_cost_weight=query_bev_dice_match_cost_weight,
-    query_attn_match_cost_weight=query_attn_match_cost_weight,
-    query_attn_match_metric=query_attn_match_metric,
-    query_attn_match_pred_norm=query_attn_match_pred_norm,
-    query_attn_match_eps=query_attn_match_eps,
-
-    # Query Gaussian parameterization.
-    query_matched_gmo_bce_occ_size=query_matched_gmo_bce_occ_size,
-    query_num_gaussians=query_num_gaussians,
-    query_multi_gaussian_offset_max_m=query_multi_gaussian_offset_max_m,
-    query_multi_gaussian_sigma_min_m=query_multi_gaussian_sigma_min_m,
-    query_multi_gaussian_sigma_max_m=query_multi_gaussian_sigma_max_m,
-    query_multi_gaussian_sigma_reg_loss_weight=query_multi_gaussian_sigma_reg_loss_weight,
-    query_multi_gaussian_sigma_reg_log_eps=query_multi_gaussian_sigma_reg_log_eps,
-    query_multi_gaussian_pair_chunk=query_multi_gaussian_pair_chunk,
-    query_multi_gaussian_weight_mode=query_multi_gaussian_weight_mode,
-    query_multi_gaussian_softplus_bias_init=query_multi_gaussian_softplus_bias_init,
-    query_multi_gaussian_weight_reg_loss_weight=query_multi_gaussian_weight_reg_loss_weight,
-    query_multi_gaussian_weight_reg_target_sum=query_multi_gaussian_weight_reg_target_sum,
-
-    # Query transformer.
-    query_embed_dim=query_embed_dim,
-    query_num_queries=query_num_queries,
-    query_transformer_num_layers=query_transformer_num_layers,
-    query_id_reinject_scale=query_id_reinject_scale,
-    query_ca_kv_identity_init=query_ca_kv_identity_init,
-    query_ca_attn_tau=query_ca_attn_tau,
-    query_decor_loss_weight=query_decor_loss_weight,
-    query_attn_vis_dir=query_attn_vis_dir,
-
-    # Attention-based query losses.
-    use_query_attn_bbox_loss=use_query_attn_bbox_loss,
-    query_attn_bbox_loss_weight=query_attn_bbox_loss_weight,
-    query_attn_bbox_unmatched_weight=query_attn_bbox_unmatched_weight,
-    query_attn_bbox_eps=query_attn_bbox_eps,
-    use_query_attn_cam_gaussian_score=use_query_attn_cam_gaussian_score,
-    query_attn_cam_frame_mode=query_attn_cam_frame_mode,
-    query_attn_cam_target_mode=query_attn_cam_target_mode,
-    query_attn_cam_metric=query_attn_cam_metric,
-    query_attn_cam_camera_reduce_mode=query_attn_cam_camera_reduce_mode,
-    query_attn_cam_eps=query_attn_cam_eps,
-    query_attn_cam_gaussian_truncate_sigma=query_attn_cam_gaussian_truncate_sigma,
-    query_attn_cam_target_binary_threshold=query_attn_cam_target_binary_threshold,
-    query_attn_cam_score_norm_mode=query_attn_cam_score_norm_mode,
-    query_attn_softargmax_tau=query_attn_softargmax_tau,
-    query_depth_loss_weight=query_depth_loss_weight,
-    query_depth_label_smoothing=query_depth_label_smoothing,
-    query_inst_depth_num_bins=query_inst_depth_num_bins,
-    query_inst_depth_range_mode=query_inst_depth_range_mode,
-
-    # Center matching.
-    query_center_match_cost_weight=query_center_match_cost_weight,
-    query_center_match_loss_type=query_center_match_loss_type,
-    query_center_routed_loss_weight=query_center_routed_loss_weight,
-    query_traj_loss_weight=query_traj_loss_weight,
-    query_traj_loss_type=query_traj_loss_type,
-    query_traj_residual_max_m=query_traj_residual_max_m,
-    query_traj_prior_detach=query_traj_prior_detach,
-    query_traj_moving_reweight_enabled=query_traj_moving_reweight_enabled,
-    query_traj_moving_threshold_m=query_traj_moving_threshold_m,
-    query_traj_moving_weight=query_traj_moving_weight,
-    query_traj_static_weight=query_traj_static_weight,
-
-    # Debug controls.
-    debug_query_vis_every=8,
-    debug_query_vis_dir="./work_dirs/query_debug_vis_no_pretrain",
-    center_only_mode=center_only_mode,
-    debug_query_center_marker_radius=debug_query_center_marker_radius,
-    debug_query_confidence_vis_threshold=debug_query_confidence_vis_threshold,
-    debug_query_objectness_vis_threshold=debug_query_objectness_vis_threshold,
-    debug_query_gaussian_vis_mode=debug_query_gaussian_vis_mode,
-    debug_query_gaussian_prob_threshold=debug_query_gaussian_prob_threshold,
-    debug_query_gaussian_prob_alpha_scale=debug_query_gaussian_prob_alpha_scale,
-    debug_query_score_topk=debug_query_score_topk,
-    debug_query_score_threshold=debug_query_score_threshold,
-    debug_query_score_iou_weight=debug_query_score_iou_weight,
-    debug_query_score_cls_weight=debug_query_score_cls_weight,
-    debug_query_score_cam_attn_weight=debug_query_score_cam_attn_weight,
-    debug_instance_img_vis_every=debug_instance_img_vis_every,
-    debug_instance_img_vis_dir=debug_instance_img_vis_dir,
-    debug_instance_img_vis_max_frames=n_future_frames_plus,
-    debug_instance_img_vis_max_instances=debug_instance_img_vis_max_instances,
-    debug_query_cam_gaussian_vis_enabled=debug_query_cam_gaussian_vis_enabled,
-    debug_query_cam_gaussian_vis_every=debug_query_cam_gaussian_vis_every,
-    debug_query_cam_gaussian_vis_dir=debug_query_cam_gaussian_vis_dir,
-    debug_query_cam_gaussian_vis_max_queries=debug_query_cam_gaussian_vis_max_queries,
-    debug_query_cam_gaussian_vis_max_frames=debug_query_cam_gaussian_vis_max_frames,
-    debug_query_cam_gaussian_vis_gt_overlay_enabled=debug_query_cam_gaussian_vis_gt_overlay_enabled,
-    debug_query_cam_gaussian_vis_topk_matched=debug_query_cam_gaussian_vis_topk_matched,
-    debug_gt_alignment_vis_every=debug_gt_alignment_vis_every,
-    debug_gt_alignment_vis_dir=debug_gt_alignment_vis_dir,
-    debug_gt_alignment_vis_max_frames=debug_gt_alignment_vis_max_frames,
-    debug_query_inst_depth_lift_vis_every=debug_query_inst_depth_lift_vis_every,
-    debug_query_inst_depth_lift_vis_dir=debug_query_inst_depth_lift_vis_dir,
-    debug_query_inst_depth_lift_vis_max_frames=debug_query_inst_depth_lift_vis_max_frames,
-    debug_query_inst_depth_lift_vis_max_cams=debug_query_inst_depth_lift_vis_max_cams,
-    debug_query_inst_depth_lift_vis_max_instances=debug_query_inst_depth_lift_vis_max_instances,
-    debug_query_attn_softargmax_vis_every=(
-        debug_query_attn_softargmax_vis_every
-        if debug_query_attn_softargmax_vis_enabled
-        else 0
-    ),
-    debug_query_attn_softargmax_vis_dir=debug_query_attn_softargmax_vis_dir,
-    debug_query_attn_softargmax_vis_max_frames=debug_query_attn_softargmax_vis_max_frames,
-    debug_query_attn_softargmax_vis_max_cams=debug_query_attn_softargmax_vis_max_cams,
-    debug_query_attn_softargmax_vis_max_queries=debug_query_attn_softargmax_vis_max_queries,
-
-    # Backbone / neck / head.
+    model_cfg=model_cfg,
+    debug_cfg=debug_cfg,
+    visualization_cfg=visualization_cfg,
     img_backbone=dict(
         pretrained='torchvision://resnet18',
         type='ResNet',
