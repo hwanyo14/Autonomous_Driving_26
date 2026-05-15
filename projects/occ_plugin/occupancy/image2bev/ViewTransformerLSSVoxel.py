@@ -132,10 +132,10 @@ class ViewTransformerLiftSplatShootVoxel(ViewTransformerLSSBEVDepth):
         if (depth_digit is None) or (img_feat is None):
             x = x.view(B * N, C, H, W)
             # ======== DepthNet time ========
-            depth_start = time.time()
+            # depth_start = time.time()
             x = self.depth_net(x, mlp_input_seq)
-            depth_end = time.time()
-            print(f"DepthNet time: {depth_end - depth_start} seconds")
+            # depth_end = time.time()
+            # print(f"DepthNet time: {depth_end - depth_start} seconds")
 
             depth_digit = x[:, :self.D, ...]
             img_feat = x[:, self.D:self.D + self.numC_Trans, ...]
@@ -149,9 +149,9 @@ class ViewTransformerLiftSplatShootVoxel(ViewTransformerLSSBEVDepth):
         geom = self.get_geometry(rots_seq, trans_seq, intrins_seq, post_rots_seq, post_trans_seq, bda)
 
         # ======== Voxel Pooling time ========
-        voxel_start = time.time()
+        # voxel_start = time.time()
         bev_feat = self.voxel_pooling(geom, volume)
-        voxel_end = time.time()
-        print(f"Voxel Pooling time: {voxel_end - voxel_start} seconds")
+        # voxel_end = time.time()
+        # print(f"Voxel Pooling time: {voxel_end - voxel_start} seconds")
 
         return bev_feat, depth_prob

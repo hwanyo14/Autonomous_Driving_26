@@ -1852,16 +1852,16 @@ class EfficientOCF(
             img_metas=img_metas,
             step=cur_train_iter,
         )
-        self.maybe_save_query_inst_depth_lift_vis(
-            img_inputs_seq=img_inputs_seq,
-            query_match_inputs=query_match_inputs,
-            query_inst_depth_target_pack=query_inst_depth_target_pack,
-            gt_segmentation_instance3d_txyz_fine=gt_instance_occ3d_txyz_primary,
-            gt_segmentation_instance3d_txyz_bbox=gt_segmentation_instance3d_txyz,
-            future_egomotion=future_egomotion,
-            img_metas=img_metas,
-            step=cur_train_iter,
-        )
+        # self.maybe_save_query_inst_depth_lift_vis(
+        #     img_inputs_seq=img_inputs_seq,
+        #     query_match_inputs=query_match_inputs,
+        #     query_inst_depth_target_pack=query_inst_depth_target_pack,
+        #     gt_segmentation_instance3d_txyz_fine=gt_instance_occ3d_txyz_primary,
+        #     gt_segmentation_instance3d_txyz_bbox=gt_segmentation_instance3d_txyz,
+        #     future_egomotion=future_egomotion,
+        #     img_metas=img_metas,
+        #     step=cur_train_iter,
+        # )
         self.maybe_save_query_attn_softargmax_vis(
             img_inputs_seq=img_inputs_seq,
             query_attn_weights_tqnhw=_query_attn_weights_tqnhw,
