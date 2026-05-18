@@ -1657,6 +1657,41 @@ class EfficientOCF(
             _mqi = inst_match_result.get("matched_query_idx", None) if isinstance(inst_match_result, dict) else None
             if torch.is_tensor(_mqi) and _mqi.numel() > 0 and _q_total > 0:
                 _motion_skd = traj_motion_input_tqd2.index_select(1, _mqi)
+                # Teacher forcing: replace past delta priors with GT-derived offsets.
+                if (
+                    self.training
+                    and bool(getattr(self, "query_traj_teacher_forcing", False))
+                    and int(getattr(self, "query_traj_teacher_forcing_until_iter", 0)) > 0
+                    and int(getattr(self.query_head, "_train_iter", 0)) < int(self.query_traj_teacher_forcing_until_iter)
+                    and isinstance(inst_match_result, dict)
+                ):
+                    _mii = inst_match_result.get("matched_inst_idx", None)
+                    _gt_c = inst_match_result.get("gt_centers_tn3", None)
+                    _gt_v = inst_match_result.get("gt_valid_tn", None)
+                    _past_steps = int(_query_present_local_idx)
+                    if (
+                        torch.is_tensor(_mii) and _mii.numel() > 0
+                        and torch.is_tensor(_gt_c) and _gt_c.dim() == 3
+                        and torch.is_tensor(_gt_v) and _gt_v.dim() == 2
+                        and int(_gt_c.shape[0]) > _past_steps
+                        and _past_steps > 0
+                    ):
+                        _gt_xy = _gt_c[:_past_steps + 1, :, :2].to(
+                            device=_motion_skd.device, dtype=torch.float32
+                        )
+                        _gt_delta = _gt_xy[1:_past_steps + 1] - _gt_xy[:_past_steps]  # [past_steps, N, 2]
+                        _gt_delta_k = _gt_delta.index_select(1, _mii)  # [past_steps, K, 2]
+                        _gt_v_past = _gt_v[:_past_steps + 1].to(
+                            device=_motion_skd.device, dtype=torch.bool
+                        )
+                        _valid_k = (_gt_v_past[:_past_steps].index_select(1, _mii)
+                                    & _gt_v_past[1:_past_steps + 1].index_select(1, _mii))
+                        _traj_max = _motion_skd.new_tensor(self.query_traj_residual_max_m).view(1, 1, 2)
+                        _gt_delta_norm = (_gt_delta_k / _traj_max.clamp_min(1e-6)).clamp(-1.0, 1.0)
+                        _motion_skd = _motion_skd.clone()
+                        for _t in range(_past_steps):
+                            _valid_t = _valid_k[_t]  # [K]
+                            _motion_skd[_t, _valid_t, -2:] = _gt_delta_norm[_t, _valid_t]
                 _feat_tkd = _query_future_feat_tqd.index_select(1, _mqi)
                 _, _traj_fk2 = self.query_head._predict_trajectory_from_inputs(_motion_skd, _feat_tkd)
                 _traj_offsets_fq2 = traj_motion_input_tqd2.new_zeros(_n_future, _q_total, 2)

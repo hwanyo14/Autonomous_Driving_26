@@ -18,4 +18,4 @@ python -m torch.distributed.run \
     $CONFIG \
     --seed 2 \
     --launcher pytorch ${@:3}
-    # --resume work_dirs/EfficientOCF_V1.1_query_main/epoch_4_lss_only.pth
+    # --resume work_dirs/EfficientOCF_V1.1_1gpu/epoch_4_lss_only.pth

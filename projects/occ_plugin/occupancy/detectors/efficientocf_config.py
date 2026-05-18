@@ -50,6 +50,8 @@ MODEL_CFG_DEFAULTS = {
     "query_traj_moving_threshold_m": 0.5,
     "query_traj_moving_weight": 5.0,
     "query_traj_static_weight": 1.0,
+    "query_traj_teacher_forcing": False,
+    "query_traj_teacher_forcing_until_iter": 0,
     "query_center_match_cost_weight": 0.0,
     "query_center_match_loss_type": "l1",
     "query_matched_gmo_bce_occ_size": (128, 128, 10),
@@ -226,6 +228,8 @@ def apply_model_cfg(self, cfg):
     self.query_traj_moving_threshold_m = float(cfg["query_traj_moving_threshold_m"])
     self.query_traj_moving_weight = float(cfg["query_traj_moving_weight"])
     self.query_traj_static_weight = float(cfg["query_traj_static_weight"])
+    self.query_traj_teacher_forcing = bool(cfg["query_traj_teacher_forcing"])
+    self.query_traj_teacher_forcing_until_iter = int(cfg["query_traj_teacher_forcing_until_iter"])
     self.query_center_match_cost_weight = float(cfg["query_center_match_cost_weight"])
     self.query_center_match_loss_type = str(cfg["query_center_match_loss_type"]).lower()
     self.query_matched_gmo_bce_occ_size = tuple(int(v) for v in cfg["query_matched_gmo_bce_occ_size"])
