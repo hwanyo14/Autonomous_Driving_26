@@ -364,6 +364,7 @@ model_cfg = dict(
     use_query_attn_bbox_loss=True,
     query_attn_cam_gaussian_truncate_sigma=1.777,
     query_center_match_cost_weight=4.0,
+    query_temporal_offset_match_cost_weight=2.0,
     query_center_routed_loss_weight=0.3,
     query_traj_loss_weight=0.5,
     query_traj_residual_max_m=(15.0, 15.0),

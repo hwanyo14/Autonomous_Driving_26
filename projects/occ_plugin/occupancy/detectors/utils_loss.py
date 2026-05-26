@@ -1845,6 +1845,9 @@ class EfficientOCFLossMixin:
         losses["dbg_query_center_match_cost_weight"] = centers_world.new_tensor(
             float(getattr(self, "query_center_match_cost_weight", 0.0))
         )
+        losses["dbg_query_temporal_offset_match_cost_weight"] = centers_world.new_tensor(
+            float(getattr(self, "query_temporal_offset_match_cost_weight", 0.0))
+        )
         losses["dbg_query_bev_dice_match_cost_weight"] = centers_world.new_tensor(
             float(self.query_bev_dice_match_cost_weight)
         )
@@ -1908,6 +1911,7 @@ class EfficientOCFLossMixin:
                     "soft": inst_match_result.get("cost_soft_contrib_qn", None),
                     "cls": inst_match_result.get("cost_cls_contrib_qn", None),
                     "center": inst_match_result.get("cost_center_contrib_qn", None),
+                    "temporal_offset": inst_match_result.get("cost_temporal_offset_contrib_qn", None),
                     "bev_dice": inst_match_result.get("cost_bev_dice_contrib_qn", None),
                     "attn": inst_match_result.get("cost_attn_iou_contrib_qn", None),
                 }
@@ -2005,6 +2009,7 @@ class EfficientOCFLossMixin:
             "dbg_query_soft_assign_cost_weight",
             "dbg_query_cls_match_cost_weight",
             "dbg_query_center_match_cost_weight",
+            "dbg_query_temporal_offset_match_cost_weight",
             "dbg_query_bev_dice_match_cost_weight",
             "dbg_query_attn_match_cost_weight",
         }

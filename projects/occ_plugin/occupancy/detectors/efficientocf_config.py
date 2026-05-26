@@ -37,7 +37,7 @@ MODEL_CFG_DEFAULTS = {
     "query_match_feature_source": "query_img_feat_pooled",
     "query_soft_assign_temp": 0.10,
     "query_soft_assign_cost_weight": 0.0,
-    "query_sim_match_cost_weight": 1.0,
+    "query_sim_match_cost_weight": 0.0,
     "query_cls_match_cost_weight": 0.0,
     "query_bev_dice_match_cost_weight": 0.0,
     "query_center_routed_loss_weight": 0.1,
@@ -53,6 +53,7 @@ MODEL_CFG_DEFAULTS = {
     "query_traj_teacher_forcing": False,
     "query_traj_teacher_forcing_until_iter": 0,
     "query_center_match_cost_weight": 0.0,
+    "query_temporal_offset_match_cost_weight": 0.0,
     "query_center_match_loss_type": "l1",
     "query_matched_gmo_bce_occ_size": (128, 128, 10),
     "query_num_gaussians": 1,
@@ -231,6 +232,7 @@ def apply_model_cfg(self, cfg):
     self.query_traj_teacher_forcing = bool(cfg["query_traj_teacher_forcing"])
     self.query_traj_teacher_forcing_until_iter = int(cfg["query_traj_teacher_forcing_until_iter"])
     self.query_center_match_cost_weight = float(cfg["query_center_match_cost_weight"])
+    self.query_temporal_offset_match_cost_weight = float(cfg["query_temporal_offset_match_cost_weight"])
     self.query_center_match_loss_type = str(cfg["query_center_match_loss_type"]).lower()
     self.query_matched_gmo_bce_occ_size = tuple(int(v) for v in cfg["query_matched_gmo_bce_occ_size"])
     self.query_num_gaussians = int(cfg["query_num_gaussians"])
