@@ -1231,17 +1231,16 @@ class EfficientOCF(
         gt_inst_center_world_hist_tn3 = None
         gt_inst_center_valid_hist_tn = None
         gt_inst_ids_hist_n = None
-        if isinstance(gt_occ_inst_bundle, dict):
+        gt_inst_center_world_tn3, gt_inst_center_valid_tn, gt_inst_ids_n = self._prepare_gt_instance_centers_for_trajectory_matching(
+            gt_instance_centers_world=gt_instance_centers_world,
+            gt_instance_centers_valid=gt_instance_centers_valid,
+            gt_instance_ids=gt_instance_ids,
+        )
+        if gt_inst_center_world_tn3 is None and isinstance(gt_occ_inst_bundle, dict):
             gt_inst_center_world_tn3, gt_inst_center_valid_tn, gt_inst_ids_n = self._prepare_gt_instance_centers_for_trajectory_matching(
                 gt_instance_centers_world=gt_occ_inst_bundle.get("centers_world_tn3", None),
                 gt_instance_centers_valid=gt_occ_inst_bundle.get("centers_valid_tn", None),
                 gt_instance_ids=gt_occ_inst_bundle.get("instance_ids_n", None),
-            )
-        if gt_inst_center_world_tn3 is None:
-            gt_inst_center_world_tn3, gt_inst_center_valid_tn, gt_inst_ids_n = self._prepare_gt_instance_centers_for_trajectory_matching(
-                gt_instance_centers_world=gt_instance_centers_world,
-                gt_instance_centers_valid=gt_instance_centers_valid,
-                gt_instance_ids=gt_instance_ids,
             )
         # Per-instance depth target uses bbox-based centers from segmentation_instance3d path.
         gt_inst_center_world_hist_tn3, gt_inst_center_valid_hist_tn, gt_inst_ids_hist_n = self._prepare_gt_instance_centers_for_history(
