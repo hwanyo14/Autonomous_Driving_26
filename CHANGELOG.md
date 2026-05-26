@@ -1,5 +1,44 @@
 # Changelog
 
+## 2026-05-26 KST (latest)
+
+### Attn center distance auxiliary loss 추가
+
+**핵심 내용**: 매칭된 (query, GT) 쌍에 대해 attention softargmax predicted 2D center와 GT mask centroid 간의 L2 거리를 보조 loss로 추가. on/off 및 weight 조절 가능.
+
+**주요 변경사항**:
+- `utils_loss.py`: `_compute_query_attn_center_dist_loss` 추가. matched pair에 대해 normalized L2 거리 계산
+- `utils_loss.py` `_aggregate_training_losses`: `query_attn_center_dist_loss` 파라미터 추가 + `loss_query_attn_center_dist = raw * weight` 처리
+- `efficientocf.py`: `query_attn_center_dist_loss` 초기화 및 호출, `_aggregate_training_losses` 전달
+- `efficientocf_config.py`: `use_query_attn_center_dist_loss`, `query_attn_center_dist_loss_weight` 추가
+- `EfficientOCF_V1.1_1gpu_traj_tf.py`: `use_query_attn_center_dist_loss=True`, `query_attn_center_dist_loss_weight=0.05` 설정
+
+---
+
+### Attn matching & scoring: IoU → center distance 기반으로 교체
+
+**핵심 내용**: attention map이 넓게 분산될 경우 region IoU 기반 matching/scoring이 오염되는 문제 해결. softargmax 예측 2D center와 GT mask centroid 간 거리를 cost 및 score 기준으로 대체.
+
+**주요 변경사항**:
+- `utils_matcher.py`: `_compute_query_attn_center_dist_cost_qn` 추가. `_match_queries_to_gt_instances`에 `query_attn_match_metric="center_dist"` elif 분기 추가
+- `utils_loss.py`: `_compute_query_attn_center_dist_score` 추가. GT mask centroid 기준 per-query 최소 거리 → `exp(-d/sigma)` 점수
+- `efficientocf.py`: scoring 호출부를 `use_query_attn_cam_center_dist_score` 우선 분기 + 기존 Gaussian path elif로 변경
+- `efficientocf_config.py`: `use_query_attn_cam_center_dist_score`, `query_attn_center_dist_score_sigma` 추가
+- `EfficientOCF_V1.1_1gpu.py`: `query_attn_match_metric="center_dist"`, `use_query_attn_cam_center_dist_score=True`, `query_attn_center_dist_score_sigma=10.0` 추가
+
+---
+
+## 2026-05-26 KST
+
+### DDP match-cost debug key pre-allocation fix (root cause)
+
+**핵심 내용**: `_aggregate_training_losses` 끝에 `dbg_query_match_cost_` prefix가 아닌 모든 `dbg_*` 키를 삭제하는 필터가 있음을 확인. 실제 문제는 `dbg_query_match_cost_*` 32개 키가 `if isinstance(inst_match_result, dict)` + `if torch.is_tensor(cost_qn)` + 각 contrib 조건에 중첩 의존하여, 매칭 인스턴스가 없는 rank에서 키 누락 발생.
+
+**주요 변경사항**:
+- `detectors/utils_loss.py` `_aggregate_training_losses`: `if isinstance(inst_match_result, dict)` 블록 전에 32개 `dbg_query_match_cost_*` 키를 `z`로 선할당. 이전의 `dbg_query_traj_*` setdefault fix는 해당 키가 필터로 삭제되므로 무효였기에 원복.
+
+---
+
 ## 2026-05-26 11:01 KST
 
 ### BBox-based GT Instance Centers

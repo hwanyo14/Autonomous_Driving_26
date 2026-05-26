@@ -68,7 +68,7 @@ MODEL_CFG_DEFAULTS = {
     "query_multi_gaussian_weight_reg_loss_weight": 1e-3,
     "query_multi_gaussian_weight_reg_target_sum": 1.0,
     "query_embed_dim": 256,
-    "query_num_queries": 100,
+    "query_num_queries": 200,
     "query_transformer_num_layers": 1,
     "query_id_reinject_scale": 0.0,
     "query_ca_kv_identity_init": False,
@@ -85,6 +85,10 @@ MODEL_CFG_DEFAULTS = {
     "query_attn_match_pred_norm": "amax",
     "query_attn_match_eps": 1e-6,
     "use_query_attn_cam_gaussian_score": False,
+    "use_query_attn_cam_center_dist_score": False,
+    "query_attn_center_dist_score_sigma": 10.0,
+    "use_query_attn_center_dist_loss": False,
+    "query_attn_center_dist_loss_weight": 0.05,
     "query_attn_cam_frame_mode": "overlap_only",
     "query_attn_cam_target_mode": "prob",
     "query_attn_cam_metric": "kl",
@@ -264,6 +268,10 @@ def apply_model_cfg(self, cfg):
     self.query_attn_match_pred_norm = str(cfg["query_attn_match_pred_norm"]).lower()
     self.query_attn_match_eps = float(cfg["query_attn_match_eps"])
     self.use_query_attn_cam_gaussian_score = bool(cfg["use_query_attn_cam_gaussian_score"])
+    self.use_query_attn_cam_center_dist_score = bool(cfg["use_query_attn_cam_center_dist_score"])
+    self.query_attn_center_dist_score_sigma = float(cfg["query_attn_center_dist_score_sigma"])
+    self.use_query_attn_center_dist_loss = bool(cfg["use_query_attn_center_dist_loss"])
+    self.query_attn_center_dist_loss_weight = float(cfg["query_attn_center_dist_loss_weight"])
     self.query_attn_cam_frame_mode = str(cfg["query_attn_cam_frame_mode"]).lower()
     self.query_attn_cam_target_mode = str(cfg["query_attn_cam_target_mode"]).lower()
     self.query_attn_cam_metric = str(cfg["query_attn_cam_metric"]).lower()

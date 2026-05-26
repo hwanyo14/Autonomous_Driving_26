@@ -296,6 +296,98 @@ class EfficientOCFMatcherMixin:
                    / valid_count_qn.clamp_min(1.0))
         return cost_qn, valid_pair_qn
 
+    def _compute_query_attn_center_dist_cost_qn(
+        self,
+        query_attn_weights_tqnhw: torch.Tensor,
+        gt_attn_targets: dict,
+        eps: float = 1e-6,
+    ):
+        if (not torch.is_tensor(query_attn_weights_tqnhw)) or query_attn_weights_tqnhw.dim() != 5:
+            return None, None
+        if not isinstance(gt_attn_targets, dict):
+            return None, None
+
+        gt_inst_mask_tnhw = gt_attn_targets.get("gt_inst_mask_tnhw", None)
+        gt_inst_valid_tn = gt_attn_targets.get("gt_inst_valid_tn", None)
+        attn_t_idx_t = gt_attn_targets.get("attn_t_idx_t", None)
+        if (
+            (not torch.is_tensor(gt_inst_mask_tnhw))
+            or gt_inst_mask_tnhw.dim() != 4
+            or (not torch.is_tensor(gt_inst_valid_tn))
+            or gt_inst_valid_tn.dim() != 2
+        ):
+            return None, None
+
+        t_attn, q_count, _n_cam, h_attn, w_attn = [int(v) for v in query_attn_weights_tqnhw.shape]
+        t_gt, n_inst, h_gt, w_gt = [int(v) for v in gt_inst_mask_tnhw.shape]
+        if (
+            t_attn <= 0
+            or q_count <= 0
+            or t_gt <= 0
+            or n_inst <= 0
+            or h_attn != h_gt
+            or w_attn != w_gt
+            or int(gt_inst_valid_tn.shape[0]) != t_gt
+            or int(gt_inst_valid_tn.shape[1]) != n_inst
+        ):
+            return None, None
+
+        t = min(t_attn, t_gt)
+        if t <= 0:
+            return None, None
+
+        if torch.is_tensor(attn_t_idx_t) and int(attn_t_idx_t.numel()) >= t:
+            attn_idx = attn_t_idx_t[:t].to(device=query_attn_weights_tqnhw.device, dtype=torch.long)
+            if not bool(((attn_idx >= 0) & (attn_idx < t_attn)).all().item()):
+                return None, None
+            attn_sel_tqnhw = query_attn_weights_tqnhw.index_select(0, attn_idx)
+        else:
+            attn_sel_tqnhw = query_attn_weights_tqnhw[:t]
+
+        eps_v = float(max(1e-12, eps))
+        dev = query_attn_weights_tqnhw.device
+
+        gy, gx = torch.meshgrid(
+            torch.arange(h_attn, device=dev, dtype=torch.float32),
+            torch.arange(w_attn, device=dev, dtype=torch.float32),
+            indexing="ij",
+        )
+        gx_flat = gx.reshape(1, 1, -1)
+        gy_flat = gy.reshape(1, 1, -1)
+
+        gt_mask_tnp = gt_inst_mask_tnhw[:t].to(device=dev, dtype=torch.float32).reshape(t, n_inst, -1)
+        gt_mass_tn = gt_mask_tnp.sum(dim=-1).clamp_min(1.0)
+        gt_cx_tn = (gt_mask_tnp * gx_flat).sum(dim=-1) / gt_mass_tn
+        gt_cy_tn = (gt_mask_tnp * gy_flat).sum(dim=-1) / gt_mass_tn
+
+        attn_tqhw = attn_sel_tqnhw.to(torch.float32).clamp_min(0.0).sum(dim=2)
+        attn_tqp = attn_tqhw.reshape(t, q_count, -1)
+        prob_den_tq1 = attn_tqp.sum(dim=-1, keepdim=True)
+        prob_tqhw = (attn_tqp / prob_den_tq1.clamp_min(eps_v)).reshape(t, q_count, h_attn, w_attn)
+        pred_cx_tq = (prob_tqhw * gx).sum(dim=[2, 3])
+        pred_cy_tq = (prob_tqhw * gy).sum(dim=[2, 3])
+
+        dx_tqn = pred_cx_tq[:, :, None] - gt_cx_tn[:, None, :]
+        dy_tqn = pred_cy_tq[:, :, None] - gt_cy_tn[:, None, :]
+        dist_tqn = (dx_tqn.pow(2) + dy_tqn.pow(2)).sqrt()
+        diag = float((h_attn ** 2 + w_attn ** 2) ** 0.5)
+        cost_tqn = (dist_tqn / max(diag, eps_v)).clamp(0.0, 1.0)
+
+        valid_tn = gt_inst_valid_tn[:t].to(device=dev, dtype=torch.bool)
+        gt_mask_sum_tn = gt_inst_mask_tnhw[:t].to(device=dev, dtype=torch.float32).reshape(t, n_inst, -1).sum(-1)
+        valid_tn = valid_tn & (gt_mask_sum_tn > 0.0)
+        valid_t1n = valid_tn[:, None, :]
+        finite_tqn = torch.isfinite(cost_tqn)
+        valid_pair_tqn = finite_tqn & valid_t1n
+        valid_count_qn = valid_pair_tqn.to(torch.float32).sum(dim=0)
+        valid_pair_qn = valid_count_qn > 0.0
+        if not bool(valid_pair_qn.any().item()):
+            return None, None
+
+        cost_qn = (torch.where(valid_pair_tqn, cost_tqn, torch.zeros_like(cost_tqn)).sum(dim=0)
+                   / valid_count_qn.clamp_min(1.0))
+        return cost_qn, valid_pair_qn
+
     @staticmethod
     def _resolve_temporal_cost_frame_indices(
         frame_indices,
@@ -685,9 +777,10 @@ class EfficientOCFMatcherMixin:
         attn_iou_cost_qn = None
         attn_iou_contrib_qn = torch.zeros_like(cost_feat_qn)
         attn_iou_cost_w = float(query_attn_match_cost_weight)
+        _attn_metric = str(query_attn_match_metric).lower()
         if (
             attn_iou_cost_w > 0.0
-            and str(query_attn_match_metric).lower() == "soft_iou"
+            and _attn_metric == "soft_iou"
             and torch.is_tensor(query_attn_weights_tqnhw)
             and isinstance(gt_attn_targets, dict)
         ):
@@ -695,6 +788,17 @@ class EfficientOCFMatcherMixin:
                 query_attn_weights_tqnhw=query_attn_weights_tqnhw,
                 gt_attn_targets=gt_attn_targets,
                 pred_norm=query_attn_match_pred_norm,
+                eps=float(query_attn_match_eps),
+            )
+        elif (
+            attn_iou_cost_w > 0.0
+            and _attn_metric == "center_dist"
+            and torch.is_tensor(query_attn_weights_tqnhw)
+            and isinstance(gt_attn_targets, dict)
+        ):
+            attn_iou_cost_qn, attn_iou_valid_qn = self._compute_query_attn_center_dist_cost_qn(
+                query_attn_weights_tqnhw=query_attn_weights_tqnhw,
+                gt_attn_targets=gt_attn_targets,
                 eps=float(query_attn_match_eps),
             )
             if (

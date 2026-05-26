@@ -878,6 +878,242 @@ class EfficientOCFLossMixin:
             out["cam_attn_score_valid_q"] = valid_q & torch.isfinite(score_q)
         return out
 
+    def _compute_query_attn_center_dist_score(
+        self,
+        query_attn_weights_tqnhw: torch.Tensor,
+        gt_attn_targets: dict,
+    ) -> dict:
+        if torch.is_tensor(query_attn_weights_tqnhw):
+            z = query_attn_weights_tqnhw.sum() * 0.0
+            q_count = int(query_attn_weights_tqnhw.shape[1]) if query_attn_weights_tqnhw.dim() >= 2 else 0
+            score_q = torch.zeros((max(0, q_count),), device=query_attn_weights_tqnhw.device, dtype=torch.float32)
+        else:
+            z = self.mean_weight.sum() * 0.0
+            score_q = torch.zeros((0,), device=z.device, dtype=torch.float32)
+
+        out = {
+            "cam_attn_score_q": score_q,
+            "cam_attn_score_valid_q": torch.zeros_like(score_q, dtype=torch.bool),
+            "dbg_query_attn_cam_score_mean": z,
+            "dbg_query_attn_cam_metric_raw_mean": z,
+            "dbg_query_attn_cam_valid_pair_count": z,
+            "dbg_query_attn_cam_nonfinite_skip": z,
+            "dbg_query_attn_cam_shape_invalid_skip": z,
+        }
+        if (not torch.is_tensor(query_attn_weights_tqnhw)) or query_attn_weights_tqnhw.dim() != 5:
+            out["dbg_query_attn_cam_shape_invalid_skip"] = z.new_tensor(1.0)
+            return out
+        if not isinstance(gt_attn_targets, dict):
+            out["dbg_query_attn_cam_shape_invalid_skip"] = z.new_tensor(1.0)
+            return out
+
+        gt_inst_mask_tnhw = gt_attn_targets.get("gt_inst_mask_tnhw", None)
+        gt_inst_valid_tn = gt_attn_targets.get("gt_inst_valid_tn", None)
+        attn_t_idx_t = gt_attn_targets.get("attn_t_idx_t", None)
+        if (
+            (not torch.is_tensor(gt_inst_mask_tnhw))
+            or gt_inst_mask_tnhw.dim() != 4
+            or (not torch.is_tensor(gt_inst_valid_tn))
+            or gt_inst_valid_tn.dim() != 2
+        ):
+            out["dbg_query_attn_cam_shape_invalid_skip"] = z.new_tensor(1.0)
+            return out
+
+        t_attn, q_attn, _n_cam, h_attn, w_attn = [int(v) for v in query_attn_weights_tqnhw.shape]
+        t_gt, n_inst, h_gt, w_gt = [int(v) for v in gt_inst_mask_tnhw.shape]
+        if (
+            t_gt <= 0 or q_attn <= 0 or n_inst <= 0
+            or h_attn != h_gt or w_attn != w_gt
+            or int(gt_inst_valid_tn.shape[0]) != t_gt
+            or int(gt_inst_valid_tn.shape[1]) != n_inst
+        ):
+            out["dbg_query_attn_cam_shape_invalid_skip"] = z.new_tensor(1.0)
+            return out
+
+        t = min(t_attn, t_gt)
+        if t <= 0:
+            out["dbg_query_attn_cam_shape_invalid_skip"] = z.new_tensor(1.0)
+            return out
+
+        if torch.is_tensor(attn_t_idx_t) and int(attn_t_idx_t.numel()) >= t:
+            attn_idx = attn_t_idx_t[:t].to(device=query_attn_weights_tqnhw.device, dtype=torch.long)
+            if not bool(((attn_idx >= 0) & (attn_idx < t_attn)).all().item()):
+                out["dbg_query_attn_cam_shape_invalid_skip"] = z.new_tensor(1.0)
+                return out
+            attn_sel_tqnhw = query_attn_weights_tqnhw.index_select(0, attn_idx).to(torch.float32)
+        else:
+            attn_sel_tqnhw = query_attn_weights_tqnhw[:t].to(torch.float32)
+
+        eps_v = float(getattr(self, "query_attn_cam_eps", 1e-6))
+        eps_v = max(eps_v, 1e-12)
+        sigma = float(getattr(self, "query_attn_center_dist_score_sigma", 10.0))
+        sigma = max(sigma, eps_v)
+        dev = query_attn_weights_tqnhw.device
+
+        gy, gx = torch.meshgrid(
+            torch.arange(h_attn, device=dev, dtype=torch.float32),
+            torch.arange(w_attn, device=dev, dtype=torch.float32),
+            indexing="ij",
+        )
+        gx_flat = gx.reshape(1, 1, -1)
+        gy_flat = gy.reshape(1, 1, -1)
+
+        gt_mask_tnp = gt_inst_mask_tnhw[:t].to(device=dev, dtype=torch.float32).reshape(t, n_inst, -1)
+        gt_mass_tn = gt_mask_tnp.sum(dim=-1).clamp_min(1.0)
+        gt_cx_tn = (gt_mask_tnp * gx_flat).sum(dim=-1) / gt_mass_tn
+        gt_cy_tn = (gt_mask_tnp * gy_flat).sum(dim=-1) / gt_mass_tn
+
+        attn_tqhw = attn_sel_tqnhw.clamp_min(0.0).sum(dim=2)
+        attn_tqp = attn_tqhw.reshape(t, q_attn, -1)
+        prob_den_tq1 = attn_tqp.sum(dim=-1, keepdim=True)
+        prob_tqhw = (attn_tqp / prob_den_tq1.clamp_min(eps_v)).reshape(t, q_attn, h_attn, w_attn)
+        pred_cx_tq = (prob_tqhw * gx).sum(dim=[2, 3])
+        pred_cy_tq = (prob_tqhw * gy).sum(dim=[2, 3])
+
+        dx_tqn = pred_cx_tq[:, :, None] - gt_cx_tn[:, None, :]
+        dy_tqn = pred_cy_tq[:, :, None] - gt_cy_tn[:, None, :]
+        dist_tqn = (dx_tqn.pow(2) + dy_tqn.pow(2)).sqrt()
+
+        valid_tn = gt_inst_valid_tn[:t].to(device=dev, dtype=torch.bool)
+        gt_mask_sum_tn = gt_mask_tnp.sum(dim=-1)
+        valid_tn = valid_tn & (gt_mask_sum_tn > 0.0)
+
+        large_val = float(max(h_attn, w_attn)) * 1e3
+        dist_tqn_masked = torch.where(valid_tn[:, None, :], dist_tqn, dist_tqn.new_full(dist_tqn.shape, large_val))
+        dist_min_tq = dist_tqn_masked.min(dim=-1).values
+
+        valid_q_t = valid_tn.any(dim=-1)
+        valid_f_tq = valid_q_t[:, None].to(torch.float32).expand(t, q_attn)
+        valid_count_q = valid_f_tq.sum(dim=0)
+        valid_q = valid_count_q > 0.0
+        dist_mean_q = torch.zeros((q_attn,), device=dev, dtype=torch.float32)
+        dist_mean_q[valid_q] = (
+            (dist_min_tq * valid_f_tq).sum(dim=0)[valid_q] / valid_count_q[valid_q].clamp_min(1.0)
+        )
+
+        score_q = torch.zeros((q_attn,), device=dev, dtype=torch.float32)
+        score_q[valid_q] = torch.exp(-dist_mean_q[valid_q] / sigma).clamp(0.0, 1.0)
+        out["cam_attn_score_q"] = score_q
+        out["cam_attn_score_valid_q"] = valid_q
+        out["dbg_query_attn_cam_valid_pair_count"] = valid_count_q.sum()
+        out["dbg_query_attn_cam_metric_raw_mean"] = (
+            dist_mean_q[valid_q].mean() if bool(valid_q.any().item()) else z.new_tensor(0.0)
+        )
+        out["dbg_query_attn_cam_score_mean"] = (
+            score_q[valid_q].mean() if bool(valid_q.any().item()) else z.new_tensor(0.0)
+        )
+        if not bool(torch.isfinite(score_q).all().item()):
+            out["dbg_query_attn_cam_nonfinite_skip"] = z.new_tensor(1.0)
+            out["cam_attn_score_q"] = torch.where(torch.isfinite(score_q), score_q, torch.zeros_like(score_q))
+            out["cam_attn_score_valid_q"] = valid_q & torch.isfinite(score_q)
+        return out
+
+    def _compute_query_attn_center_dist_loss(
+        self,
+        query_attn_weights_tqnhw: torch.Tensor,
+        inst_match_result: dict,
+        gt_attn_targets: dict,
+    ) -> dict:
+        if torch.is_tensor(query_attn_weights_tqnhw):
+            z = query_attn_weights_tqnhw.sum() * 0.0
+        else:
+            z = self.mean_weight.sum() * 0.0
+
+        out = {
+            "loss_query_attn_center_dist": z,
+            "dbg_query_attn_center_dist_mean": z,
+            "dbg_query_attn_center_dist_valid_pairs": z,
+            "dbg_query_attn_center_dist_shape_invalid_skip": z,
+        }
+        if (not torch.is_tensor(query_attn_weights_tqnhw)) or query_attn_weights_tqnhw.dim() != 5:
+            out["dbg_query_attn_center_dist_shape_invalid_skip"] = z.new_tensor(1.0)
+            return out
+        if not isinstance(inst_match_result, dict) or not isinstance(gt_attn_targets, dict):
+            out["dbg_query_attn_center_dist_shape_invalid_skip"] = z.new_tensor(1.0)
+            return out
+
+        gt_inst_mask_tnhw = gt_attn_targets.get("gt_inst_mask_tnhw", None)
+        gt_inst_valid_tn = gt_attn_targets.get("gt_inst_valid_tn", None)
+        attn_t_idx_t = gt_attn_targets.get("attn_t_idx_t", None)
+        matched_query_idx = inst_match_result.get("matched_query_idx", None)
+        matched_inst_idx = inst_match_result.get("matched_inst_idx", None)
+        if (
+            (not torch.is_tensor(gt_inst_mask_tnhw)) or gt_inst_mask_tnhw.dim() != 4
+            or (not torch.is_tensor(gt_inst_valid_tn)) or gt_inst_valid_tn.dim() != 2
+        ):
+            out["dbg_query_attn_center_dist_shape_invalid_skip"] = z.new_tensor(1.0)
+            return out
+        if (not torch.is_tensor(matched_query_idx)) or int(matched_query_idx.numel()) == 0:
+            return out
+
+        t_attn, q_attn, _n_cam, h_attn, w_attn = [int(v) for v in query_attn_weights_tqnhw.shape]
+        t_gt, n_inst, h_gt, w_gt = [int(v) for v in gt_inst_mask_tnhw.shape]
+        if h_attn != h_gt or w_attn != w_gt:
+            out["dbg_query_attn_center_dist_shape_invalid_skip"] = z.new_tensor(1.0)
+            return out
+
+        t = min(t_attn, t_gt)
+        if t <= 0:
+            return out
+
+        dev = query_attn_weights_tqnhw.device
+        eps_v = max(float(getattr(self, "query_attn_cam_eps", 1e-6)), 1e-12)
+
+        if torch.is_tensor(attn_t_idx_t) and int(attn_t_idx_t.numel()) >= t:
+            attn_idx = attn_t_idx_t[:t].to(device=dev, dtype=torch.long)
+            if not bool(((attn_idx >= 0) & (attn_idx < t_attn)).all().item()):
+                out["dbg_query_attn_center_dist_shape_invalid_skip"] = z.new_tensor(1.0)
+                return out
+            attn_sel_tqnhw = query_attn_weights_tqnhw.index_select(0, attn_idx).to(torch.float32)
+        else:
+            attn_sel_tqnhw = query_attn_weights_tqnhw[:t].to(torch.float32)
+
+        mq = matched_query_idx.to(device=dev, dtype=torch.long)
+        mn = matched_inst_idx.to(device=dev, dtype=torch.long)
+        k = int(mq.numel())
+
+        gy, gx = torch.meshgrid(
+            torch.arange(h_attn, device=dev, dtype=torch.float32),
+            torch.arange(w_attn, device=dev, dtype=torch.float32),
+            indexing="ij",
+        )
+        gx_flat = gx.reshape(1, 1, -1)
+        gy_flat = gy.reshape(1, 1, -1)
+
+        # Predicted center: softargmax over camera-aggregated attention for matched queries [T, K, H, W]
+        attn_tkhw = attn_sel_tqnhw.index_select(1, mq).clamp_min(0.0).sum(dim=2)
+        attn_tkp = attn_tkhw.reshape(t, k, -1)
+        prob_den_tk1 = attn_tkp.sum(dim=-1, keepdim=True)
+        prob_tkhw = (attn_tkp / prob_den_tk1.clamp_min(eps_v)).reshape(t, k, h_attn, w_attn)
+        pred_cx_tk = (prob_tkhw * gx).sum(dim=[2, 3])
+        pred_cy_tk = (prob_tkhw * gy).sum(dim=[2, 3])
+
+        # GT center: mask centroid for matched instances [T, K]
+        gt_mask_tkhw = gt_inst_mask_tnhw[:t].index_select(1, mn).to(device=dev, dtype=torch.float32)
+        gt_mask_tkp = gt_mask_tkhw.reshape(t, k, -1)
+        gt_mass_tk = gt_mask_tkp.sum(dim=-1).clamp_min(1.0)
+        gt_cx_tk = (gt_mask_tkp * gx_flat).sum(dim=-1) / gt_mass_tk
+        gt_cy_tk = (gt_mask_tkp * gy_flat).sum(dim=-1) / gt_mass_tk
+
+        dist_tk = ((pred_cx_tk - gt_cx_tk).pow(2) + (pred_cy_tk - gt_cy_tk).pow(2)).sqrt()
+        diag = float((h_attn ** 2 + w_attn ** 2) ** 0.5)
+        dist_norm_tk = dist_tk / max(diag, eps_v)
+
+        # Validity: GT mask must be non-empty and GT instance must be valid
+        valid_tk = gt_inst_valid_tn[:t].index_select(1, mn).to(device=dev, dtype=torch.bool)
+        gt_mask_sum_tk = gt_mask_tkp.sum(dim=-1)
+        valid_tk = valid_tk & (gt_mask_sum_tk > 0.0) & torch.isfinite(dist_norm_tk)
+
+        valid_count = valid_tk.to(torch.float32).sum()
+        out["dbg_query_attn_center_dist_valid_pairs"] = valid_count
+        if not bool((valid_count > 0).item()):
+            return out
+
+        loss_val = (dist_norm_tk * valid_tk.to(torch.float32)).sum() / valid_count.clamp_min(1.0)
+        out["dbg_query_attn_center_dist_mean"] = loss_val.detach()
+        out["loss_query_attn_center_dist"] = loss_val
+        return out
+
     def _compute_query_self_bev_align_loss(
         self,
         query_future_feat_tqd: torch.Tensor,
@@ -1751,6 +1987,7 @@ class EfficientOCFLossMixin:
         query_cls_loss,
         query_depth_loss,
         query_attn_bbox_loss,
+        query_attn_center_dist_loss,
         matched_gmo_loss,
         center_match_loss,
         query_traj_loss,
@@ -1804,6 +2041,13 @@ class EfficientOCFLossMixin:
         else:
             losses["loss_query_attn_bbox"] = z
 
+        w_center_dist = float(getattr(self, "query_attn_center_dist_loss_weight", 0.0))
+        if isinstance(query_attn_center_dist_loss, dict):
+            raw = query_attn_center_dist_loss.get("loss_query_attn_center_dist", z)
+            losses["loss_query_attn_center_dist"] = raw * w_center_dist
+        else:
+            losses["loss_query_attn_center_dist"] = z
+
         if isinstance(matched_gmo_loss, dict):
             losses.update(matched_gmo_loss)
         else:
@@ -1854,6 +2098,18 @@ class EfficientOCFLossMixin:
         losses["dbg_query_attn_match_cost_weight"] = centers_world.new_tensor(
             float(getattr(self, "query_attn_match_cost_weight", 0.0))
         )
+
+        # Pre-allocate all match-cost debug keys with zeros for DDP log_vars parity
+        for _k in (
+            "dbg_query_match_cost_total_mean",
+            "dbg_query_match_cost_matched_mean",
+            "dbg_query_match_cost_total_pair_count",
+            "dbg_query_match_cost_matched_pair_count",
+        ):
+            losses[_k] = z
+        for _name in ("feat", "soft", "cls", "center", "temporal_offset", "bev_dice", "attn"):
+            for _suffix in ("total_mean", "matched_mean", "ratio_total", "ratio_matched"):
+                losses[f"dbg_query_match_cost_{_name}_{_suffix}"] = z
 
         if isinstance(inst_match_result, dict):
             cost_qn = inst_match_result.get("cost_qn", None)

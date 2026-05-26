@@ -1539,6 +1539,7 @@ class EfficientOCF(
         query_cls_loss = None
         query_depth_loss = None
         query_attn_bbox_loss = None
+        query_attn_center_dist_loss = None
         query_attn_cam_score_pack = None
         query_inst_depth_target_pack = None
         matched_gmo_loss = None
@@ -1813,6 +1814,27 @@ class EfficientOCF(
                     has_empty_gt_mask = float(1.0 if (not bool(gt_mask_tnhw.any().item())) else 0.0)
                 query_attn_bbox_loss["dbg_query_attn_bbox_empty_gt_mask"] = centers_world.new_tensor(has_empty_gt_mask)
         if (
+            self.use_query_attn_center_dist_loss
+            and torch.is_tensor(_query_attn_weights_tqnhw)
+            and isinstance(_query_attn_bbox_targets, dict)
+            and isinstance(inst_match_result, dict)
+        ):
+            query_attn_center_dist_loss = self._compute_query_attn_center_dist_loss(
+                query_attn_weights_tqnhw=_query_attn_weights_tqnhw,
+                inst_match_result=inst_match_result,
+                gt_attn_targets=_query_attn_bbox_targets,
+            )
+        if (
+            self.use_query_attn_cam_center_dist_score
+            and torch.is_tensor(_query_attn_weights_tqnhw)
+            and isinstance(_query_attn_bbox_targets, dict)
+        ):
+            with torch.no_grad():
+                query_attn_cam_score_pack = self._compute_query_attn_center_dist_score(
+                    query_attn_weights_tqnhw=_query_attn_weights_tqnhw,
+                    gt_attn_targets=_query_attn_bbox_targets,
+                )
+        elif (
             self.use_query_attn_cam_gaussian_score
             and torch.is_tensor(_query_attn_weights_tqnhw)
             and isinstance(query_match_inputs, dict)
@@ -1835,7 +1857,6 @@ class EfficientOCF(
                         query_attn_weights_tqnhw=_query_attn_weights_tqnhw,
                         cam_targets=query_attn_cam_targets,
                     )
-                    pass  # query_attn_cam_score_pack may be None or a valid score dict
         if (
             self.use_gmo_bce_loss
             and (not self.center_only_mode)
@@ -1995,6 +2016,7 @@ class EfficientOCF(
             query_cls_loss=query_cls_loss,
             query_depth_loss=query_depth_loss,
             query_attn_bbox_loss=query_attn_bbox_loss,
+            query_attn_center_dist_loss=query_attn_center_dist_loss,
             matched_gmo_loss=matched_gmo_loss,
             center_match_loss=center_match_loss,
             query_traj_loss=query_traj_loss,

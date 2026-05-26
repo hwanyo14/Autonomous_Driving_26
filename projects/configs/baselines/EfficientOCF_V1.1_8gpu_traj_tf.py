@@ -384,7 +384,7 @@ model_cfg = dict(
     query_multi_gaussian_weight_mode='softplus',
     # Teacher forcing: use GT past delta offsets until this iteration, then switch to prediction.
     query_traj_teacher_forcing=True,
-    query_traj_teacher_forcing_until_iter=30000,
+    query_traj_teacher_forcing_until_iter=3500,
 )
 
 debug_cfg = dict(
@@ -474,16 +474,17 @@ optimizer = dict(
     weight_decay=0.01,
 )
 
-optimizer_config = dict(
-    type='GradientCumulativeOptimizerHook',
-    cumulative_iters=8,
-    grad_clip=dict(max_norm=35, norm_type=2),
-)
+# optimizer_config = dict(
+#     type='GradientCumulativeOptimizerHook',
+#     cumulative_iters=8,
+#     grad_clip=dict(max_norm=35, norm_type=2),
+# )
+optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
 
 lr_config = dict(
     policy='CosineAnnealing',
     warmup='linear',
-    warmup_iters=4000,
+    warmup_iters=500,
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
 )
