@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-05-21
+
+### BBox-based GT Instance Centers
+
+**핵심 내용**: GT instance center를 fine occupancy voxel 평균 대신 bbox-volume instance의 3D bbox 중심으로 계산하도록 변경. center supervision 계열만 bbox center를 사용하고, GMO voxel loss는 기존 fine occupancy source를 유지.
+
+**주요 변경사항**:
+- `loading_instance.py`: `build_instance_center_world_targets()`에서 instance별 center 계산을 voxel 평균에서 `(min_xyz + max_xyz) / 2` bbox midpoint로 변경
+- `efficientocf.py`: trajectory matching용 `gt_inst_center_world_tn3`가 `gt_occ_inst_bundle`보다 dataloader의 `gt_instance_centers_world`/`gt_instance_centers_valid`를 우선 사용하도록 변경
+- `efficientocf.py`: center matching loss, Hungarian center cost, trajectory loss, trajectory teacher forcing이 bbox center source를 타도록 정렬
+
+**유지된 동작**:
+- `gt_occ_inst` 기반 dense occupancy / class / instance tensor는 그대로 유지
+- `gmo_bce`/`focal`/`dice` 및 voxel mask 기반 GT는 기존 fine occupancy source 유지
+
 ## 2026-05-16
 
 ### Trajectory Head Teacher Forcing

@@ -522,7 +522,8 @@ class LoadInstanceWithFlow(object):
 
     def build_instance_center_world_targets(self, sparse_seq_rows):
         """
-        Convert per-frame sparse instance rows into dense temporal center targets.
+        Convert per-frame sparse bbox-volume instance rows into dense temporal
+        center targets.
 
         Args:
             sparse_seq_rows: list[T] of arrays with shape [K, >=4]
@@ -562,7 +563,9 @@ class LoadInstanceWithFlow(object):
                 pts = xyz[inst == iid]
                 if pts.shape[0] == 0:
                     continue
-                cur[int(iid)] = pts.mean(axis=0).astype(np.float32, copy=False)
+                min_xyz = pts.min(axis=0)
+                max_xyz = pts.max(axis=0)
+                cur[int(iid)] = ((min_xyz + max_xyz) * 0.5).astype(np.float32, copy=False)
 
             frame_center_maps.append(cur)
             all_instance_ids.update(cur.keys())
