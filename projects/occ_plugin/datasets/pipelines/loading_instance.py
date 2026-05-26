@@ -562,7 +562,7 @@ class LoadInstanceWithFlow(object):
                 pts = xyz[inst == iid]
                 if pts.shape[0] == 0:
                     continue
-                cur[int(iid)] = pts.mean(axis=0).astype(np.float32, copy=False)
+                cur[int(iid)] = ((pts.min(axis=0) + pts.max(axis=0)) * 0.5).astype(np.float32, copy=False)
 
             frame_center_maps.append(cur)
             all_instance_ids.update(cur.keys())

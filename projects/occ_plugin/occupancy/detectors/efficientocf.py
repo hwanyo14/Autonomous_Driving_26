@@ -1231,17 +1231,16 @@ class EfficientOCF(
         gt_inst_center_world_hist_tn3 = None
         gt_inst_center_valid_hist_tn = None
         gt_inst_ids_hist_n = None
-        if isinstance(gt_occ_inst_bundle, dict):
+        gt_inst_center_world_tn3, gt_inst_center_valid_tn, gt_inst_ids_n = self._prepare_gt_instance_centers_for_trajectory_matching(
+            gt_instance_centers_world=gt_instance_centers_world,
+            gt_instance_centers_valid=gt_instance_centers_valid,
+            gt_instance_ids=gt_instance_ids,
+        )
+        if gt_inst_center_world_tn3 is None and isinstance(gt_occ_inst_bundle, dict):
             gt_inst_center_world_tn3, gt_inst_center_valid_tn, gt_inst_ids_n = self._prepare_gt_instance_centers_for_trajectory_matching(
                 gt_instance_centers_world=gt_occ_inst_bundle.get("centers_world_tn3", None),
                 gt_instance_centers_valid=gt_occ_inst_bundle.get("centers_valid_tn", None),
                 gt_instance_ids=gt_occ_inst_bundle.get("instance_ids_n", None),
-            )
-        if gt_inst_center_world_tn3 is None:
-            gt_inst_center_world_tn3, gt_inst_center_valid_tn, gt_inst_ids_n = self._prepare_gt_instance_centers_for_trajectory_matching(
-                gt_instance_centers_world=gt_instance_centers_world,
-                gt_instance_centers_valid=gt_instance_centers_valid,
-                gt_instance_ids=gt_instance_ids,
             )
         # Per-instance depth target uses bbox-based centers from segmentation_instance3d path.
         gt_inst_center_world_hist_tn3, gt_inst_center_valid_hist_tn, gt_inst_ids_hist_n = self._prepare_gt_instance_centers_for_history(
@@ -1642,6 +1641,7 @@ class EfficientOCF(
             query_attn_match_eps=self.query_attn_match_eps,
             query_center_match_frame_idx=match_center_frame_idx,
             query_temporal_cost_frame_indices=match_temporal_cost_frame_indices,
+            query_temporal_offset_match_cost_weight=self.query_temporal_offset_match_cost_weight,
         )
         self._last_inst_match_result = inst_match_result
         if isinstance(inst_match_result, dict):
@@ -1689,6 +1689,7 @@ class EfficientOCF(
                         _traj_max = _motion_skd.new_tensor(self.query_traj_residual_max_m).view(1, 1, 2)
                         _gt_delta_norm = (_gt_delta_k / _traj_max.clamp_min(1e-6)).clamp(-1.0, 1.0)
                         _motion_skd = _motion_skd.clone()
+                        _motion_skd[:_past_steps, :, -2:] = 0.0
                         for _t in range(_past_steps):
                             _valid_t = _valid_k[_t]  # [K]
                             _motion_skd[_t, _valid_t, -2:] = _gt_delta_norm[_t, _valid_t]

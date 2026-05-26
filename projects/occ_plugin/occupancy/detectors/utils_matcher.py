@@ -55,6 +55,8 @@ class EfficientOCFMatcherMixin:
             "cost_cls_contrib_qn": None,
             "cost_center_qn": None,
             "cost_center_contrib_qn": None,
+            "cost_temporal_offset_qn": None,
+            "cost_temporal_offset_contrib_qn": None,
             "cost_bev_dice_qn": None,
             "cost_bev_dice_contrib_qn": None,
             "cost_attn_iou_qn": None,
@@ -345,6 +347,7 @@ class EfficientOCFMatcherMixin:
         query_attn_match_eps: float = 1e-6,
         query_center_match_frame_idx: int = None,
         query_temporal_cost_frame_indices=None,
+        query_temporal_offset_match_cost_weight: float = 0.0,
     ):
         match_result = self._build_empty_match_result(device=centers_world.device)
 
@@ -511,8 +514,11 @@ class EfficientOCFMatcherMixin:
 
         center_cost_qn = None
         center_contrib_qn = torch.zeros_like(cost_feat_qn)
+        temporal_offset_cost_qn = None
+        temporal_offset_contrib_qn = torch.zeros_like(cost_feat_qn)
         center_frame_idx = None
         center_cost_w = float(getattr(self, "query_center_match_cost_weight", 0.0))
+        temporal_offset_cost_w = float(query_temporal_offset_match_cost_weight)
         t_center = min(
             int(centers_world.shape[0]),
             int(match_gt_center_tn3.shape[0]),
@@ -549,6 +555,30 @@ class EfficientOCFMatcherMixin:
                 if center_cost_w > 0.0:
                     center_contrib_qn = center_cost_w * center_cost_qn * center_valid_qn.to(cost_qn.dtype)
                     cost_qn = cost_qn + center_contrib_qn
+                if len(temporal_cost_idx) >= 2:
+                    pred_delta_tq2 = pred_center_tq3[1:, :, :2] - pred_center_tq3[:-1, :, :2]
+                    gt_delta_tn2 = gt_center_tn3[1:, :, :2] - gt_center_tn3[:-1, :, :2]
+                    gt_delta_valid_tn = gt_center_valid_tn[1:] & gt_center_valid_tn[:-1]
+                    traj_max_xy = centers_world.new_tensor(
+                        self.query_traj_residual_max_m, dtype=torch.float32
+                    ).view(1, 1, 1, 2).clamp_min(1e-6)
+                    delta_l1_tqn = (
+                        torch.abs(pred_delta_tq2[:, :, None, :] - gt_delta_tn2[:, None, :, :]) / traj_max_xy
+                    ).sum(dim=-1)
+                    delta_valid_t1n = gt_delta_valid_tn.to(torch.float32)[:, None, :]
+                    delta_num_qn = (delta_l1_tqn * delta_valid_t1n).sum(dim=0)
+                    delta_den_qn = delta_valid_t1n.sum(dim=0)
+                    delta_valid_qn = delta_den_qn > 0.0
+                    temporal_offset_cost_qn = (
+                        delta_num_qn / delta_den_qn.clamp_min(1.0)
+                    ).clamp(0.0, 2.0)
+                    if temporal_offset_cost_w > 0.0:
+                        temporal_offset_contrib_qn = (
+                            temporal_offset_cost_w
+                            * temporal_offset_cost_qn
+                            * delta_valid_qn.to(cost_qn.dtype)
+                        )
+                        cost_qn = cost_qn + temporal_offset_contrib_qn
             elif query_center_match_frame_idx is not None:
                 preferred_center_idx = int(query_center_match_frame_idx)
                 preferred_center_idx = max(0, min(t_center - 1, preferred_center_idx))
@@ -703,6 +733,10 @@ class EfficientOCFMatcherMixin:
             center_cost_qn = center_cost_qn.index_select(1, valid_inst_idx)
         if center_contrib_qn is not None:
             center_contrib_qn = center_contrib_qn.index_select(1, valid_inst_idx)
+        if temporal_offset_cost_qn is not None:
+            temporal_offset_cost_qn = temporal_offset_cost_qn.index_select(1, valid_inst_idx)
+        if temporal_offset_contrib_qn is not None:
+            temporal_offset_contrib_qn = temporal_offset_contrib_qn.index_select(1, valid_inst_idx)
         if bev_dice_cost_qn is not None:
             bev_dice_cost_qn = bev_dice_cost_qn.index_select(1, valid_inst_idx)
         if bev_dice_contrib_qn is not None:
@@ -739,6 +773,8 @@ class EfficientOCFMatcherMixin:
         match_result["cost_cls_contrib_qn"] = cls_contrib_qn
         match_result["cost_center_qn"] = center_cost_qn
         match_result["cost_center_contrib_qn"] = center_contrib_qn
+        match_result["cost_temporal_offset_qn"] = temporal_offset_cost_qn
+        match_result["cost_temporal_offset_contrib_qn"] = temporal_offset_contrib_qn
         match_result["cost_bev_dice_qn"] = bev_dice_cost_qn
         match_result["cost_bev_dice_contrib_qn"] = bev_dice_contrib_qn
         match_result["cost_attn_iou_qn"] = attn_iou_cost_qn
