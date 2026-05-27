@@ -88,6 +88,7 @@
 │       │   │   ├── query_head.py  # 현재 query 기반 instance head; center/sigma/class/depth/trajectory 예측
 │       │   │   ├── query_head_ori.py  # 예전 query head; center+offset 기반 point set 예측 버전
 │       │   │   ├── utils.py  # torchsparse 기반 point/voxel/range 변환 유틸
+│       │   │   ├── utils_query_vis.py  # query BEV 시각화 유틸; VisConfig, 드로잉/팔레트/legend/save_prob_grid_vis 함수 모음
 │       │   │   └── voxelizer.py  # query point/Gaussian을 occupancy grid로 바꾸는 soft voxelizer
 │       │   ├── detectors/
 │       │   │   ├── __init__.py  # 현재 detector 등록

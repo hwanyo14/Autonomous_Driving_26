@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-05-27
+
+### query_head.py 시각화 코드 분리 및 리팩토링
+
+**핵심 내용**: `query_head.py`의 쿼리 시각화 관련 코드를 `utils_query_vis.py`로 분리. 4098줄 → 2581줄 (약 37% 감소).
+
+**주요 변경사항**:
+- `dense_heads/utils_query_vis.py` 신규 생성: `VisConfig` 데이터클래스, `draw_marker_splats`, `draw_cross_marker`, `draw_gaussian_bev_footprints`, `get_query_vis_palette`, `draw_query_vis_legend`, `draw_generic_vis_legend`, `normalize_gt_occ_semantic_for_vis`, `normalize_gt_occ_inst_for_vis`, `save_prob_grid_vis`, `is_main_process` 포함
+- `query_head.py`: 위 함수들 제거 후 import로 교체, `_vis_cfg` property 추가, `_is_main_process` 1-line 위임, `_maybe_save_prob_grid_vis` thin wrapper로 대체
+
 ## 2026-05-26 11:01 KST
 
 ### BBox-based GT Instance Centers
