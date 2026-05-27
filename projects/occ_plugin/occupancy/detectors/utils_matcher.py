@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 import numpy as np
 
 try:
@@ -43,171 +42,21 @@ class EfficientOCFMatcherMixin:
         return {
             "matched_query_idx": empty_idx,
             "matched_inst_idx": empty_idx,
-            "sim_qn": None,
-            "soft_assign_qn": None,
             "center_frame_idx": None,
             "cost_qn": None,
-            "cost_feat_qn": None,
-            "cost_feat_contrib_qn": None,
-            "cost_soft_qn": None,
-            "cost_soft_contrib_qn": None,
             "cost_cls_qn": None,
             "cost_cls_contrib_qn": None,
             "cost_center_qn": None,
             "cost_center_contrib_qn": None,
             "cost_temporal_offset_qn": None,
             "cost_temporal_offset_contrib_qn": None,
-            "cost_bev_dice_qn": None,
-            "cost_bev_dice_contrib_qn": None,
             "cost_attn_iou_qn": None,
             "cost_attn_iou_contrib_qn": None,
             "gt_centers_tn3": None,
             "gt_valid_tn": None,
             "gt_ids_n": None,
             "gt_cls_n": None,
-            "gt_match_feat_tnd": None,
-            "gt_match_feat_valid_tn": None,
-            "gt_match_feat_ids_n": None,
-            "gt_bev_feat_tnd": None,
-            "gt_bev_feat_valid_tn": None,
-            "gt_bev_feat_ids_n": None,
-            "matched_query_feat_tkd": None,
-            "matched_gt_feat_tkd": None,
-            "matched_gt_feat_valid_tk": None,
         }
-
-    def _compute_query_gt_bev_dice_cost_qn(
-        self,
-        centers_world_tq3: torch.Tensor,
-        sigmas_world_tq3: torch.Tensor,
-        gt_instance_occ3d_txyz: torch.Tensor,
-        gt_ids_n: torch.Tensor,
-        gt_valid_tn: torch.Tensor = None,
-        mixture_centers_world_tqg3: torch.Tensor = None,
-        mixture_sigmas_world_tqg3: torch.Tensor = None,
-        mixture_yaw_tqg: torch.Tensor = None,
-        mixture_weights_tqg: torch.Tensor = None,
-        tversky_alpha: float = 0.7,
-        tversky_beta: float = 0.3,
-        pair_chunk_size: int = 8,
-        eps: float = 1e-6,
-    ):
-        if (not torch.is_tensor(centers_world_tq3)) or centers_world_tq3.dim() != 3:
-            return None, None
-        if (not torch.is_tensor(gt_instance_occ3d_txyz)) or gt_instance_occ3d_txyz.dim() != 4:
-            return None, None
-        if (not torch.is_tensor(gt_ids_n)) or gt_ids_n.numel() <= 0:
-            return None, None
-
-        t_count = int(min(centers_world_tq3.shape[0], gt_instance_occ3d_txyz.shape[0]))
-        q_count = int(centers_world_tq3.shape[1])
-        n_inst = int(gt_ids_n.numel())
-        if t_count <= 0 or q_count <= 0 or n_inst <= 0:
-            return None, None
-
-        use_mixture = (
-            torch.is_tensor(mixture_centers_world_tqg3)
-            and torch.is_tensor(mixture_sigmas_world_tqg3)
-            and torch.is_tensor(mixture_yaw_tqg)
-            and torch.is_tensor(mixture_weights_tqg)
-            and mixture_centers_world_tqg3.dim() == 4
-            and tuple(mixture_centers_world_tqg3.shape) == tuple(mixture_sigmas_world_tqg3.shape)
-            and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_yaw_tqg.shape)
-            and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_weights_tqg.shape)
-            and int(mixture_centers_world_tqg3.shape[1]) == q_count
-        )
-        if use_mixture:
-            pred_tq1zyx = self.matched_gmo_voxelizer.forward_gaussian_mixture_grouped(
-                mixture_centers_world_tkg3=mixture_centers_world_tqg3[:t_count].to(torch.float32),
-                mixture_sigmas_world_tkg3=mixture_sigmas_world_tqg3[:t_count].to(torch.float32),
-                mixture_weights_tkg=mixture_weights_tqg[:t_count].to(torch.float32),
-                mixture_yaw_tkg=mixture_yaw_tqg[:t_count].to(torch.float32),
-                pair_weights_tk=None,
-                pair_chunk_size=int(max(1, pair_chunk_size)),
-            ).to(torch.float32)
-        else:
-            if (not torch.is_tensor(sigmas_world_tq3)) or tuple(sigmas_world_tq3.shape) != tuple(centers_world_tq3.shape):
-                return None, None
-            pred_tq1zyx = self.matched_gmo_voxelizer(
-                centers_world_tq3[:t_count],
-                sigmas_world=sigmas_world_tq3[:t_count],
-                weights=None,
-            ).to(torch.float32)
-
-        if pred_tq1zyx.dim() == 6:
-            pred_tqzyx = pred_tq1zyx[:, :, 0]
-        elif pred_tq1zyx.dim() == 5:
-            pred_tqzyx = pred_tq1zyx
-        else:
-            return None, None
-        if int(pred_tqzyx.shape[0]) != t_count or int(pred_tqzyx.shape[1]) != q_count:
-            return None, None
-
-        pred_bev_tqp = pred_tqzyx.amax(dim=2).reshape(t_count, q_count, -1).clamp(0.0, 1.0)
-        gt_occ_sel = gt_instance_occ3d_txyz[:t_count].to(device=pred_tqzyx.device, dtype=torch.long)
-        gt_ids = gt_ids_n.to(device=pred_tqzyx.device, dtype=torch.long)
-
-        if (
-            torch.is_tensor(gt_valid_tn)
-            and gt_valid_tn.dim() == 2
-            and int(gt_valid_tn.shape[0]) >= t_count
-            and int(gt_valid_tn.shape[1]) == n_inst
-        ):
-            valid_tn = gt_valid_tn[:t_count].to(device=pred_tqzyx.device, dtype=torch.bool)
-        else:
-            valid_tn = torch.ones((t_count, n_inst), device=pred_tqzyx.device, dtype=torch.bool)
-
-        cost_sum_qn = pred_bev_tqp.new_zeros((q_count, n_inst))
-        cost_cnt_qn = pred_bev_tqp.new_zeros((q_count, n_inst))
-
-        pred_spatial = tuple(int(v) for v in pred_tqzyx.shape[-3:])
-        full_spatial = (int(gt_occ_sel.shape[3]), int(gt_occ_sel.shape[2]), int(gt_occ_sel.shape[1]))
-        max_compare_elems = 128 * 1024 * 1024
-        per_inst_elems = int(t_count * gt_occ_sel.shape[1] * gt_occ_sel.shape[2] * gt_occ_sel.shape[3])
-        max_chunk = int(max_compare_elems // max(1, per_inst_elems))
-        gt_chunk_size = max(1, min(int(max(1, pair_chunk_size)), max_chunk, n_inst))
-        pool_dtype = torch.float16 if gt_occ_sel.is_cuda else torch.float32
-        alpha = float(max(0.0, tversky_alpha))
-        beta = float(max(0.0, tversky_beta))
-        eps_v = float(max(1e-12, eps))
-
-        for n0 in range(0, n_inst, gt_chunk_size):
-            n1 = min(n_inst, n0 + gt_chunk_size)
-            kc = int(n1 - n0)
-            if kc <= 0:
-                continue
-            gt_ids_chunk = gt_ids[n0:n1]
-            gt_chunk_tkxyz = (gt_occ_sel[:, None] == gt_ids_chunk[None, :, None, None, None])
-            gt_chunk_tk1zyx = gt_chunk_tkxyz.permute(0, 1, 4, 3, 2).unsqueeze(2)
-            if full_spatial != pred_spatial:
-                gt_chunk_lowres = F.adaptive_max_pool3d(
-                    gt_chunk_tk1zyx.reshape(t_count * kc, 1, *full_spatial).to(pool_dtype),
-                    output_size=pred_spatial,
-                ).reshape(t_count, kc, 1, *pred_spatial)
-            else:
-                gt_chunk_lowres = gt_chunk_tk1zyx.to(pool_dtype)
-            gt_bev_tkp = gt_chunk_lowres[:, :, 0].amax(dim=2).reshape(t_count, kc, -1).to(torch.float32).clamp(0.0, 1.0)
-
-            for t in range(t_count):
-                valid_1k = valid_tn[t, n0:n1].to(dtype=torch.float32)[None, :]
-                if not bool((valid_1k > 0.0).any().item()):
-                    continue
-                pred_qp = pred_bev_tqp[t]
-                gt_kp = gt_bev_tkp[t]
-                tp_qk = torch.matmul(pred_qp, gt_kp.t())
-                pred_sum_q1 = pred_qp.sum(dim=1, keepdim=True)
-                gt_sum_1k = gt_kp.sum(dim=1, keepdim=True).t()
-                fp_qk = (pred_sum_q1 - tp_qk).clamp_min(0.0)
-                fn_qk = (gt_sum_1k - tp_qk).clamp_min(0.0)
-                denom_qk = tp_qk + (alpha * fp_qk) + (beta * fn_qk)
-                score_qk = (tp_qk + eps_v) / (denom_qk + eps_v)
-                cost_qk = (1.0 - score_qk).clamp(0.0, 1.0)
-                cost_sum_qn[:, n0:n1] += cost_qk * valid_1k
-                cost_cnt_qn[:, n0:n1] += valid_1k
-
-        valid_qn = cost_cnt_qn > 0.0
-        cost_qn = cost_sum_qn / cost_cnt_qn.clamp_min(1.0)
-        return cost_qn, valid_qn
 
     def _compute_query_attn_soft_iou_cost_qn(
         self,
@@ -318,29 +167,15 @@ class EfficientOCFMatcherMixin:
     def _match_queries_to_gt_instances(
         self,
         centers_world: torch.Tensor,
-        query_sigmas_world_tq3: torch.Tensor = None,
-        query_mixture_centers_world_tqg3: torch.Tensor = None,
-        query_mixture_sigmas_world_tqg3: torch.Tensor = None,
-        query_mixture_yaw_tqg: torch.Tensor = None,
-        query_mixture_weights_tqg: torch.Tensor = None,
-        gt_instance_occ3d_txyz: torch.Tensor = None,
         gt_inst_center_world_tn3: torch.Tensor = None,
         gt_inst_center_valid_tn: torch.Tensor = None,
         gt_inst_ids_n: torch.Tensor = None,
         gt_inst_cls_n: torch.Tensor = None,
         gt_inst_cls_valid_n: torch.Tensor = None,
-        query_img_feat_tqd: torch.Tensor = None,
         query_cls_logits_qc: torch.Tensor = None,
-        gt_inst_bev_feat_tnd: torch.Tensor = None,
-        gt_inst_bev_feat_valid_tn: torch.Tensor = None,
-        gt_inst_bev_feat_ids_n: torch.Tensor = None,
+        query_cls_match_cost_weight: float = 0.0,
         query_attn_weights_tqnhw: torch.Tensor = None,
         gt_attn_targets: dict = None,
-        query_sim_cost_weight: float = 1.0,
-        query_cls_cost_weight: float = 0.0,
-        query_soft_assign_temp: float = 0.10,
-        query_soft_assign_cost_weight: float = 0.0,
-        query_bev_dice_cost_weight: float = 0.0,
         query_attn_match_cost_weight: float = 0.0,
         query_attn_match_metric: str = "soft_iou",
         query_attn_match_pred_norm: str = "amax",
@@ -371,151 +206,78 @@ class EfficientOCFMatcherMixin:
         if torch.is_tensor(gt_inst_cls_valid_n):
             match_cls_valid_n = gt_inst_cls_valid_n.to(device=centers_world.device, dtype=torch.bool)
 
-        match_query_img_feat_tqd = None
-        if torch.is_tensor(query_img_feat_tqd):
-            if query_img_feat_tqd.dim() != 3:
-                raise ValueError(f"query_img_feat_tqd must be [T,Q,D], got {tuple(query_img_feat_tqd.shape)}")
-            if query_img_feat_tqd.shape[1] != centers_world.shape[1]:
-                raise ValueError(
-                    f"query_img_feat_tqd query dim mismatch with centers_world: "
-                    f"{tuple(query_img_feat_tqd.shape)} vs {tuple(centers_world.shape)}"
-                )
-            match_query_img_feat_tqd = query_img_feat_tqd.to(device=centers_world.device, dtype=centers_world.dtype)
-
-        match_gt_feat_tnd = None
-        match_gt_feat_valid_tn = None
-        match_gt_feat_ids_n = None
-        if torch.is_tensor(gt_inst_bev_feat_tnd):
-            if gt_inst_bev_feat_tnd.dim() != 3:
-                raise ValueError(f"gt_inst_bev_feat_tnd must be [T,N,D], got {tuple(gt_inst_bev_feat_tnd.shape)}")
-            match_gt_feat_tnd = gt_inst_bev_feat_tnd.to(device=centers_world.device, dtype=centers_world.dtype)
-            if torch.is_tensor(gt_inst_bev_feat_valid_tn):
-                if gt_inst_bev_feat_valid_tn.shape[:2] != match_gt_feat_tnd.shape[:2]:
-                    raise ValueError(
-                        "gt_inst_bev_feat_valid_tn shape mismatch: "
-                        f"{tuple(gt_inst_bev_feat_valid_tn.shape)} vs {tuple(match_gt_feat_tnd.shape)}"
-                    )
-                match_gt_feat_valid_tn = gt_inst_bev_feat_valid_tn.to(device=centers_world.device, dtype=torch.bool)
-            else:
-                match_gt_feat_valid_tn = torch.ones(
-                    match_gt_feat_tnd.shape[:2], device=centers_world.device, dtype=torch.bool
-                )
-            if torch.is_tensor(gt_inst_bev_feat_ids_n):
-                match_gt_feat_ids_n = gt_inst_bev_feat_ids_n.to(device=centers_world.device, dtype=torch.long)
-
         if (match_ids_n is not None) and (match_ids_n.numel() == match_gt_center_tn3.shape[1]):
             id_order = torch.argsort(match_ids_n)
             match_gt_center_tn3 = match_gt_center_tn3[:, id_order, :]
             match_valid_tn = match_valid_tn[:, id_order]
             match_ids_n = match_ids_n[id_order]
-            if (match_gt_feat_tnd is not None) and (match_gt_feat_ids_n is not None):
-                if match_gt_feat_ids_n.numel() == match_gt_feat_tnd.shape[1]:
-                    feat_order = torch.argsort(match_gt_feat_ids_n)
-                    match_gt_feat_tnd = match_gt_feat_tnd[:, feat_order, :]
-                    match_gt_feat_valid_tn = match_gt_feat_valid_tn[:, feat_order]
-                    match_gt_feat_ids_n = match_gt_feat_ids_n[feat_order]
-                    if match_gt_feat_ids_n.numel() == match_ids_n.numel() and not torch.equal(match_gt_feat_ids_n, match_ids_n):
-                        match_gt_feat_tnd = None
-                        match_gt_feat_valid_tn = None
-                        match_gt_feat_ids_n = None
-            elif match_gt_feat_tnd is not None:
-                if match_gt_feat_tnd.shape[1] != match_gt_center_tn3.shape[1]:
-                    match_gt_feat_tnd = None
-                    match_gt_feat_valid_tn = None
+            if match_cls_n is not None and int(match_cls_n.numel()) == int(id_order.numel()):
+                match_cls_n = match_cls_n[id_order]
+            if match_cls_valid_n is not None and int(match_cls_valid_n.numel()) == int(id_order.numel()):
+                match_cls_valid_n = match_cls_valid_n[id_order]
 
         match_result["gt_centers_tn3"] = match_gt_center_tn3
         match_result["gt_valid_tn"] = match_valid_tn
         match_result["gt_ids_n"] = match_ids_n
         match_result["gt_cls_n"] = match_cls_n
-        match_result["gt_match_feat_tnd"] = match_gt_feat_tnd
-        match_result["gt_match_feat_valid_tn"] = match_gt_feat_valid_tn
-        match_result["gt_match_feat_ids_n"] = match_gt_feat_ids_n
-        match_result["gt_bev_feat_tnd"] = match_gt_feat_tnd
-        match_result["gt_bev_feat_valid_tn"] = match_gt_feat_valid_tn
-        match_result["gt_bev_feat_ids_n"] = match_gt_feat_ids_n
 
         q_count = int(centers_world.shape[1])
         n_inst = int(match_gt_center_tn3.shape[1])
         if (q_count <= 0) or (n_inst <= 0):
             return match_result
-        if ((match_query_img_feat_tqd is None) or (match_gt_feat_tnd is None)):
-            return match_result
-
-        if match_gt_feat_valid_tn is None:
-            match_gt_feat_valid_tn = torch.ones(
-                match_gt_feat_tnd.shape[:2], device=centers_world.device, dtype=torch.bool
-            )
-            match_result["gt_bev_feat_valid_tn"] = match_gt_feat_valid_tn
 
         active_center = match_valid_tn.any(dim=0)
-        active_feat = match_gt_feat_valid_tn.any(dim=0)
-        active_inst_idx = torch.nonzero(active_center & active_feat, as_tuple=False).squeeze(1)
+        active_inst_idx = torch.nonzero(active_center, as_tuple=False).squeeze(1)
         if active_inst_idx.numel() <= 0:
             return match_result
 
         if active_inst_idx.numel() != n_inst:
             match_gt_center_tn3 = match_gt_center_tn3[:, active_inst_idx, :]
             match_valid_tn = match_valid_tn[:, active_inst_idx]
-            match_gt_feat_tnd = match_gt_feat_tnd[:, active_inst_idx, :]
-            match_gt_feat_valid_tn = match_gt_feat_valid_tn[:, active_inst_idx]
             if match_ids_n is not None:
                 match_ids_n = match_ids_n[active_inst_idx]
             if match_cls_n is not None and int(match_cls_n.numel()) == n_inst:
                 match_cls_n = match_cls_n[active_inst_idx]
             if match_cls_valid_n is not None and int(match_cls_valid_n.numel()) == n_inst:
                 match_cls_valid_n = match_cls_valid_n[active_inst_idx]
-            if (match_gt_feat_ids_n is not None) and (match_gt_feat_ids_n.numel() == n_inst):
-                match_gt_feat_ids_n = match_gt_feat_ids_n[active_inst_idx]
             n_inst = int(match_gt_center_tn3.shape[1])
             match_result["gt_centers_tn3"] = match_gt_center_tn3
             match_result["gt_valid_tn"] = match_valid_tn
             match_result["gt_ids_n"] = match_ids_n
             match_result["gt_cls_n"] = match_cls_n
-            match_result["gt_match_feat_tnd"] = match_gt_feat_tnd
-            match_result["gt_match_feat_valid_tn"] = match_gt_feat_valid_tn
-            match_result["gt_match_feat_ids_n"] = match_gt_feat_ids_n
-            match_result["gt_bev_feat_tnd"] = match_gt_feat_tnd
-            match_result["gt_bev_feat_valid_tn"] = match_gt_feat_valid_tn
-            match_result["gt_bev_feat_ids_n"] = match_gt_feat_ids_n
 
-        t_match = min(
-            int(match_query_img_feat_tqd.shape[0]),
-            int(match_gt_feat_tnd.shape[0]),
-            int(match_gt_feat_valid_tn.shape[0]),
-        )
-        if t_match <= 0:
-            return match_result
+        cost_qn = centers_world.new_zeros((q_count, n_inst), dtype=torch.float32)
 
-        q_feat_tqd = F.normalize(match_query_img_feat_tqd[-t_match:].to(torch.float32), dim=-1, eps=1e-6)
-        gt_feat_tnd = F.normalize(match_gt_feat_tnd[:t_match].to(torch.float32), dim=-1, eps=1e-6)
-        gt_feat_valid_tn = match_gt_feat_valid_tn[:t_match].to(device=centers_world.device, dtype=torch.bool)
-
-        sim_tqn = torch.einsum("tqd,tnd->tqn", q_feat_tqd, gt_feat_tnd).clamp(-1.0, 1.0)
-        valid_t1n = gt_feat_valid_tn.to(torch.float32)[:, None, :]
-        sim_sum_qn = (sim_tqn * valid_t1n).sum(dim=0)
-        valid_cnt_qn = valid_t1n.sum(dim=0)
-        valid_pair_qn = valid_cnt_qn > 0.0
-        if not torch.any(valid_pair_qn):
-            return match_result
-
-        sim_qn = sim_sum_qn / valid_cnt_qn.clamp_min(1.0)
-        tau = max(1e-6, float(query_soft_assign_temp))
-        soft_assign_qn = torch.softmax(sim_qn / tau, dim=1)
-        cost_feat_qn = (1.0 - sim_qn).clamp(0.0, 2.0)
-        cost_soft_qn = (-torch.log(soft_assign_qn.clamp_min(1e-8))).clamp(0.0, 30.0)
-
-        sim_cost_w = float(query_sim_cost_weight)
-        cost_feat_contrib_qn = sim_cost_w * cost_feat_qn
-        # Legacy costs are kept for diagnostics compatibility but are never added to Hungarian cost.
-        cost_soft_contrib_qn = torch.zeros_like(cost_feat_qn)
         cls_cost_qn = None
-        cls_contrib_qn = torch.zeros_like(cost_feat_qn)
-        cost_qn = cost_feat_contrib_qn
+        cls_contrib_qn = torch.zeros_like(cost_qn)
+        cls_cost_w = float(query_cls_match_cost_weight)
+        if (
+            cls_cost_w > 0.0
+            and torch.is_tensor(query_cls_logits_qc)
+            and query_cls_logits_qc.dim() == 2
+            and int(query_cls_logits_qc.shape[0]) == q_count
+            and torch.is_tensor(match_cls_n)
+            and int(match_cls_n.numel()) == n_inst
+        ):
+            cls_count = int(query_cls_logits_qc.shape[1])
+            gt_cls = match_cls_n.to(device=centers_world.device, dtype=torch.long)
+            cls_valid_n = (gt_cls >= 0) & (gt_cls < cls_count)
+            if torch.is_tensor(match_cls_valid_n) and int(match_cls_valid_n.numel()) == n_inst:
+                cls_valid_n = cls_valid_n & match_cls_valid_n.to(device=centers_world.device, dtype=torch.bool)
+            if bool(cls_valid_n.any().item()):
+                log_prob_qc = torch.log_softmax(
+                    query_cls_logits_qc.to(device=centers_world.device, dtype=torch.float32),
+                    dim=-1,
+                )
+                gather_cls_n = gt_cls.clamp(0, max(0, cls_count - 1))
+                cls_cost_qn = (-log_prob_qc[:, gather_cls_n]).clamp(0.0, 30.0)
+                cls_contrib_qn = cls_cost_w * cls_cost_qn * cls_valid_n.to(cost_qn.dtype)[None, :]
+                cost_qn = cost_qn + cls_contrib_qn
 
         center_cost_qn = None
-        center_contrib_qn = torch.zeros_like(cost_feat_qn)
+        center_contrib_qn = torch.zeros_like(cost_qn)
         temporal_offset_cost_qn = None
-        temporal_offset_contrib_qn = torch.zeros_like(cost_feat_qn)
+        temporal_offset_contrib_qn = torch.zeros_like(cost_qn)
         center_frame_idx = None
         center_cost_w = float(getattr(self, "query_center_match_cost_weight", 0.0))
         temporal_offset_cost_w = float(query_temporal_offset_match_cost_weight)
@@ -555,6 +317,7 @@ class EfficientOCFMatcherMixin:
                 if center_cost_w > 0.0:
                     center_contrib_qn = center_cost_w * center_cost_qn * center_valid_qn.to(cost_qn.dtype)
                     cost_qn = cost_qn + center_contrib_qn
+                    cost_qn = cost_qn.masked_fill(~center_valid_qn, cost_qn.new_tensor(1e6))
                 if len(temporal_cost_idx) >= 2:
                     pred_delta_tq2 = pred_center_tq3[1:, :, :2] - pred_center_tq3[:-1, :, :2]
                     gt_delta_tn2 = gt_center_tn3[1:, :, :2] - gt_center_tn3[:-1, :, :2]
@@ -598,92 +361,10 @@ class EfficientOCFMatcherMixin:
                 if center_cost_w > 0.0:
                     center_contrib_qn = center_cost_w * center_cost_qn * center_pair_valid_qn.to(cost_qn.dtype)
                     cost_qn = cost_qn + center_contrib_qn
+                    cost_qn = cost_qn.masked_fill(~center_pair_valid_qn, cost_qn.new_tensor(1e6))
 
-        bev_dice_cost_qn = None
-        bev_dice_contrib_qn = torch.zeros_like(cost_feat_qn)
-        bev_dice_cost_w = float(query_bev_dice_cost_weight)
-        if (
-            bev_dice_cost_w > 0.0
-            and torch.is_tensor(gt_instance_occ3d_txyz)
-            and torch.is_tensor(match_ids_n)
-            and match_ids_n.numel() > 0
-        ):
-            if temporal_cost_idx is not None:
-                frame_idx_t = torch.as_tensor(
-                    temporal_cost_idx,
-                    device=centers_world.device,
-                    dtype=torch.long,
-                )
-                bev_centers_tq3 = centers_world.index_select(0, frame_idx_t)
-                bev_valid_tn = match_valid_tn.index_select(0, frame_idx_t)
-                gt_occ_cost_txyz = gt_instance_occ3d_txyz.index_select(0, frame_idx_t.to(gt_instance_occ3d_txyz.device))
-                bev_sigmas_tq3 = (
-                    query_sigmas_world_tq3.index_select(0, frame_idx_t)
-                    if torch.is_tensor(query_sigmas_world_tq3)
-                    and tuple(query_sigmas_world_tq3.shape[:2]) == tuple(centers_world.shape[:2])
-                    else None
-                )
-                bev_mix_centers_tqg3 = (
-                    query_mixture_centers_world_tqg3.index_select(0, frame_idx_t)
-                    if torch.is_tensor(query_mixture_centers_world_tqg3)
-                    and int(query_mixture_centers_world_tqg3.shape[0]) == int(centers_world.shape[0])
-                    else None
-                )
-                bev_mix_sigmas_tqg3 = (
-                    query_mixture_sigmas_world_tqg3.index_select(0, frame_idx_t)
-                    if torch.is_tensor(query_mixture_sigmas_world_tqg3)
-                    and int(query_mixture_sigmas_world_tqg3.shape[0]) == int(centers_world.shape[0])
-                    else None
-                )
-                bev_mix_yaw_tqg = (
-                    query_mixture_yaw_tqg.index_select(0, frame_idx_t)
-                    if torch.is_tensor(query_mixture_yaw_tqg)
-                    and int(query_mixture_yaw_tqg.shape[0]) == int(centers_world.shape[0])
-                    else None
-                )
-                bev_mix_weights_tqg = (
-                    query_mixture_weights_tqg.index_select(0, frame_idx_t)
-                    if torch.is_tensor(query_mixture_weights_tqg)
-                    and int(query_mixture_weights_tqg.shape[0]) == int(centers_world.shape[0])
-                    else None
-                )
-            else:
-                bev_centers_tq3 = centers_world
-                bev_valid_tn = match_valid_tn
-                gt_occ_cost_txyz = gt_instance_occ3d_txyz
-                bev_sigmas_tq3 = query_sigmas_world_tq3
-                bev_mix_centers_tqg3 = query_mixture_centers_world_tqg3
-                bev_mix_sigmas_tqg3 = query_mixture_sigmas_world_tqg3
-                bev_mix_yaw_tqg = query_mixture_yaw_tqg
-                bev_mix_weights_tqg = query_mixture_weights_tqg
-            bev_dice_cost_qn, bev_dice_valid_qn = self._compute_query_gt_bev_dice_cost_qn(
-                centers_world_tq3=bev_centers_tq3,
-                sigmas_world_tq3=bev_sigmas_tq3,
-                gt_instance_occ3d_txyz=gt_occ_cost_txyz,
-                gt_ids_n=match_ids_n,
-                gt_valid_tn=bev_valid_tn,
-                mixture_centers_world_tqg3=bev_mix_centers_tqg3,
-                mixture_sigmas_world_tqg3=bev_mix_sigmas_tqg3,
-                mixture_yaw_tqg=bev_mix_yaw_tqg,
-                mixture_weights_tqg=bev_mix_weights_tqg,
-            )
-            if (
-                torch.is_tensor(bev_dice_cost_qn)
-                and bev_dice_cost_qn.shape == cost_qn.shape
-                and torch.is_tensor(bev_dice_valid_qn)
-                and bev_dice_valid_qn.shape == cost_qn.shape
-            ):
-                bev_dice_contrib_qn = (
-                    bev_dice_cost_w
-                    * bev_dice_cost_qn.to(cost_qn.dtype)
-                    * bev_dice_valid_qn.to(cost_qn.dtype)
-                )
-                cost_qn = cost_qn + bev_dice_contrib_qn
-            else:
-                bev_dice_cost_qn = None
-                bev_dice_contrib_qn = torch.zeros_like(cost_feat_qn)
         attn_iou_cost_qn = None
-        attn_iou_contrib_qn = torch.zeros_like(cost_feat_qn)
+        attn_iou_contrib_qn = torch.zeros_like(cost_qn)
         attn_iou_cost_w = float(query_attn_match_cost_weight)
         if (
             attn_iou_cost_w > 0.0
@@ -711,84 +392,23 @@ class EfficientOCFMatcherMixin:
                 cost_qn = cost_qn + attn_iou_contrib_qn
             else:
                 attn_iou_cost_qn = None
-                attn_iou_contrib_qn = torch.zeros_like(cost_feat_qn)
+                attn_iou_contrib_qn = torch.zeros_like(cost_qn)
 
-        valid_inst_n = valid_pair_qn.any(dim=0)
-        valid_inst_idx = torch.nonzero(valid_inst_n, as_tuple=False).squeeze(1)
-        if valid_inst_idx.numel() <= 0:
-            return match_result
-
-        cost_qn = cost_qn.index_select(1, valid_inst_idx)
-        sim_qn = sim_qn.index_select(1, valid_inst_idx)
-        soft_assign_qn = soft_assign_qn.index_select(1, valid_inst_idx)
-        cost_feat_qn = cost_feat_qn.index_select(1, valid_inst_idx)
-        cost_feat_contrib_qn = cost_feat_contrib_qn.index_select(1, valid_inst_idx)
-        cost_soft_qn = cost_soft_qn.index_select(1, valid_inst_idx)
-        cost_soft_contrib_qn = cost_soft_contrib_qn.index_select(1, valid_inst_idx)
-        if cls_cost_qn is not None:
-            cls_cost_qn = cls_cost_qn.index_select(1, valid_inst_idx)
-        if cls_contrib_qn is not None:
-            cls_contrib_qn = cls_contrib_qn.index_select(1, valid_inst_idx)
-        if center_cost_qn is not None:
-            center_cost_qn = center_cost_qn.index_select(1, valid_inst_idx)
-        if center_contrib_qn is not None:
-            center_contrib_qn = center_contrib_qn.index_select(1, valid_inst_idx)
-        if temporal_offset_cost_qn is not None:
-            temporal_offset_cost_qn = temporal_offset_cost_qn.index_select(1, valid_inst_idx)
-        if temporal_offset_contrib_qn is not None:
-            temporal_offset_contrib_qn = temporal_offset_contrib_qn.index_select(1, valid_inst_idx)
-        if bev_dice_cost_qn is not None:
-            bev_dice_cost_qn = bev_dice_cost_qn.index_select(1, valid_inst_idx)
-        if bev_dice_contrib_qn is not None:
-            bev_dice_contrib_qn = bev_dice_contrib_qn.index_select(1, valid_inst_idx)
-        if attn_iou_cost_qn is not None:
-            attn_iou_cost_qn = attn_iou_cost_qn.index_select(1, valid_inst_idx)
-        if attn_iou_contrib_qn is not None:
-            attn_iou_contrib_qn = attn_iou_contrib_qn.index_select(1, valid_inst_idx)
-
-        if match_gt_center_tn3.shape[1] != valid_inst_idx.numel():
-            match_gt_center_tn3 = match_gt_center_tn3.index_select(1, valid_inst_idx)
-            match_valid_tn = match_valid_tn.index_select(1, valid_inst_idx)
-            match_gt_feat_tnd = match_gt_feat_tnd.index_select(1, valid_inst_idx)
-            match_gt_feat_valid_tn = match_gt_feat_valid_tn.index_select(1, valid_inst_idx)
-            if match_ids_n is not None and match_ids_n.numel() == n_inst:
-                match_ids_n = match_ids_n.index_select(0, valid_inst_idx)
-            if match_cls_n is not None and match_cls_n.numel() == n_inst:
-                match_cls_n = match_cls_n.index_select(0, valid_inst_idx)
-            if match_cls_valid_n is not None and match_cls_valid_n.numel() == n_inst:
-                match_cls_valid_n = match_cls_valid_n.index_select(0, valid_inst_idx)
-            if match_gt_feat_ids_n is not None and match_gt_feat_ids_n.numel() == n_inst:
-                match_gt_feat_ids_n = match_gt_feat_ids_n.index_select(0, valid_inst_idx)
-
-        match_result["sim_qn"] = sim_qn
-        match_result["soft_assign_qn"] = soft_assign_qn
         if center_frame_idx is not None:
             match_result["center_frame_idx"] = centers_world.new_tensor(float(center_frame_idx))
         match_result["cost_qn"] = cost_qn
-        match_result["cost_feat_qn"] = cost_feat_qn
-        match_result["cost_feat_contrib_qn"] = cost_feat_contrib_qn
-        match_result["cost_soft_qn"] = cost_soft_qn
-        match_result["cost_soft_contrib_qn"] = cost_soft_contrib_qn
         match_result["cost_cls_qn"] = cls_cost_qn
         match_result["cost_cls_contrib_qn"] = cls_contrib_qn
         match_result["cost_center_qn"] = center_cost_qn
         match_result["cost_center_contrib_qn"] = center_contrib_qn
         match_result["cost_temporal_offset_qn"] = temporal_offset_cost_qn
         match_result["cost_temporal_offset_contrib_qn"] = temporal_offset_contrib_qn
-        match_result["cost_bev_dice_qn"] = bev_dice_cost_qn
-        match_result["cost_bev_dice_contrib_qn"] = bev_dice_contrib_qn
         match_result["cost_attn_iou_qn"] = attn_iou_cost_qn
         match_result["cost_attn_iou_contrib_qn"] = attn_iou_contrib_qn
         match_result["gt_centers_tn3"] = match_gt_center_tn3
         match_result["gt_valid_tn"] = match_valid_tn
         match_result["gt_ids_n"] = match_ids_n
         match_result["gt_cls_n"] = match_cls_n
-        match_result["gt_match_feat_tnd"] = match_gt_feat_tnd
-        match_result["gt_match_feat_valid_tn"] = match_gt_feat_valid_tn
-        match_result["gt_match_feat_ids_n"] = match_gt_feat_ids_n
-        match_result["gt_bev_feat_tnd"] = match_gt_feat_tnd
-        match_result["gt_bev_feat_valid_tn"] = match_gt_feat_valid_tn
-        match_result["gt_bev_feat_ids_n"] = match_gt_feat_ids_n
 
         row_ind, col_ind = _solve_unique_assignment(cost_qn.detach().cpu().numpy())
         if row_ind.size == 0:
@@ -801,13 +421,6 @@ class EfficientOCFMatcherMixin:
         match_inst_idx = match_inst_idx[inst_order]
         match_result["matched_query_idx"] = match_query_idx
         match_result["matched_inst_idx"] = match_inst_idx
-        if bool(getattr(self, "query_present_only", False)):
-            query_feat_for_match = match_query_img_feat_tqd[:t_match]
-        else:
-            query_feat_for_match = match_query_img_feat_tqd[-t_match:]
-        match_result["matched_query_feat_tkd"] = query_feat_for_match.index_select(1, match_query_idx)
-        match_result["matched_gt_feat_tkd"] = match_gt_feat_tnd.index_select(1, match_inst_idx)
-        match_result["matched_gt_feat_valid_tk"] = match_gt_feat_valid_tn.index_select(1, match_inst_idx)
         return match_result
 
     def _compute_query_inst_center_match_loss(
@@ -818,15 +431,6 @@ class EfficientOCFMatcherMixin:
         gt_inst_ids_n: torch.Tensor = None,
         gt_inst_cls_n: torch.Tensor = None,
         gt_inst_cls_valid_n: torch.Tensor = None,
-        query_img_feat_tqd: torch.Tensor = None,
-        query_cls_logits_qc: torch.Tensor = None,
-        gt_inst_bev_feat_tnd: torch.Tensor = None,
-        gt_inst_bev_feat_valid_tn: torch.Tensor = None,
-        gt_inst_bev_feat_ids_n: torch.Tensor = None,
-        query_sim_cost_weight: float = 1.0,
-        query_cls_cost_weight: float = 0.0,
-        query_soft_assign_temp: float = 0.10,
-        query_soft_assign_cost_weight: float = 0.0,
         loss_weight: float = 0.1,
         return_match: bool = False,
     ):
@@ -837,15 +441,6 @@ class EfficientOCFMatcherMixin:
             gt_inst_ids_n=gt_inst_ids_n,
             gt_inst_cls_n=gt_inst_cls_n,
             gt_inst_cls_valid_n=gt_inst_cls_valid_n,
-            query_img_feat_tqd=query_img_feat_tqd,
-            query_cls_logits_qc=query_cls_logits_qc,
-            gt_inst_bev_feat_tnd=gt_inst_bev_feat_tnd,
-            gt_inst_bev_feat_valid_tn=gt_inst_bev_feat_valid_tn,
-            gt_inst_bev_feat_ids_n=gt_inst_bev_feat_ids_n,
-            query_sim_cost_weight=query_sim_cost_weight,
-            query_cls_cost_weight=query_cls_cost_weight,
-            query_soft_assign_temp=query_soft_assign_temp,
-            query_soft_assign_cost_weight=query_soft_assign_cost_weight,
         )
 
         match_query_idx = match_result.get("matched_query_idx", None)

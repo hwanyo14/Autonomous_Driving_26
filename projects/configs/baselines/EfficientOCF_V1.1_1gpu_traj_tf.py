@@ -342,7 +342,7 @@ grid_config = {
     'dbound': [2.0, 58.0, 0.5],
 }
 
-bev_feat_dim = 64
+bev_feat_dim = 128
 numC_Trans = bev_feat_dim
 
 gn_cfg = dict(type='GN', num_groups=16, requires_grad=True)
@@ -357,14 +357,15 @@ model_cfg = dict(
     strict_query_class_id_validation=strict_query_class_id_validation,
     query_num_classes=len(query_class_ids),
     query_cls_loss_class_weights=[0.1] + [1.0] * (len(query_class_ids) - 1),
-    query_attn_match_cost_weight=0.5,
+    query_cls_match_cost_weight=0.2,
+    query_attn_match_cost_weight=1.0,
     query_embed_dim=bev_feat_dim,
     query_id_reinject_scale=0.2,
     query_decor_loss_weight=1.0,
     use_query_attn_bbox_loss=True,
     query_attn_cam_gaussian_truncate_sigma=1.777,
     query_center_match_cost_weight=4.0,
-    query_temporal_offset_match_cost_weight=2.0,
+    query_temporal_offset_match_cost_weight=0.5,
     query_center_routed_loss_weight=0.3,
     query_traj_loss_weight=0.5,
     query_traj_residual_max_m=(15.0, 15.0),
@@ -395,7 +396,6 @@ debug_cfg = dict(
 visualization_cfg = dict(
     debug_query_vis_dir="./work_dirs/query_debug_vis_traj_tf",
     debug_query_gaussian_vis_mode='prob',
-    debug_query_score_iou_weight=0.0,
     debug_query_score_cls_weight=0.3,
     debug_query_score_cam_attn_weight=0.7,
     debug_instance_img_vis_dir="./work_dirs/instance_img_debug_vis_traj_tf",

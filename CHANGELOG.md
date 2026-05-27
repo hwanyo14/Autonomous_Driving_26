@@ -1,5 +1,40 @@
 # Changelog
 
+## 2026-05-27 19:19 KST
+
+### Query Objectness Scoring
+
+**핵심 내용**: query별 objectness head를 추가하고, Hungarian matched 여부로 supervision한 뒤 query 시각화 score에 gating으로 반영.
+
+**주요 변경사항**:
+- `query_head.py`: query feature에서 `[Q]` objectness logit/score를 예측하는 MLP head 추가
+- `efficientocf.py`, `utils_loss.py`: Hungarian matched query는 1, unmatched query는 0으로 `loss_query_objectness` 계산 및 로깅 연결
+- `utils_visualization.py`, `utils_query_vis.py`: 기존 cls/cam score를 objectness로 gating하고, row2는 all query에 high-score query를 강조 표시하며 row3/4는 threshold/top-k 통과 객체만 표시
+- `efficientocf_config.py`, `EfficientOCF_V1.1_1gpu.py`: objectness loss weight/type 설정 추가
+
+## 2026-05-27 18:55 KST
+
+### Weak Class Cost for Hungarian Matching
+
+**핵심 내용**: Hungarian matching에 GT class 확률 기반 weak class cost를 다시 추가.
+
+**주요 변경사항**:
+- `utils_matcher.py`: valid GT class에 대해 `-log p(gt_class)` class cost를 계산하고 `query_cls_match_cost_weight`로 cost에 반영
+- `EfficientOCF_V1.1_1gpu_traj_tf.py`: 약한 class matching cost로 `query_cls_match_cost_weight=0.2` 설정
+- `utils_loss.py`: class matching cost weight/contribution diagnostics 복구
+
+## 2026-05-27 16:41 KST
+
+### Scoring / Hungarian Matching 비활성 요소 제거
+
+**핵심 내용**: `EfficientOCF_V1.1_1gpu_traj_tf.py` 기준으로 실제 score/cost에 포함되지 않던 scoring IoU, feature/soft/class/BEV-dice matching cost 및 관련 계산부를 제거.
+
+**주요 변경사항**:
+- scoring: query score를 class probability + cam attention score만 사용하도록 정리하고, cam attention score는 별도 false flag 없이 생성 조건이 맞으면 계산되도록 변경
+- Hungarian matching: center distance, temporal offset, attention soft-IoU cost만 남기고 비활성 cost 계산/diagnostics/config 키 제거
+- `EfficientOCF_V1.1_1gpu.py`, `EfficientOCF_V1.1_1gpu_traj_tf.py`: 제거된 scoring IoU weight 설정 삭제
+- 사용되지 않게 된 GT feature pooling, matching feature frame selection, matched-query IoU score helper 제거
+
 ## 2026-05-27
 
 ### query_head.py 시각화 코드 분리 및 리팩토링

@@ -66,34 +66,6 @@ class EfficientOCFLossMixin:
             aligned.append(aligned_step_q3)
         return torch.stack(aligned, dim=0).to(dtype=centers_world_tq3.dtype).contiguous()
 
-    def _select_matching_feature_frames(
-        self,
-        query_feat_tqd: torch.Tensor,
-        gt_feat_tnd: torch.Tensor = None,
-        gt_valid_tn: torch.Tensor = None,
-    ):
-        """
-        Matching feature frames:
-        - query/src: use the full receptive-field history without dropping frames
-        """
-        if (not torch.is_tensor(query_feat_tqd)) or query_feat_tqd.dim() != 3:
-            return None, None, None
-        q_sel = query_feat_tqd.contiguous()
-
-        gt_sel = None
-        gt_valid_sel = None
-        if torch.is_tensor(gt_feat_tnd) and gt_feat_tnd.dim() == 3 and int(gt_feat_tnd.shape[0]) > 0:
-            t = min(int(query_feat_tqd.shape[0]), int(gt_feat_tnd.shape[0]))
-            gt_sel = gt_feat_tnd[:t].contiguous()
-            q_sel = query_feat_tqd[:t].contiguous()
-        if torch.is_tensor(gt_valid_tn) and gt_valid_tn.dim() == 2 and int(gt_valid_tn.shape[0]) > 0:
-            t = min(int(q_sel.shape[0]), int(gt_valid_tn.shape[0]))
-            q_sel = q_sel[:t].contiguous()
-            if gt_sel is not None:
-                gt_sel = gt_sel[:t].contiguous()
-            gt_valid_sel = gt_valid_tn[:t].contiguous()
-        return q_sel, gt_sel, gt_valid_sel
-
     def _compute_query_cls_loss(
         self,
         query_cls_logits_qc: torch.Tensor,
@@ -1155,127 +1127,6 @@ class EfficientOCFLossMixin:
         gt_tk1zyx = torch.cat(gt_chunks, dim=1) if len(gt_chunks) > 1 else gt_chunks[0]
         return pred_tk1zyx, gt_tk1zyx, valid_tk
 
-    def _compute_matched_query_sequence_iou_scores(
-        self,
-        centers_world_tq3: torch.Tensor,
-        sigmas_world_tq3: torch.Tensor,
-        gt_instance_occ3d_txyz_pred: torch.Tensor,
-        inst_match_result: dict = None,
-        objectness_scores_tq: torch.Tensor = None,
-        mixture_centers_world_tqg3: torch.Tensor = None,
-        mixture_sigmas_world_tqg3: torch.Tensor = None,
-        mixture_yaw_tqg: torch.Tensor = None,
-        mixture_weights_tqg: torch.Tensor = None,
-        pair_chunk_size: int = 8,
-        eps: float = 1e-6,
-    ) -> torch.Tensor:
-        if (not torch.is_tensor(centers_world_tq3)) or centers_world_tq3.dim() != 3:
-            return None
-        if (not torch.is_tensor(sigmas_world_tq3)) or tuple(sigmas_world_tq3.shape) != tuple(centers_world_tq3.shape):
-            return None
-        if (not torch.is_tensor(gt_instance_occ3d_txyz_pred)) or gt_instance_occ3d_txyz_pred.dim() != 4:
-            return None
-        if not isinstance(inst_match_result, dict):
-            return None
-
-        matched_query_idx = inst_match_result.get("matched_query_idx", None)
-        matched_inst_idx = inst_match_result.get("matched_inst_idx", None)
-        gt_ids_n = inst_match_result.get("gt_ids_n", None)
-        gt_valid_tn = inst_match_result.get("gt_valid_tn", None)
-        q_count = int(centers_world_tq3.shape[1])
-        iou_q = centers_world_tq3.new_zeros((q_count,), dtype=torch.float32)
-        if (
-            (not torch.is_tensor(matched_query_idx))
-            or (not torch.is_tensor(matched_inst_idx))
-            or matched_query_idx.numel() <= 0
-            or matched_query_idx.numel() != matched_inst_idx.numel()
-            or (not torch.is_tensor(gt_ids_n))
-            or gt_ids_n.numel() <= 0
-        ):
-            return iou_q
-
-        t_count = int(min(centers_world_tq3.shape[0], gt_instance_occ3d_txyz_pred.shape[0]))
-        if t_count <= 0:
-            return iou_q
-        gt_occ_txyz = gt_instance_occ3d_txyz_pred[:t_count].to(device=centers_world_tq3.device, dtype=torch.long)
-        mq = matched_query_idx.to(device=centers_world_tq3.device, dtype=torch.long)
-        mi = matched_inst_idx.to(device=centers_world_tq3.device, dtype=torch.long)
-        gt_ids = gt_ids_n.to(device=centers_world_tq3.device, dtype=torch.long)
-        keep = (mq >= 0) & (mq < q_count) & (mi >= 0) & (mi < int(gt_ids.numel()))
-        if not bool(keep.any().item()):
-            return iou_q
-        mq = mq[keep]
-        mi = mi[keep]
-        pair_gt_ids = gt_ids.index_select(0, mi)
-        if torch.is_tensor(gt_valid_tn) and gt_valid_tn.dim() == 2 and int(gt_valid_tn.shape[0]) >= t_count:
-            gt_valid_sel_tk = gt_valid_tn[:t_count].to(device=centers_world_tq3.device, dtype=torch.bool).index_select(1, mi)
-        else:
-            gt_valid_sel_tk = torch.ones((t_count, int(mq.numel())), device=centers_world_tq3.device, dtype=torch.bool)
-
-        use_mixture = (
-            torch.is_tensor(mixture_centers_world_tqg3)
-            and torch.is_tensor(mixture_sigmas_world_tqg3)
-            and torch.is_tensor(mixture_yaw_tqg)
-            and torch.is_tensor(mixture_weights_tqg)
-            and mixture_centers_world_tqg3.dim() == 4
-            and tuple(mixture_centers_world_tqg3.shape) == tuple(mixture_sigmas_world_tqg3.shape)
-            and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_yaw_tqg.shape)
-            and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_weights_tqg.shape)
-        )
-        if use_mixture:
-            pred_tk1zyx, gt_tk1zyx, valid_tk = self._prepare_grouped_matched_pair_lowres_occ(
-                gt_occ_txyz=gt_occ_txyz,
-                matched_query_idx=mq,
-                pair_gt_ids_k=pair_gt_ids,
-                gt_valid_sel_tk=gt_valid_sel_tk,
-                mixture_centers_world_tqg3=mixture_centers_world_tqg3[:t_count],
-                mixture_sigmas_world_tqg3=mixture_sigmas_world_tqg3[:t_count],
-                mixture_yaw_tqg=mixture_yaw_tqg[:t_count],
-                mixture_weights_tqg=mixture_weights_tqg[:t_count],
-                objectness_scores_tq=objectness_scores_tq,
-                pair_chunk_size=int(pair_chunk_size),
-            )
-            if pred_tk1zyx is None:
-                return iou_q
-            pred_bin_tk = pred_tk1zyx[:, :, 0] > 0.5
-            gt_bin_tk = gt_tk1zyx[:, :, 0] > 0.5
-            inter_tk = (pred_bin_tk & gt_bin_tk).flatten(2).sum(dim=2).to(torch.float32)
-            union_tk = (pred_bin_tk | gt_bin_tk).flatten(2).sum(dim=2).to(torch.float32)
-            valid_iou_tk = valid_tk & (union_tk > 0.0)
-            for k in range(int(mq.numel())):
-                q_idx = int(mq[k].item())
-                if not bool(valid_iou_tk[:, k].any().item()):
-                    continue
-                iou_t = inter_tk[:, k][valid_iou_tk[:, k]] / (union_tk[:, k][valid_iou_tk[:, k]] + float(eps))
-                iou_q[q_idx] = iou_t.mean().clamp(0.0, 1.0)
-            return iou_q
-
-        for k in range(int(mq.numel())):
-            q_idx = int(mq[k].item())
-            inst_id = int(pair_gt_ids[k].item())
-            pred_k_t1zyx, gt_k_t1zyx, valid_frame_t = self._prepare_single_matched_pair_lowres_occ(
-                centers_world_tq3=centers_world_tq3[:t_count],
-                sigmas_world_tq3=sigmas_world_tq3[:t_count],
-                gt_occ_txyz=gt_occ_txyz,
-                q_idx=q_idx,
-                inst_id=inst_id,
-                valid_frame_t=gt_valid_sel_tk[:, k],
-                objectness_scores_tq=objectness_scores_tq,
-            )
-            if pred_k_t1zyx is None:
-                continue
-            pred_bin_t = pred_k_t1zyx[:, 0] > 0.5
-            gt_bin_t = gt_k_t1zyx[:, 0] > 0.5
-            valid_t = valid_frame_t.to(torch.bool)
-            inter_t = (pred_bin_t & gt_bin_t).flatten(1).sum(dim=1).to(torch.float32)
-            union_t = (pred_bin_t | gt_bin_t).flatten(1).sum(dim=1).to(torch.float32)
-            valid_iou_t = valid_t & (union_t > 0.0)
-            if not bool(valid_iou_t.any().item()):
-                continue
-            iou_t = inter_t[valid_iou_t] / (union_t[valid_iou_t] + float(eps))
-            iou_q[q_idx] = iou_t.mean().clamp(0.0, 1.0)
-        return iou_q
-
     @staticmethod
     def _compute_balanced_binary_pair_loss(
         pred_occ: torch.Tensor,
@@ -1749,6 +1600,7 @@ class EfficientOCFLossMixin:
         *,
         # Pre-computed query loss dicts
         query_cls_loss,
+        query_objectness_loss,
         query_depth_loss,
         query_attn_bbox_loss,
         matched_gmo_loss,
@@ -1778,6 +1630,10 @@ class EfficientOCFLossMixin:
             losses.update(query_cls_loss)
         else:
             losses["loss_query_cls"] = z
+        if isinstance(query_objectness_loss, dict):
+            losses.update(query_objectness_loss)
+        else:
+            losses["loss_query_objectness"] = z
         if isinstance(query_depth_loss, dict):
             losses.update(query_depth_loss)
         else:
@@ -1833,23 +1689,14 @@ class EfficientOCFLossMixin:
             losses["loss_query_traj"] = z
 
         # ---- Hungarian matching cost diagnostics ----
-        losses["dbg_query_sim_match_cost_weight"] = centers_world.new_tensor(
-            float(self.query_sim_match_cost_weight)
-        )
-        losses["dbg_query_soft_assign_cost_weight"] = centers_world.new_tensor(
-            float(self.query_soft_assign_cost_weight)
-        )
         losses["dbg_query_cls_match_cost_weight"] = centers_world.new_tensor(
-            float(self.query_cls_match_cost_weight)
+            float(getattr(self, "query_cls_match_cost_weight", 0.0))
         )
         losses["dbg_query_center_match_cost_weight"] = centers_world.new_tensor(
             float(getattr(self, "query_center_match_cost_weight", 0.0))
         )
         losses["dbg_query_temporal_offset_match_cost_weight"] = centers_world.new_tensor(
             float(getattr(self, "query_temporal_offset_match_cost_weight", 0.0))
-        )
-        losses["dbg_query_bev_dice_match_cost_weight"] = centers_world.new_tensor(
-            float(self.query_bev_dice_match_cost_weight)
         )
         losses["dbg_query_attn_match_cost_weight"] = centers_world.new_tensor(
             float(getattr(self, "query_attn_match_cost_weight", 0.0))
@@ -1907,12 +1754,9 @@ class EfficientOCFLossMixin:
                 matched_mean_safe = matched_mean.detach().abs().clamp_min(eps) if torch.is_tensor(matched_mean) else cost_qn_f32.new_tensor(eps)
 
                 contrib_map = {
-                    "feat": inst_match_result.get("cost_feat_contrib_qn", None),
-                    "soft": inst_match_result.get("cost_soft_contrib_qn", None),
                     "cls": inst_match_result.get("cost_cls_contrib_qn", None),
                     "center": inst_match_result.get("cost_center_contrib_qn", None),
                     "temporal_offset": inst_match_result.get("cost_temporal_offset_contrib_qn", None),
-                    "bev_dice": inst_match_result.get("cost_bev_dice_contrib_qn", None),
                     "attn": inst_match_result.get("cost_attn_iou_contrib_qn", None),
                 }
                 for name, contrib_qn in contrib_map.items():
@@ -2005,13 +1849,12 @@ class EfficientOCFLossMixin:
                 if loss_key.startswith('loss'):
                     losses[loss_key] = losses[loss_key] / (losses[loss_key].detach() + 1e-9)
         _keep_dbg = {
-            "dbg_query_sim_match_cost_weight",
-            "dbg_query_soft_assign_cost_weight",
             "dbg_query_cls_match_cost_weight",
             "dbg_query_center_match_cost_weight",
             "dbg_query_temporal_offset_match_cost_weight",
-            "dbg_query_bev_dice_match_cost_weight",
             "dbg_query_attn_match_cost_weight",
+            "dbg_query_objectness_score_mean",
+            "dbg_query_objectness_pos_ratio",
         }
         for k in [
             k for k in losses

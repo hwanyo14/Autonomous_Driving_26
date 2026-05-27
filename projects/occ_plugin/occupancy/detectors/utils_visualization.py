@@ -1209,13 +1209,13 @@ class EfficientOCFVisualizationMixin:
         centers_world_tq3: torch.Tensor,
         query_cls_scores_qc: torch.Tensor,
         inst_match_result: dict,
-        gt_segmentation_instance3d_txyz: torch.Tensor,
         gaussian_sigmas_world_tq3: torch.Tensor = None,
         mixture_centers_world_tqg3: torch.Tensor = None,
         mixture_sigmas_world_tqg3: torch.Tensor = None,
         mixture_yaw_tqg: torch.Tensor = None,
         mixture_weights_tqg: torch.Tensor = None,
         query_attn_cam_score_pack: dict = None,
+        query_objectness_scores_q: torch.Tensor = None,
     ):
         if (not torch.is_tensor(centers_world_tq3)) or centers_world_tq3.dim() != 3:
             return None
@@ -1225,8 +1225,6 @@ class EfficientOCFVisualizationMixin:
         if q_count <= 0 or c_count <= 1:
             return None
         if int(centers_world_tq3.shape[1]) != q_count:
-            return None
-        if (not torch.is_tensor(gt_segmentation_instance3d_txyz)) or gt_segmentation_instance3d_txyz.dim() != 4:
             return None
         has_surrogate_sigma = (
             torch.is_tensor(gaussian_sigmas_world_tq3)
@@ -1246,73 +1244,12 @@ class EfficientOCFVisualizationMixin:
         if (not has_surrogate_sigma) and (not has_mixture):
             return None
 
-        score_frame_count = min(
-            int(getattr(self, "time_receptive_field", 1)),
-            int(centers_world_tq3.shape[0]),
-            int(gt_segmentation_instance3d_txyz.shape[0]),
-        )
-        if score_frame_count <= 0:
-            return None
-        score_centers_tq3 = centers_world_tq3[:score_frame_count].contiguous()
-        score_gt_occ_txyz = gt_segmentation_instance3d_txyz[:score_frame_count].contiguous()
-        score_sigmas_tq3 = (
-            gaussian_sigmas_world_tq3[:score_frame_count].contiguous()
-            if has_surrogate_sigma
-            else centers_world_tq3.new_zeros(score_centers_tq3.shape)
-        )
-        score_mix_centers_tqg3 = (
-            mixture_centers_world_tqg3[:score_frame_count].contiguous()
-            if has_mixture
-            else None
-        )
-        score_mix_sigmas_tqg3 = (
-            mixture_sigmas_world_tqg3[:score_frame_count].contiguous()
-            if has_mixture
-            else None
-        )
-        score_mix_yaw_tqg = (
-            mixture_yaw_tqg[:score_frame_count].contiguous()
-            if has_mixture
-            else None
-        )
-        score_mix_weights_tqg = (
-            mixture_weights_tqg[:score_frame_count].contiguous()
-            if has_mixture
-            else None
-        )
-
         cls_scores_qc = query_cls_scores_qc.to(device=centers_world_tq3.device, dtype=torch.float32)
         pred_cls_q = torch.argmax(cls_scores_qc, dim=-1).to(torch.long)
         fg_scores_qc = cls_scores_qc.clone()
         fg_scores_qc[:, int(self.query_bg_class)] = 0.0
         cls_prob_q = fg_scores_qc.max(dim=-1).values.clamp(0.0, 1.0)
 
-        if has_mixture:
-            iou_q = self._compute_matched_query_sequence_iou_scores(
-                centers_world_tq3=score_centers_tq3,
-                sigmas_world_tq3=score_sigmas_tq3,
-                mixture_centers_world_tqg3=score_mix_centers_tqg3,
-                mixture_sigmas_world_tqg3=score_mix_sigmas_tqg3,
-                mixture_yaw_tqg=score_mix_yaw_tqg,
-                mixture_weights_tqg=score_mix_weights_tqg,
-                gt_instance_occ3d_txyz_pred=score_gt_occ_txyz,
-                inst_match_result=inst_match_result,
-                objectness_scores_tq=None,
-                pair_chunk_size=int(self.query_multi_gaussian_pair_chunk),
-            )
-        else:
-            iou_q = self._compute_matched_query_sequence_iou_scores(
-                centers_world_tq3=score_centers_tq3,
-                sigmas_world_tq3=score_sigmas_tq3,
-                gt_instance_occ3d_txyz_pred=score_gt_occ_txyz,
-                inst_match_result=inst_match_result,
-                objectness_scores_tq=None,
-            )
-        if not torch.is_tensor(iou_q) or int(iou_q.numel()) != q_count:
-            iou_q = centers_world_tq3.new_zeros((q_count,), dtype=torch.float32)
-        iou_q = iou_q.to(dtype=torch.float32).clamp(0.0, 1.0)
-
-        w_iou = float(self.debug_query_score_iou_weight)
         w_cls = float(self.debug_query_score_cls_weight)
         w_cam = float(self.debug_query_score_cam_attn_weight)
         cam_attn_score_q = centers_world_tq3.new_zeros((q_count,), dtype=torch.float32)
@@ -1329,10 +1266,15 @@ class EfficientOCFVisualizationMixin:
             else:
                 cam_attn_score_valid_q = torch.zeros((q_count,), device=centers_world_tq3.device, dtype=torch.bool)
         cam_valid_f_q = cam_attn_score_valid_q.to(torch.float32)
-        score_num_q = (w_iou * iou_q) + (w_cls * cls_prob_q) + (w_cam * cam_attn_score_q * cam_valid_f_q)
-        score_den_q = (w_iou + w_cls) + (w_cam * cam_valid_f_q)
-        score_q = score_num_q / score_den_q.clamp_min(1e-6)
-        score_q = score_q.clamp(0.0, 1.0)
+        score_num_q = (w_cls * cls_prob_q) + (w_cam * cam_attn_score_q * cam_valid_f_q)
+        score_den_q = w_cls + (w_cam * cam_valid_f_q)
+        base_score_q = (score_num_q / score_den_q.clamp_min(1e-6)).clamp(0.0, 1.0)
+        objectness_q = centers_world_tq3.new_ones((q_count,), dtype=torch.float32)
+        if torch.is_tensor(query_objectness_scores_q) and int(query_objectness_scores_q.numel()) == q_count:
+            objectness_q = query_objectness_scores_q.to(
+                device=centers_world_tq3.device, dtype=torch.float32
+            ).reshape(-1).clamp(0.0, 1.0)
+        score_q = (objectness_q * base_score_q).clamp(0.0, 1.0)
 
         candidate_idx = torch.arange(q_count, device=score_q.device, dtype=torch.long)
 
@@ -1486,26 +1428,31 @@ class EfficientOCFVisualizationMixin:
             "candidate_sigmas_tq3": candidate_sigmas.detach(),
             "candidate_pred_cls_q": pred_cls_q.index_select(0, candidate_idx).detach(),
             "candidate_cls_prob_q": cls_prob_q.index_select(0, candidate_idx).detach(),
-            "candidate_iou_q": iou_q.index_select(0, candidate_idx).detach(),
+            "candidate_objectness_q": objectness_q.index_select(0, candidate_idx).detach(),
+            "candidate_base_score_q": base_score_q.index_select(0, candidate_idx).detach(),
             "candidate_score_q": score_q.index_select(0, candidate_idx).detach(),
             "selected_points_tq3": selected_points.detach(),
             "selected_sigmas_tq3": selected_sigmas.detach(),
             "selected_pred_cls_q": pred_cls_q.index_select(0, selected_idx).detach(),
+            "selected_objectness_q": objectness_q.index_select(0, selected_idx).detach(),
+            "selected_base_score_q": base_score_q.index_select(0, selected_idx).detach(),
             "selected_score_q": score_q.index_select(0, selected_idx).detach(),
             "selected_query_idx_q": selected_idx.detach(),
             "matched_points_tq3": matched_points.detach(),
             "matched_sigmas_tq3": matched_sigmas.detach(),
             "matched_pred_cls_q": pred_cls_q.index_select(0, matched_idx).detach(),
+            "matched_objectness_q": objectness_q.index_select(0, matched_idx).detach(),
+            "matched_base_score_q": base_score_q.index_select(0, matched_idx).detach(),
             "matched_score_q": score_q.index_select(0, matched_idx).detach(),
             "matched_query_idx_q": matched_idx.detach(),
             "matched_inst_idx_q": matched_inst_idx.detach(),
             "matched_gt_ids_q": matched_gt_ids.detach(),
             "score_q": score_q.detach(),
-            "iou_q": iou_q.detach(),
+            "base_score_q": base_score_q.detach(),
+            "objectness_q": objectness_q.detach(),
             "cls_prob_q": cls_prob_q.detach(),
             "cam_attn_score_q": cam_attn_score_q.detach(),
             "cam_attn_score_valid_q": cam_attn_score_valid_q.detach(),
-            "score_frame_count": int(score_frame_count),
             "pred_cls_q": pred_cls_q.detach(),
             "gaussian_sigmas_tq3": gaussian_sigmas_world_tq3.detach() if has_surrogate_sigma else None,
             "candidate_mixture_centers_tqg3": candidate_mix_centers.detach() if candidate_mix_centers is not None else None,
@@ -1522,7 +1469,6 @@ class EfficientOCFVisualizationMixin:
             "matched_mixture_weights_tqg": matched_mix_weights.detach() if matched_mix_weights is not None else None,
             "top_k": int(self.debug_query_score_topk),
             "score_thr": float(self.debug_query_score_threshold),
-            "w_iou": float(w_iou),
             "w_cls": float(w_cls),
             "w_cam": float(w_cam),
         }

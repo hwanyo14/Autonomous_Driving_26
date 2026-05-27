@@ -34,12 +34,9 @@ MODEL_CFG_DEFAULTS = {
     "query_num_classes": 3,
     "query_cls_loss_weight": 1.0,
     "query_cls_loss_class_weights": None,
-    "query_match_feature_source": "query_img_feat_pooled",
-    "query_soft_assign_temp": 0.10,
-    "query_soft_assign_cost_weight": 0.0,
-    "query_sim_match_cost_weight": 0.0,
     "query_cls_match_cost_weight": 0.0,
-    "query_bev_dice_match_cost_weight": 0.0,
+    "query_objectness_loss_weight": 0.1,
+    "query_objectness_loss_type": "balanced_bce",
     "query_center_routed_loss_weight": 0.1,
     "query_traj_matched_only": True,
     "query_traj_loss_weight": 0.0,
@@ -84,7 +81,6 @@ MODEL_CFG_DEFAULTS = {
     "query_attn_match_metric": "soft_iou",
     "query_attn_match_pred_norm": "amax",
     "query_attn_match_eps": 1e-6,
-    "use_query_attn_cam_gaussian_score": False,
     "query_attn_cam_frame_mode": "overlap_only",
     "query_attn_cam_target_mode": "prob",
     "query_attn_cam_metric": "kl",
@@ -122,7 +118,6 @@ VISUALIZATION_CFG_DEFAULTS = {
     "debug_query_gaussian_prob_alpha_scale": 4.0,
     "debug_query_score_topk": 50,
     "debug_query_score_threshold": 0.5,
-    "debug_query_score_iou_weight": 0.5,
     "debug_query_score_cls_weight": 0.5,
     "debug_query_score_cam_attn_weight": 0.0,
     "debug_instance_img_vis_dir": "./work_dirs/instance_img_debug_vis",
@@ -213,12 +208,9 @@ def apply_model_cfg(self, cfg):
     self.strict_query_class_id_validation = bool(cfg["strict_query_class_id_validation"])
 
     self.query_cls_loss_weight = float(cfg["query_cls_loss_weight"])
-    self.query_match_feature_source = str(cfg["query_match_feature_source"])
-    self.query_soft_assign_temp = float(cfg["query_soft_assign_temp"])
-    self.query_soft_assign_cost_weight = float(cfg["query_soft_assign_cost_weight"])
-    self.query_sim_match_cost_weight = float(cfg["query_sim_match_cost_weight"])
     self.query_cls_match_cost_weight = float(cfg["query_cls_match_cost_weight"])
-    self.query_bev_dice_match_cost_weight = float(cfg["query_bev_dice_match_cost_weight"])
+    self.query_objectness_loss_weight = float(cfg["query_objectness_loss_weight"])
+    self.query_objectness_loss_type = str(cfg["query_objectness_loss_type"]).lower()
     self.query_center_routed_loss_weight = float(cfg["query_center_routed_loss_weight"])
     self.query_traj_matched_only = bool(cfg["query_traj_matched_only"])
     self.query_traj_loss_weight = float(cfg["query_traj_loss_weight"])
@@ -263,7 +255,6 @@ def apply_model_cfg(self, cfg):
     self.query_attn_match_metric = str(cfg["query_attn_match_metric"]).lower()
     self.query_attn_match_pred_norm = str(cfg["query_attn_match_pred_norm"]).lower()
     self.query_attn_match_eps = float(cfg["query_attn_match_eps"])
-    self.use_query_attn_cam_gaussian_score = bool(cfg["use_query_attn_cam_gaussian_score"])
     self.query_attn_cam_frame_mode = str(cfg["query_attn_cam_frame_mode"]).lower()
     self.query_attn_cam_target_mode = str(cfg["query_attn_cam_target_mode"]).lower()
     self.query_attn_cam_metric = str(cfg["query_attn_cam_metric"]).lower()
@@ -317,7 +308,6 @@ def apply_visualization_cfg(self, cfg):
     self.debug_query_gaussian_prob_alpha_scale = float(cfg["debug_query_gaussian_prob_alpha_scale"])
     self.debug_query_score_topk = max(0, int(cfg["debug_query_score_topk"]))
     self.debug_query_score_threshold = float(cfg["debug_query_score_threshold"])
-    self.debug_query_score_iou_weight = float(cfg["debug_query_score_iou_weight"])
     self.debug_query_score_cls_weight = float(cfg["debug_query_score_cls_weight"])
     self.debug_query_score_cam_attn_weight = float(cfg["debug_query_score_cam_attn_weight"])
     self.debug_instance_img_vis_dir = str(cfg["debug_instance_img_vis_dir"])

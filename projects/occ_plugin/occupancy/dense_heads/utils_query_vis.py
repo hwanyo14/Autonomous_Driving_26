@@ -705,7 +705,6 @@ def save_prob_grid_vis(
     use_score_bundle = isinstance(query_vis_bundle, dict)
     bundle_top_k = 0
     bundle_score_thr = vis_cfg.conf_thr
-    bundle_w_iou = 0.5
     bundle_w_cls = 0.5
     bundle_w_cam = 0.0
 
@@ -748,7 +747,6 @@ def save_prob_grid_vis(
         cls_matched = _expand_attr_for_points(query_vis_bundle.get("matched_pred_cls_q", None), pts_matched)
         bundle_top_k = int(query_vis_bundle.get("top_k", 0))
         bundle_score_thr = float(query_vis_bundle.get("score_thr", bundle_score_thr))
-        bundle_w_iou = float(query_vis_bundle.get("w_iou", bundle_w_iou))
         bundle_w_cls = float(query_vis_bundle.get("w_cls", bundle_w_cls))
         bundle_w_cam = float(query_vis_bundle.get("w_cam", bundle_w_cam))
     else:
@@ -1062,12 +1060,14 @@ def save_prob_grid_vis(
 
     if use_score_bundle:
         score_q = query_vis_bundle.get("score_q", None)
-        iou_q = query_vis_bundle.get("iou_q", None)
+        base_score_q = query_vis_bundle.get("base_score_q", None)
+        objectness_q = query_vis_bundle.get("objectness_q", None)
         cls_prob_q = query_vis_bundle.get("cls_prob_q", None)
         cam_attn_score_q = query_vis_bundle.get("cam_attn_score_q", None)
         cam_attn_score_valid_q = query_vis_bundle.get("cam_attn_score_valid_q", None)
         score_mean = float(score_q.float().mean().item()) if torch.is_tensor(score_q) and score_q.numel() > 0 else 0.0
-        iou_mean = float(iou_q.float().mean().item()) if torch.is_tensor(iou_q) and iou_q.numel() > 0 else 0.0
+        base_mean = float(base_score_q.float().mean().item()) if torch.is_tensor(base_score_q) and base_score_q.numel() > 0 else 0.0
+        obj_mean = float(objectness_q.float().mean().item()) if torch.is_tensor(objectness_q) and objectness_q.numel() > 0 else 0.0
         cls_mean = float(cls_prob_q.float().mean().item()) if torch.is_tensor(cls_prob_q) and cls_prob_q.numel() > 0 else 0.0
         cam_mean = 0.0
         if torch.is_tensor(cam_attn_score_q) and cam_attn_score_q.numel() > 0:
@@ -1079,13 +1079,13 @@ def save_prob_grid_vis(
                 cam_mean = float(cam_attn_score_q.float().mean().item())
         header = (
             f"row1: gt_occ_inst occupancy BEV  "
-            f"row2: candidates(all queries, bg+fg)  "
+            f"row2: all queries, high-score highlighted  "
             f"row3: selected(score>=thr + topk)  "
             f"row4: selected(class-colored)  "
             f"row5: Hungarian-matched query centers only  "
             f"row6: GT class BEV(gt_occ_inst cls) | topk={bundle_top_k} thr={bundle_score_thr:.2f} "
-            f"w_iou={bundle_w_iou:.2f} w_cls={bundle_w_cls:.2f} w_cam={bundle_w_cam:.2f} "
-            f"mean(iou/cls/cam/score)=({iou_mean:.3f}/{cls_mean:.3f}/{cam_mean:.3f}/{score_mean:.3f})"
+            f"w_cls={bundle_w_cls:.2f} w_cam={bundle_w_cam:.2f} "
+            f"mean(obj/base/cls/cam/score)=({obj_mean:.3f}/{base_mean:.3f}/{cls_mean:.3f}/{cam_mean:.3f}/{score_mean:.3f})"
         )
         if bundle_has_gaussian:
             header += f" | Gaussian vis: {gaussian_desc}"

@@ -124,6 +124,22 @@ class ClassificationHead(nn.Module):
         return cls_logits
 
 
+class ObjectnessHead(nn.Module):
+    def __init__(self, embed_dim=128, out_dim=1):
+        super(ObjectnessHead, self).__init__()
+        self.mlp = MLP(
+            in_dim=embed_dim,
+            hidden_dim=embed_dim,
+            out_dim=out_dim,
+            num_layers=2,
+            dropout=0.0,
+            use_ln=True,
+        )
+
+    def forward(self, query_feat_qd):
+        return self.mlp(query_feat_qd).squeeze(-1)
+
+
 class QueryDepthHead(nn.Module):
     def __init__(self, embed_dim=128, out_dim=64):
         super(QueryDepthHead, self).__init__()
@@ -412,6 +428,7 @@ class QueryHead(nn.Module):
             # Backward-compat alias used by debug grad logger.
             self.gaussian_head = self.gaussian_sigma_head
         self.cls_head = ClassificationHead(embed_dim=self.embed_dim, out_dim=self.num_query_classes)
+        self.objectness_head = ObjectnessHead(embed_dim=self.embed_dim, out_dim=1)
         self.query_depth_head = QueryDepthHead(
             embed_dim=self.embed_dim,
             out_dim=self.query_depth_num_bins,
@@ -981,6 +998,8 @@ class QueryHead(nn.Module):
         query_cls_feat_qd = self._build_query_cls_feature_qd(query_inst, query_feat_tqd)
         query_cls_logits_qc = self.cls_head(query_cls_feat_qd)  # [Q,C]
         query_cls_scores_qc = torch.softmax(query_cls_logits_qc, dim=-1)
+        query_objectness_logits_q = self.objectness_head(query_cls_feat_qd)  # [Q]
+        query_objectness_scores_q = torch.sigmoid(query_objectness_logits_q)
         query_cls_scores_tqc = query_cls_scores_qc.unsqueeze(0).expand(
             int(query_feat_tqd.shape[0]), -1, -1
         )
@@ -1034,6 +1053,8 @@ class QueryHead(nn.Module):
             "query_cls_logits_qc": query_cls_logits_qc,
             "query_cls_scores_qc": query_cls_scores_qc,
             "query_cls_scores_tqc": query_cls_scores_tqc,
+            "query_objectness_logits_q": query_objectness_logits_q,
+            "query_objectness_scores_q": query_objectness_scores_q,
             "query_depth_logits_tqd": query_depth_logits_tqd,
             "query_depth_probs_tqd": query_depth_probs_tqd,
             "query_feat_tqd": query_feat_tqd,
@@ -1531,7 +1552,8 @@ class QueryHead(nn.Module):
                 sidecar = {}
                 for key in (
                     "score_q",
-                    "iou_q",
+                    "base_score_q",
+                    "objectness_q",
                     "cls_prob_q",
                     "cam_attn_score_q",
                     "cam_attn_score_valid_q",
@@ -1552,13 +1574,18 @@ class QueryHead(nn.Module):
                     "matched_mixture_yaw_tqg",
                     "matched_mixture_weights_tqg",
                     "selected_query_idx_q",
+                    "candidate_objectness_q",
+                    "candidate_base_score_q",
+                    "selected_objectness_q",
+                    "selected_base_score_q",
+                    "matched_objectness_q",
+                    "matched_base_score_q",
                 ):
                     val = query_vis_bundle.get(key, None)
                     if torch.is_tensor(val):
                         sidecar[key] = val.detach().cpu()
                 sidecar["top_k"] = int(query_vis_bundle.get("top_k", 0))
                 sidecar["score_thr"] = float(query_vis_bundle.get("score_thr", 0.0))
-                sidecar["w_iou"] = float(query_vis_bundle.get("w_iou", 0.5))
                 sidecar["w_cls"] = float(query_vis_bundle.get("w_cls", 0.5))
                 sidecar["w_cam"] = float(query_vis_bundle.get("w_cam", 0.0))
                 torch.save(sidecar, out_path)

@@ -85,7 +85,6 @@ class EfficientOCF(
         apply_visualization_cfg(self, visualization_cfg)
         self._dbg_printed_instance_img_seq_len_warning = False
         self._last_inst_match_result = None
-        self._last_gt_instance_bev_feat_cache = None
         self._last_query_inst_depth_target_pack = None
         self._last_query_attn_soft_lift_pack = None
         query_raw_to_compact_size = max(256, max(self.query_class_ids) + 1)
@@ -940,6 +939,8 @@ class EfficientOCF(
         query_cls_logits_qc = query_head_outputs["query_cls_logits_qc"]
         query_cls_scores_qc = query_head_outputs["query_cls_scores_qc"]
         query_cls_scores_tqc = query_head_outputs["query_cls_scores_tqc"]
+        query_objectness_logits_q = query_head_outputs["query_objectness_logits_q"]
+        query_objectness_scores_q = query_head_outputs["query_objectness_scores_q"]
         query_depth_logits_tqd = query_head_outputs["query_depth_logits_tqd"]
         query_depth_probs_tqd = query_head_outputs["query_depth_probs_tqd"]
         query_future_feat_tqd = query_head_outputs["query_feat_tqd"]
@@ -1090,6 +1091,8 @@ class EfficientOCF(
             query_cls_logits_qc,
             query_cls_scores_qc,
             query_cls_scores_tqc,
+            query_objectness_logits_q,
+            query_objectness_scores_q,
             query_depth_logits_tqd,
             query_depth_probs_tqd,
             query_img_feat_pooled,
@@ -1317,9 +1320,11 @@ class EfficientOCF(
             query_cls_logits_qc,
             query_cls_scores_qc,
             query_cls_scores_tqc,
+            query_objectness_logits_q,
+            query_objectness_scores_q,
             query_depth_logits_tqd,
             query_depth_probs_tqd,
-            query_img_feat_pooled_tqd,
+            _query_img_feat_pooled_tqd,
             _query_future_feat_tqd,
             _query_attn_weights_tqnhw,
             _query_attn_bbox_targets,
@@ -1537,6 +1542,7 @@ class EfficientOCF(
             match_center_frame_idx = None
             traj_loss_present_local_idx = int(_query_present_local_idx)
         query_cls_loss = None
+        query_objectness_loss = None
         query_depth_loss = None
         query_attn_bbox_loss = None
         query_attn_cam_score_pack = None
@@ -1548,40 +1554,6 @@ class EfficientOCF(
         num_matched_queries = 0
         num_total_queries = int(centers_world.shape[1]) if torch.is_tensor(centers_world) else 0
 
-        gt_inst_img_feat_tnd, gt_inst_img_feat_valid_tn, gt_inst_img_feat_ids_n = self.pool_gt_instance_context_features(
-            segmentation_instance3d_txyz=gt_instance_occ3d_txyz_primary,
-            future_egomotion=future_egomotion,
-            gt_inst_ids_n=gt_inst_ids_n,
-            query_match_inputs=query_match_inputs,
-            fallback_segmentation_instance3d_txyz=gt_segmentation_instance3d_txyz,
-        )
-        self._last_gt_instance_bev_feat_cache = None
-        if torch.is_tensor(gt_inst_img_feat_tnd):
-            self._last_gt_instance_bev_feat_cache = {
-                "feat_tnd": gt_inst_img_feat_tnd.detach(),
-                "valid_tn": gt_inst_img_feat_valid_tn.detach() if torch.is_tensor(gt_inst_img_feat_valid_tn) else None,
-                "ids_n": gt_inst_img_feat_ids_n.detach() if torch.is_tensor(gt_inst_img_feat_ids_n) else None,
-            }
-        if (
-            torch.is_tensor(gt_inst_ids_full_n)
-            and torch.is_tensor(gt_inst_img_feat_ids_n)
-            and torch.is_tensor(gt_inst_img_feat_tnd)
-            and torch.is_tensor(gt_inst_img_feat_valid_tn)
-        ):
-            feat_full_tnd = self._reindex_temporal_tensor_by_instance_ids(
-                values_tn=gt_inst_img_feat_tnd,
-                instance_ids_n=gt_inst_img_feat_ids_n,
-                target_ids_n=gt_inst_ids_full_n,
-            )
-            feat_valid_full_tn = self._reindex_temporal_tensor_by_instance_ids(
-                values_tn=gt_inst_img_feat_valid_tn,
-                instance_ids_n=gt_inst_img_feat_ids_n,
-                target_ids_n=gt_inst_ids_full_n,
-            )
-            if torch.is_tensor(feat_full_tnd) and torch.is_tensor(feat_valid_full_tn):
-                gt_inst_img_feat_tnd = feat_full_tnd
-                gt_inst_img_feat_valid_tn = feat_valid_full_tn
-                gt_inst_img_feat_ids_n = gt_inst_ids_full_n
         self._last_query_inst_depth_target_pack = None
         if (
             isinstance(query_match_inputs, dict)
@@ -1601,40 +1573,17 @@ class EfficientOCF(
                     for k, v in query_inst_depth_target_pack.items()
                 }
 
-        match_query_feat_tqd = None
-        if self.query_match_feature_source == "query_img_feat_pooled":
-            match_query_feat_tqd = query_img_feat_pooled_tqd
-
-        q_sel_tqd, g_sel_tnd, g_sel_valid_tn = self._select_matching_feature_frames(
-            query_feat_tqd=match_query_feat_tqd,
-            gt_feat_tnd=gt_inst_img_feat_tnd,
-            gt_valid_tn=gt_inst_img_feat_valid_tn,
-        )
         inst_match_result = self._match_queries_to_gt_instances(
             centers_world=centers_world_match_tq3,
-            query_sigmas_world_tq3=gaussian_sigmas_world_match_tq3,
-            query_mixture_centers_world_tqg3=mixture_centers_world_match_tqg3,
-            query_mixture_sigmas_world_tqg3=mixture_sigmas_world_match_tqg3,
-            query_mixture_yaw_tqg=mixture_yaw_match_tqg,
-            query_mixture_weights_tqg=mixture_weights_match_tqg,
-            gt_instance_occ3d_txyz=match_gt_instance_occ3d_txyz,
             gt_inst_center_world_tn3=match_gt_centers_tn3,
             gt_inst_center_valid_tn=match_gt_valid_tn,
             gt_inst_ids_n=match_gt_ids_n,
             gt_inst_cls_n=match_gt_cls_n,
             gt_inst_cls_valid_n=match_gt_cls_valid_n,
-            query_img_feat_tqd=q_sel_tqd,
             query_cls_logits_qc=query_cls_logits_qc,
-            gt_inst_bev_feat_tnd=g_sel_tnd,
-            gt_inst_bev_feat_valid_tn=g_sel_valid_tn,
-            gt_inst_bev_feat_ids_n=gt_inst_img_feat_ids_n,
+            query_cls_match_cost_weight=self.query_cls_match_cost_weight,
             query_attn_weights_tqnhw=_query_attn_weights_tqnhw,
             gt_attn_targets=_query_attn_bbox_targets,
-            query_sim_cost_weight=self.query_sim_match_cost_weight,
-            query_cls_cost_weight=self.query_cls_match_cost_weight,
-            query_soft_assign_temp=self.query_soft_assign_temp,
-            query_soft_assign_cost_weight=self.query_soft_assign_cost_weight,
-            query_bev_dice_cost_weight=self.query_bev_dice_match_cost_weight,
             query_attn_match_cost_weight=self.query_attn_match_cost_weight,
             query_attn_match_metric=self.query_attn_match_metric,
             query_attn_match_pred_norm=self.query_attn_match_pred_norm,
@@ -1648,6 +1597,21 @@ class EfficientOCF(
             matched_query_idx = inst_match_result.get("matched_query_idx", None)
             if torch.is_tensor(matched_query_idx):
                 num_matched_queries = int(matched_query_idx.numel())
+        if torch.is_tensor(query_objectness_logits_q) and query_objectness_logits_q.dim() == 1:
+            objectness_targets_q = torch.zeros_like(query_objectness_logits_q, dtype=torch.float32)
+            if isinstance(inst_match_result, dict):
+                matched_query_idx = inst_match_result.get("matched_query_idx", None)
+                if torch.is_tensor(matched_query_idx) and matched_query_idx.numel() > 0:
+                    mq = matched_query_idx.to(device=objectness_targets_q.device, dtype=torch.long).reshape(-1)
+                    mq = mq[(mq >= 0) & (mq < int(objectness_targets_q.numel()))]
+                    if mq.numel() > 0:
+                        objectness_targets_q[mq] = 1.0
+            query_objectness_loss = self.query_head.compute_objectness_loss(
+                objectness_logits=query_objectness_logits_q,
+                objectness_targets=objectness_targets_q,
+                loss_weight=float(self.query_objectness_loss_weight),
+                loss_type=self.query_objectness_loss_type,
+            )
 
         # Deferred trajectory prediction: run traj head only on matched queries,
         # scatter results back to [F, Q=100, 2] with zeros for unmatched.
@@ -1813,8 +1777,7 @@ class EfficientOCF(
                     has_empty_gt_mask = float(1.0 if (not bool(gt_mask_tnhw.any().item())) else 0.0)
                 query_attn_bbox_loss["dbg_query_attn_bbox_empty_gt_mask"] = centers_world.new_tensor(has_empty_gt_mask)
         if (
-            self.use_query_attn_cam_gaussian_score
-            and torch.is_tensor(_query_attn_weights_tqnhw)
+            torch.is_tensor(_query_attn_weights_tqnhw)
             and isinstance(query_match_inputs, dict)
             and torch.is_tensor(mixture_centers_world_loss)
             and torch.is_tensor(mixture_sigmas_world_loss)
@@ -1906,13 +1869,13 @@ class EfficientOCF(
                 centers_world_tq3=_d(centers_world_vis_full_tq3),
                 query_cls_scores_qc=_d(query_cls_scores_qc),
                 inst_match_result=inst_match_result,
-                gt_segmentation_instance3d_txyz=gt_instance_occ3d_txyz_query_vis,
                 gaussian_sigmas_world_tq3=_d(gaussian_sigmas_world_vis_full_tq3),
                 mixture_centers_world_tqg3=_d(mixture_centers_world_vis_full_tqg3),
                 mixture_sigmas_world_tqg3=_d(mixture_sigmas_world_vis_full_tqg3),
                 mixture_yaw_tqg=_d(mixture_yaw_vis_full_tqg),
                 mixture_weights_tqg=_d(mixture_weights_vis_full_tqg),
                 query_attn_cam_score_pack=query_attn_cam_score_pack,
+                query_objectness_scores_q=_d(query_objectness_scores_q),
             )
 
         # Save query debug visualization regardless of individual loss switches.
@@ -1993,6 +1956,7 @@ class EfficientOCF(
 
         return self._aggregate_training_losses(
             query_cls_loss=query_cls_loss,
+            query_objectness_loss=query_objectness_loss,
             query_depth_loss=query_depth_loss,
             query_attn_bbox_loss=query_attn_bbox_loss,
             matched_gmo_loss=matched_gmo_loss,
