@@ -35,7 +35,7 @@ MODEL_CFG_DEFAULTS = {
     "query_cls_loss_weight": 1.0,
     "query_cls_loss_class_weights": None,
     "query_cls_match_cost_weight": 0.0,
-    "query_objectness_loss_weight": 0.1,
+    "query_objectness_loss_weight": 1.0,
     "query_objectness_loss_type": "balanced_bce",
     "query_center_routed_loss_weight": 0.1,
     "query_traj_matched_only": True,
