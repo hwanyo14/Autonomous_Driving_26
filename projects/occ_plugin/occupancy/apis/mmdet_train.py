@@ -40,6 +40,34 @@ class VisualizationIterSyncHook(Hook):
     def before_iter(self, runner):
         self._sync(runner)
 
+
+def _configure_visualization_dirs(model, work_dir, timestamp):
+    if not work_dir or not timestamp:
+        return None
+    base_vis_dir = osp.join(str(work_dir), "vis", str(timestamp))
+    detector_dir_map = {
+        "debug_query_vis_dir": "query_debug_vis",
+        "debug_instance_img_vis_dir": "instance_img_debug_vis",
+        "debug_query_cam_gaussian_vis_dir": "query_cam_gaussian_vis",
+        "debug_gt_alignment_vis_dir": "gt_alignment_vis",
+        "debug_query_inst_depth_lift_vis_dir": "query_inst_depth_lift_vis",
+        "debug_query_attn_softargmax_vis_dir": "query_attn_softargmax_vis",
+        "query_attn_vis_dir": "query_attn_vis",
+    }
+
+    root_model = model.module if hasattr(model, "module") else model
+    for attr_name, folder_name in detector_dir_map.items():
+        if hasattr(root_model, attr_name):
+            setattr(root_model, attr_name, osp.join(base_vis_dir, folder_name))
+
+    query_head = getattr(root_model, "query_head", None)
+    transformer = getattr(root_model, "transformer", None)
+    if query_head is not None and hasattr(query_head, "debug_vis_dir"):
+        query_head.debug_vis_dir = osp.join(base_vis_dir, "query_debug_vis")
+    if transformer is not None and hasattr(transformer, "attn_vis_dir"):
+        transformer.attn_vis_dir = osp.join(base_vis_dir, "query_attn_vis")
+    return base_vis_dir
+
 def custom_train_detector(model,
                    dataset,
                    cfg,
@@ -71,7 +99,9 @@ def custom_train_detector(model,
             model.cuda(),
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=False,
-            find_unused_parameters=find_unused_parameters)
+            find_unused_parameters=find_unused_parameters,
+            init_sync=False,
+            static_graph=True)
     else:
         model = MMDataParallel(
             model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
@@ -91,6 +121,9 @@ def custom_train_detector(model,
 
     # an ugly workaround to make .log and .log.json filenames the same
     runner.timestamp = timestamp
+    base_vis_dir = _configure_visualization_dirs(model, cfg.work_dir, timestamp)
+    if base_vis_dir is not None:
+        logger.info(f'Visualization outputs will be saved under {base_vis_dir}')
 
     # fp16 setting TODO
     fp16_cfg = cfg.get('fp16', None)
@@ -135,7 +168,18 @@ def custom_train_detector(model,
     #     runner.register_hook(eval_hook(val_dataloader, **eval_cfg), priority='LOW')
 
     runner.register_hook(VisualizationIterSyncHook(), priority='VERY_HIGH')
-    
+
+    custom_hooks = cfg.get('custom_hooks', None)
+    if custom_hooks:
+        for hook_cfg in custom_hooks:
+            if not isinstance(hook_cfg, dict):
+                continue
+            hook_cfg = hook_cfg.copy()
+            priority = hook_cfg.pop('priority', 'NORMAL')
+            if hook_cfg.get('type') == 'OccEfficiencyHook' and 'dataloader' not in hook_cfg:
+                hook_cfg['dataloader'] = data_loaders[0]
+            runner.register_hook(build_from_cfg(hook_cfg, HOOKS), priority=priority)
+
     if distributed:
         if isinstance(runner, EpochBasedRunner):
             runner.register_hook(DistSamplerSeedHook())

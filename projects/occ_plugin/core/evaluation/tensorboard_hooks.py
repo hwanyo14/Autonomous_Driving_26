@@ -5,6 +5,29 @@ try:
     from mmcv.runner.hooks.logger.tensorboard import TensorboardLoggerHook
 except Exception:
     from mmcv.runner.hooks.logger import TensorboardLoggerHook
+from mmcv.runner.hooks.logger import TextLoggerHook
+
+
+@HOOKS.register_module()
+class TextLoggerHookNoDbg(TextLoggerHook):
+    """TextLoggerHook that hides dbg metrics from terminal/JSON logs.
+
+    TensorBoard logging is unaffected; dbg values stay in log_buffer.
+    """
+
+    @staticmethod
+    def _strip_dbg(log_dict):
+        return {
+            k: v
+            for k, v in log_dict.items()
+            if not (str(k).startswith("dbg_") or str(k).startswith("dbg/"))
+        }
+
+    def _log_info(self, log_dict, runner):
+        super()._log_info(self._strip_dbg(log_dict), runner)
+
+    def _dump_log(self, log_dict, runner):
+        super()._dump_log(self._strip_dbg(log_dict), runner)
 
 
 @HOOKS.register_module()

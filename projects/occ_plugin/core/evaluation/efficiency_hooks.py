@@ -8,6 +8,66 @@ except ImportError:
 import torch
 import torch.distributed as dist
 
+
+@HOOKS.register_module()
+class TrajectoryWarmupHook(Hook):
+    def __init__(self, schedule=None):
+        self.schedule = self._normalize_schedule(schedule)
+
+    @staticmethod
+    def _normalize_schedule(schedule):
+        if schedule is None:
+            return ()
+        normalized = []
+        for stage in schedule:
+            if not isinstance(stage, dict):
+                continue
+            item = copy.deepcopy(stage)
+            item["begin_epoch"] = int(item["begin_epoch"])
+            normalized.append(item)
+        normalized.sort(key=lambda x: x["begin_epoch"])
+        return tuple(normalized)
+
+    @staticmethod
+    def _get_model(runner):
+        return runner.model.module if hasattr(runner.model, "module") else runner.model
+
+    def _get_stage(self, epoch):
+        if len(self.schedule) == 0:
+            return None
+        cur_stage = self.schedule[0]
+        for stage in self.schedule:
+            if int(stage["begin_epoch"]) <= int(epoch):
+                cur_stage = stage
+            else:
+                break
+        return cur_stage
+
+    def _apply_stage(self, model, stage):
+        if stage is None:
+            return
+        for key, value in stage.items():
+            if key == "begin_epoch":
+                continue
+            setattr(model, key, value)
+        model._query_traj_sched_stage_begin_epoch = int(stage["begin_epoch"])
+        model._query_traj_sched_loss_weight = float(getattr(model, "query_traj_loss_weight", 0.0))
+        model._query_traj_sched_refine_loss_weight = float(getattr(model, "query_traj_xy_refine_loss_weight", 0.0))
+        model._query_traj_sched_mode_cls_loss_weight = float(getattr(model, "query_traj_mode_cls_loss_weight", 0.0))
+        model._query_traj_sched_teacher_forcing_enabled = float(
+            bool(getattr(model, "query_traj_teacher_forcing_enabled", False))
+        )
+
+    def before_run(self, runner):
+        self._apply_stage(self._get_model(runner), self._get_stage(runner.epoch + 1))
+
+    def before_train_epoch(self, runner):
+        self._apply_stage(self._get_model(runner), self._get_stage(runner.epoch + 1))
+
+    def before_epoch(self, runner):
+        self._apply_stage(self._get_model(runner), self._get_stage(runner.epoch + 1))
+
+
 @HOOKS.register_module()
 class OccEfficiencyHook(Hook):
     def __init__(self, dataloader,  **kwargs):

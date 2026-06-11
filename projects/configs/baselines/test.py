@@ -1,16 +1,13 @@
-# Developed by Jingyi Xu based on the codebase of Cam4DOcc and PowerBEV
+# Developed by Jingyi Xu based on the codebase of Cam4DOcc and PowerBEV 
 # Spatiotemporal Decoupling for Efficient Vision-Based Occupancy Forecasting
 # https://github.com/BIT-XJY/EfficientOCF
-#
-# Teacher forcing variant: past delta offset priors are computed from GT centers
-# for the first `query_traj_teacher_forcing_until_iter` iterations, then switch
-# to prediction-based priors (hard switch).
 import copy
 
 # Basic params ******************************************
 _base_ = ['../datasets/custom_nus-3d.py', '../_base_/default_runtime.py']
 
 find_unused_parameters = True
+# Whether to run only dataset generation without training.
 only_generate_dataset = False
 
 input_modality = dict(
@@ -30,23 +27,25 @@ val_ann_file = "./data/nuscenes/nuscenes_occ_infos_val.pkl"
 depth_gt_path = './data/depth_gt'
 ocf_dataset_path = "./data/efficientocf/"
 
+# User-local dataset roots.
 occ_path = "./data/nuScenes-Occupancy"
 nusc_root = './data/nuscenes/'
 occ_dt_path = "./data/occ_dt"
 segmentation_cls_dataset_path = "./data/efficientocf_bboxcls/"
 gt_occ_inst_dataset_path = "./data/nuScenes-Occupancy_inst3d/"
 
+# Query/GMO foreground semantic classes use sparse raw nuScenes occupancy ids:
+# [2, 3, 4, 5, 6, 9, 10] + background(0); pedestrian(7) excluded
 class_names = [
     'bicycle',
     'bus',
     'car',
     'construction',
     'motorcycle',
-    'pedestrian',
     'trailer',
     'truck',
 ]
-query_class_ids = [0, 2, 3, 4, 5, 6, 7, 9, 10]
+query_class_ids = [0, 2, 3, 4, 5, 6, 9, 10]
 query_class_names = ['background'] + class_names
 validate_segmentation_cls_instance3d_alignment = True
 strict_query_class_id_validation = True
@@ -54,10 +53,15 @@ use_separate_classes = False
 use_fine_occ = False
 
 # Forecasting-related params ******************************************
+# Use time_receptive_field past frames to forecast n_future_frames.
+# For 3D instance prediction, n_future_frames_plus should be > n_future_frames.
 time_receptive_field = 3
 n_future_frames = 4
 n_future_frames_plus = 6
 
+# Query present-only mode: converts the query branch output from the 6-frame
+# plus window to a single present frame (global index = time_receptive_field - 1).
+# BEV branch stays on n_future_frames_plus.
 query_present_only = True
 query_pred_num_frames = 1
 
@@ -91,6 +95,7 @@ data_config = {
     'Ncams': 6,
     'input_size': (896, 1600),
     'src_size': (900, 1600),
+    # Image-view augmentation.
     'resize': (-0.06, 0.11),
     'rot': (-5.4, 5.4),
     'flip': False,
@@ -105,8 +110,11 @@ bda_aug_conf = dict(
     flip_dy_ratio=0.5,
 )
 
-train_capacity = 4000
-test_capacity = 5119
+# train_capacity = 23930  # default: use all sequences
+train_capacity = 4000  # 3880
+# train_capacity = 7  # 3880
+
+test_capacity = 5119  # default: use all sequences
 validate_instance_cache = False
 write_instance_cache = False
 write_height_cache = False
@@ -321,13 +329,16 @@ test_config = dict(
     test_capacity=test_capacity,
 )
 
+# Copy and construct val config from test config.
 val_config = copy.deepcopy(test_config)
 val_config['test_capacity'] = 100
 
+# In our work we use 8 NVIDIA A100 GPUs.
 data = dict(
     samples_per_gpu=1,
-    workers_per_gpu=1,
+    workers_per_gpu=0,
     train=train_config,
+    # val=test_config,
     val=val_config,
     test=test_config,
     shuffler_sampler=dict(type='DistributedGroupSampler'),
@@ -356,15 +367,22 @@ model_cfg = dict(
     query_class_names=query_class_names,
     strict_query_class_id_validation=strict_query_class_id_validation,
     query_num_classes=len(query_class_ids),
-    query_cls_loss_class_weights=[0.1] + [1.0] * (len(query_class_ids) - 1),
-    query_attn_match_cost_weight=0.5,
+    query_cls_loss_class_weights=[0.02, 1.4, 1.3, 0.30, 1.4, 1.4, 1.2, 0.9],
+    query_attn_match_metric='inside_log',
+    query_attn_match_cost_weight=0.3,
     query_embed_dim=bev_feat_dim,
     query_id_reinject_scale=0.2,
     query_decor_loss_weight=1.0,
     use_query_attn_bbox_loss=True,
+    query_attn_bbox_other_weight=0.1,
+    query_attn_bbox_other_mode='union',
+    query_attn_bbox_unmatched_weight=0.0,
+    query_require_history_all_valid=True,
     query_attn_cam_gaussian_truncate_sigma=1.777,
-    query_center_match_cost_weight=4.0,
-    query_temporal_offset_match_cost_weight=2.0,
+    query_num_queries=200,
+    query_cls_match_cost_weight=0.075,
+    query_center_match_cost_weight=10.0,
+    query_temporal_offset_match_cost_weight=0.5,
     query_center_routed_loss_weight=0.3,
     query_traj_loss_weight=0.5,
     query_traj_residual_max_m=(15.0, 15.0),
@@ -377,9 +395,6 @@ model_cfg = dict(
     query_multi_gaussian_sigma_max_m=(1.0, 1.0, 1.0),
     query_multi_gaussian_sigma_reg_loss_weight=0.01,
     query_multi_gaussian_weight_mode='softplus',
-    # Teacher forcing: use GT past delta offsets until this iteration, then switch to prediction.
-    query_traj_teacher_forcing=True,
-    query_traj_teacher_forcing_until_iter=30000,
 )
 
 debug_cfg = dict(
@@ -393,23 +408,23 @@ debug_cfg = dict(
 )
 
 visualization_cfg = dict(
-    debug_query_vis_dir="./work_dirs/query_debug_vis_traj_tf",
+    debug_query_vis_dir="./work_dirs/query_debug_vis_no_pretrain",
     debug_query_gaussian_vis_mode='prob',
     debug_query_score_iou_weight=0.0,
     debug_query_score_cls_weight=0.3,
     debug_query_score_cam_attn_weight=0.7,
-    debug_instance_img_vis_dir="./work_dirs/instance_img_debug_vis_traj_tf",
+    debug_instance_img_vis_dir="./work_dirs/instance_img_debug_vis_no_pretrain",
     debug_instance_img_vis_max_frames=n_future_frames_plus,
-    debug_query_cam_gaussian_vis_dir="./work_dirs/query_cam_gaussian_vis_traj_tf",
+    debug_query_cam_gaussian_vis_dir="./work_dirs/query_cam_gaussian_vis_no_pretrain",
     debug_query_cam_gaussian_vis_max_frames=3,
     debug_query_cam_gaussian_vis_gt_overlay_enabled=True,
     debug_query_cam_gaussian_vis_topk_matched=8,
-    debug_gt_alignment_vis_dir="./work_dirs/gt_alignment_vis_traj_tf",
-    debug_query_inst_depth_lift_vis_dir="./work_dirs/query_inst_depth_lift_vis_traj_tf",
+    debug_gt_alignment_vis_dir="./work_dirs/gt_alignment_vis_no_pretrain",
+    debug_query_inst_depth_lift_vis_dir="./work_dirs/query_inst_depth_lift_vis_no_pretrain",
     debug_query_inst_depth_lift_vis_max_frames=2,
     debug_query_inst_depth_lift_vis_max_instances=12,
-    debug_query_attn_softargmax_vis_dir="./work_dirs/query_attn_softargmax_vis_traj_tf",
-    query_attn_vis_dir="./work_dirs/query_attn_vis_traj_tf",
+    debug_query_attn_softargmax_vis_dir="./work_dirs/query_attn_softargmax_vis_no_pretrain",
+    query_attn_vis_dir="./work_dirs/query_attn_vis_no_pretrain",
 )
 
 model = dict(
@@ -439,8 +454,10 @@ model = dict(
     ),
     img_neck=dict(
         type='SECONDFPN',
+        # in_channels=[256, 512, 1024, 2048],
         in_channels=[64, 128, 256, 512],
         upsample_strides=[0.25, 0.5, 1, 2],
+        # upsample_strides=[0.125, 0.25, 0.5, 1],
         out_channels=[128, 128, 128, 128],
         norm_cfg=gn_cfg,
     ),
@@ -469,9 +486,11 @@ optimizer = dict(
     weight_decay=0.01,
 )
 
+# optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
+
 optimizer_config = dict(
     type='GradientCumulativeOptimizerHook',
-    cumulative_iters=8,
+    cumulative_iters=16,
     grad_clip=dict(max_norm=35, norm_type=2),
 )
 
@@ -479,6 +498,7 @@ lr_config = dict(
     policy='CosineAnnealing',
     warmup='linear',
     warmup_iters=4000,
+    # warmup_iters=800,
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
 )
@@ -496,10 +516,17 @@ custom_hooks = [
     dict(type='OccEfficiencyHook'),
 ]
 
+# W&B logging for sweeps
 log_config = dict(
     interval=1,
     hooks=[
         dict(type='TextLoggerHookNoDbg'),
         dict(type='TensorboardLoggerHookSplitTabs'),
+        # dict(
+        #     type='WandbLoggerHook',
+        #     init_kwargs=dict(project='efficientocf',
+        #                      name='eocf_gc_light_260127_full',
+        #                      resume="allow"),
+        # ),
     ],
 )

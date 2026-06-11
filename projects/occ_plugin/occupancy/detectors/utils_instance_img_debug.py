@@ -34,16 +34,18 @@ class EfficientOCFInstanceImgDebugMixin:
 
     @staticmethod
     def _instance_color(instance_id: int, cls_id: int = None) -> Tuple[int, int, int]:
+        # Same raw-id -> color mapping as QueryHead._get_query_vis_palette
+        # so every debug visualization uses identical class colors.
         class_palette = {
-            0: (180, 180, 180),
-            2: (231, 76, 60),
-            3: (243, 156, 18),
-            4: (46, 204, 113),
-            5: (52, 152, 219),
-            6: (155, 89, 182),
-            7: (26, 188, 156),
-            9: (241, 196, 15),
-            10: (230, 126, 34),
+            0: (110, 110, 110),
+            2: (255, 170, 40),
+            3: (80, 180, 255),
+            4: (255, 80, 80),
+            5: (255, 220, 80),
+            6: (180, 100, 255),
+            7: (80, 255, 200),
+            9: (140, 255, 100),
+            10: (255, 120, 220),
         }
         if cls_id is not None and int(cls_id) in class_palette:
             return class_palette[int(cls_id)]

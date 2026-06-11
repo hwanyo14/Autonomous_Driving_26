@@ -6,6 +6,8 @@
 ├── AGENTS.md  # 이 repo에서 작업할 때 따라야 할 에이전트 지침
 ├── README.md  # 저장소 목적을 짧게 적은 루트 소개
 ├── PROJECT_STRUCTURE.md  # 이 문서
+├── CHANGELOG.md  # 코드 수정/구현 기록
+├── NOTES.md  # 구현 중 주의사항·경고·후속 작업 메모
 ├── run.sh  # 학습용 진입 스크립트; config 확인 후 tools/dist_train.sh 호출
 ├── run_eval.sh  # 평가용 진입 스크립트; config/checkpoint 확인 후 tools/dist_test.sh 호출
 ├── run_lss_pretrain.sh  # LSS view-transformer만 pretrain하도록 dist_train.sh를 감싼 래퍼

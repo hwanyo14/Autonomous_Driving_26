@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import numpy as np
+import math
 
 def sigmoid_to_world_from_range(logits: torch.Tensor,
                                 point_cloud_range,
@@ -138,17 +139,201 @@ class QueryDepthHead(nn.Module):
     
 
 class TrajectoryHead(nn.Module):
-    def __init__(self, input_dim=128, hidden_dim=128, out_dim=8):
+    def __init__(
+        self,
+        input_dim=128,
+        hidden_dim=128,
+        num_future_steps=4,
+        num_modes=1,
+        num_learned_modes=1,
+    ):
         super(TrajectoryHead, self).__init__()
         self.input_dim = int(input_dim)
         self.hidden_dim = int(hidden_dim)
-        self.out_dim = int(out_dim)
+        self.num_future_steps = int(num_future_steps)
+        self.num_modes = int(num_modes)
+        self.num_learned_modes = int(num_learned_modes)
+        self.out_dim = int(self.num_future_steps * self.num_learned_modes * 2)
         if self.input_dim <= 0:
             raise ValueError(f"input_dim must be positive, got {self.input_dim}")
         if self.hidden_dim <= 0:
             raise ValueError(f"hidden_dim must be positive, got {self.hidden_dim}")
-        if self.out_dim <= 0:
-            raise ValueError(f"out_dim must be positive, got {self.out_dim}")
+        if self.num_future_steps <= 0:
+            raise ValueError(f"num_future_steps must be positive, got {self.num_future_steps}")
+        if self.num_modes <= 0:
+            raise ValueError(f"num_modes must be positive, got {self.num_modes}")
+        if self.num_learned_modes < 0:
+            raise ValueError(f"num_learned_modes must be >= 0, got {self.num_learned_modes}")
+        self.mlp = None
+        if self.out_dim > 0:
+            self.mlp = MLP(
+                in_dim=self.input_dim,
+                hidden_dim=self.hidden_dim,
+                out_dim=self.out_dim,
+                num_layers=2,
+                dropout=0.0,
+                use_ln=True,
+            )
+        self.mode_mlp = None
+        if self.num_modes > 1:
+            self.mode_mlp = MLP(
+                in_dim=self.input_dim,
+                hidden_dim=self.hidden_dim,
+                out_dim=self.num_modes,
+                num_layers=2,
+                dropout=0.0,
+                use_ln=True,
+            )
+
+    def forward(self, query_feat_qd):
+        # [Q,D] -> learned [Q,M,F,2], mode logits [Q,K]
+        learned_logits_qmf2 = None
+        if self.mlp is not None:
+            learned_logits_qmf2 = self.mlp(query_feat_qd).reshape(
+                int(query_feat_qd.shape[0]),
+                self.num_learned_modes,
+                self.num_future_steps,
+                2,
+            )
+        mode_logits_qk = None
+        if self.mode_mlp is not None:
+            mode_logits_qk = self.mode_mlp(query_feat_qd)
+        return learned_logits_qmf2, mode_logits_qk
+
+
+class BernsteinTrajectoryHead(nn.Module):
+    def __init__(
+        self,
+        input_dim=128,
+        hidden_dim=128,
+        bernstein_degree=3,
+        num_modes=1,
+        num_learned_modes=1,
+    ):
+        super(BernsteinTrajectoryHead, self).__init__()
+        self.input_dim = int(input_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.bernstein_degree = int(bernstein_degree)
+        self.num_modes = int(num_modes)
+        self.num_learned_modes = int(num_learned_modes)
+        self.num_pred_ctrl_points = max(0, self.bernstein_degree)
+        self.out_dim = int(self.num_learned_modes * self.num_pred_ctrl_points * 2)
+        if self.input_dim <= 0:
+            raise ValueError(f"input_dim must be positive, got {self.input_dim}")
+        if self.hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be positive, got {self.hidden_dim}")
+        if self.bernstein_degree <= 0:
+            raise ValueError(f"bernstein_degree must be positive, got {self.bernstein_degree}")
+        if self.num_modes <= 0:
+            raise ValueError(f"num_modes must be positive, got {self.num_modes}")
+        if self.num_learned_modes < 0:
+            raise ValueError(f"num_learned_modes must be >= 0, got {self.num_learned_modes}")
+        self.mlp = None
+        if self.out_dim > 0:
+            self.mlp = MLP(
+                in_dim=self.input_dim,
+                hidden_dim=self.hidden_dim,
+                out_dim=self.out_dim,
+                num_layers=2,
+                dropout=0.0,
+                use_ln=True,
+            )
+        self.mode_mlp = None
+        if self.num_modes > 1:
+            self.mode_mlp = MLP(
+                in_dim=self.input_dim,
+                hidden_dim=self.hidden_dim,
+                out_dim=self.num_modes,
+                num_layers=2,
+                dropout=0.0,
+                use_ln=True,
+            )
+
+    def forward(self, query_feat_qd):
+        learned_raw_qmcp2 = None
+        if self.mlp is not None:
+            learned_raw_qmcp2 = self.mlp(query_feat_qd).reshape(
+                int(query_feat_qd.shape[0]),
+                self.num_learned_modes,
+                self.num_pred_ctrl_points,
+                2,
+            )
+        mode_logits_qk = None
+        if self.mode_mlp is not None:
+            mode_logits_qk = self.mode_mlp(query_feat_qd)
+        return learned_raw_qmcp2, mode_logits_qk
+
+
+class EndpointHead(nn.Module):
+    def __init__(
+        self,
+        input_dim=128,
+        hidden_dim=128,
+        num_modes=1,
+        num_learned_modes=1,
+    ):
+        super(EndpointHead, self).__init__()
+        self.input_dim = int(input_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.num_modes = int(num_modes)
+        self.num_learned_modes = int(num_learned_modes)
+        self.out_dim = int(self.num_learned_modes * 2)
+        if self.input_dim <= 0:
+            raise ValueError(f"input_dim must be positive, got {self.input_dim}")
+        if self.hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be positive, got {self.hidden_dim}")
+        if self.num_modes <= 0:
+            raise ValueError(f"num_modes must be positive, got {self.num_modes}")
+        if self.num_learned_modes < 0:
+            raise ValueError(f"num_learned_modes must be >= 0, got {self.num_learned_modes}")
+        self.mlp = None
+        if self.out_dim > 0:
+            self.mlp = MLP(
+                in_dim=self.input_dim,
+                hidden_dim=self.hidden_dim,
+                out_dim=self.out_dim,
+                num_layers=2,
+                dropout=0.0,
+                use_ln=True,
+            )
+        self.mode_mlp = None
+        if self.num_modes > 1:
+            self.mode_mlp = MLP(
+                in_dim=self.input_dim,
+                hidden_dim=self.hidden_dim,
+                out_dim=self.num_modes,
+                num_layers=2,
+                dropout=0.0,
+                use_ln=True,
+            )
+
+    def forward(self, query_feat_qd):
+        endpoint_logits_qm2 = None
+        if self.mlp is not None:
+            endpoint_logits_qm2 = self.mlp(query_feat_qd).reshape(
+                int(query_feat_qd.shape[0]),
+                self.num_learned_modes,
+                2,
+            )
+        mode_logits_qk = None
+        if self.mode_mlp is not None:
+            mode_logits_qk = self.mode_mlp(query_feat_qd)
+        return endpoint_logits_qm2, mode_logits_qk
+
+
+class TrajectoryDecoderHead(nn.Module):
+    def __init__(self, input_dim=128, hidden_dim=128, num_future_steps=4):
+        super(TrajectoryDecoderHead, self).__init__()
+        self.input_dim = int(input_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.num_future_steps = int(num_future_steps)
+        self.out_dim = int(self.num_future_steps * 2)
+        if self.input_dim <= 0:
+            raise ValueError(f"input_dim must be positive, got {self.input_dim}")
+        if self.hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be positive, got {self.hidden_dim}")
+        if self.num_future_steps <= 0:
+            raise ValueError(f"num_future_steps must be positive, got {self.num_future_steps}")
         self.mlp = MLP(
             in_dim=self.input_dim,
             hidden_dim=self.hidden_dim,
@@ -159,8 +344,11 @@ class TrajectoryHead(nn.Module):
         )
 
     def forward(self, query_feat_qd):
-        # [Q,D] -> [Q,out_dim]
-        return self.mlp(query_feat_qd)
+        return self.mlp(query_feat_qd).reshape(
+            int(query_feat_qd.shape[0]),
+            self.num_future_steps,
+            2,
+        )
 
 
 class QueryHead(nn.Module):
@@ -174,6 +362,21 @@ class QueryHead(nn.Module):
                  query_traj_num_steps=0,
                  query_traj_residual_max_m=(8.0, 8.0),
                  query_traj_prior_detach=True,
+                 query_traj_num_modes=1,
+                 query_traj_decoder_type="offset",
+                 query_traj_bernstein_degree=3,
+                 query_traj_use_stationary_mode=False,
+                 query_traj_use_cv_mode=False,
+                 query_traj_static_gate_enabled=False,
+                 query_traj_static_gate_threshold=0.5,
+                 query_traj_derivative_routing_enabled=False,
+                 query_traj_derivative_routing_hidden_dim=0,
+                 query_traj_anchor_refine_enabled=False,
+                 query_traj_xy_refine_enabled=False,
+                 query_traj_xy_refine_num_layers=2,
+                 query_traj_xy_refine_hidden_dim=0,
+                 query_traj_endpoint_conditioning=False,
+                 query_traj_mode_infer_policy="argmax",
                  num_query_classes=3,
                  query_class_ids=None,
                  query_class_names=None,
@@ -236,6 +439,21 @@ class QueryHead(nn.Module):
             )
         self.query_traj_residual_max_m = tuple(float(v) for v in query_traj_residual_max_m)
         self.query_traj_prior_detach = bool(query_traj_prior_detach)
+        self.query_traj_num_modes = int(query_traj_num_modes)
+        self.query_traj_decoder_type = str(query_traj_decoder_type).lower()
+        self.query_traj_bernstein_degree = int(query_traj_bernstein_degree)
+        self.query_traj_use_stationary_mode = bool(query_traj_use_stationary_mode)
+        self.query_traj_use_cv_mode = bool(query_traj_use_cv_mode)
+        self.query_traj_static_gate_enabled = bool(query_traj_static_gate_enabled)
+        self.query_traj_static_gate_threshold = float(query_traj_static_gate_threshold)
+        self.query_traj_derivative_routing_enabled = bool(query_traj_derivative_routing_enabled)
+        self.query_traj_derivative_routing_hidden_dim = int(query_traj_derivative_routing_hidden_dim)
+        self.query_traj_anchor_refine_enabled = bool(query_traj_anchor_refine_enabled)
+        self.query_traj_xy_refine_enabled = bool(query_traj_xy_refine_enabled)
+        self.query_traj_xy_refine_num_layers = int(query_traj_xy_refine_num_layers)
+        self.query_traj_xy_refine_hidden_dim = int(query_traj_xy_refine_hidden_dim)
+        self.query_traj_endpoint_conditioning = bool(query_traj_endpoint_conditioning)
+        self.query_traj_mode_infer_policy = str(query_traj_mode_infer_policy).lower()
         if len(self.query_traj_residual_max_m) != 2:
             raise ValueError(
                 "query_traj_residual_max_m must be (x,y), "
@@ -247,6 +465,78 @@ class QueryHead(nn.Module):
                     "query_traj_residual_max_m must be positive when query_traj_num_steps > 0, "
                     f"got {self.query_traj_residual_max_m}"
                 )
+        if self.query_traj_num_modes <= 0:
+            raise ValueError(
+                f"query_traj_num_modes must be >= 1, got {self.query_traj_num_modes}"
+            )
+        if self.query_traj_decoder_type not in ("offset", "bernstein"):
+            raise ValueError(
+                "query_traj_decoder_type must be one of {'offset','bernstein'}, "
+                f"got {self.query_traj_decoder_type!r}"
+            )
+        if self.query_traj_bernstein_degree <= 0:
+            raise ValueError(
+                f"query_traj_bernstein_degree must be >= 1, got {self.query_traj_bernstein_degree}"
+            )
+        if self.query_traj_mode_infer_policy not in ("argmax", "family_logsumexp_argmax"):
+            raise ValueError(
+                "query_traj_mode_infer_policy must be one of "
+                "{'argmax', 'family_logsumexp_argmax'}, "
+                f"got {self.query_traj_mode_infer_policy!r}"
+            )
+        if self.query_traj_mode_infer_policy == "family_logsumexp_argmax":
+            if not self.query_traj_use_stationary_mode:
+                raise ValueError(
+                    "family_logsumexp_argmax requires query_traj_use_stationary_mode=True"
+                )
+            if self.query_traj_use_cv_mode:
+                raise ValueError(
+                    "family_logsumexp_argmax does not support query_traj_use_cv_mode=True"
+                )
+            if self.query_traj_num_modes != 5:
+                raise ValueError(
+                    "family_logsumexp_argmax requires query_traj_num_modes=5 "
+                    f"(static=0, straight=1:3, turn=3:5), got {self.query_traj_num_modes}"
+                )
+        self.query_traj_builtin_mode_count = (
+            int(self.query_traj_use_stationary_mode) + int(self.query_traj_use_cv_mode)
+        )
+        if self.query_traj_num_modes < self.query_traj_builtin_mode_count:
+            raise ValueError(
+                "query_traj_num_modes must cover stationary/CV modes, "
+                f"got num_modes={self.query_traj_num_modes} < builtin={self.query_traj_builtin_mode_count}"
+            )
+        self.query_traj_learned_num_modes = (
+            self.query_traj_num_modes - self.query_traj_builtin_mode_count
+        )
+        if self.query_traj_static_gate_enabled:
+            if not self.query_traj_use_stationary_mode:
+                raise ValueError("query_traj_static_gate_enabled requires query_traj_use_stationary_mode=True")
+            if self.query_traj_use_cv_mode:
+                raise ValueError("query_traj_static_gate_enabled currently does not support CV mode")
+            if self.query_traj_endpoint_conditioning:
+                raise ValueError("query_traj_static_gate_enabled does not support endpoint conditioning")
+            if self.query_traj_learned_num_modes <= 0:
+                raise ValueError("query_traj_static_gate_enabled requires learned trajectory modes")
+            if not (0.0 < self.query_traj_static_gate_threshold < 1.0):
+                raise ValueError(
+                    "query_traj_static_gate_threshold must be in (0,1), "
+                    f"got {self.query_traj_static_gate_threshold}"
+                )
+        if (
+            self.query_traj_decoder_type == "bernstein"
+            and self.query_traj_endpoint_conditioning
+        ):
+            raise ValueError("bernstein trajectory decoder does not support endpoint conditioning")
+        if self.query_traj_decoder_type == "bernstein":
+            self.query_traj_derivative_router_input_dim = (
+                ((self.query_traj_bernstein_degree + 1) * 2)
+                + (self.query_traj_bernstein_degree * 2)
+                + (max(0, self.query_traj_bernstein_degree - 1) * 2)
+                + 4
+            )
+        else:
+            self.query_traj_derivative_router_input_dim = 4
         self.num_query_classes = int(num_query_classes)
         if query_class_ids is None:
             query_class_ids = tuple(range(self.num_query_classes))
@@ -409,16 +699,144 @@ class QueryHead(nn.Module):
             out_dim=self.query_depth_num_bins,
         )
         self.query_traj_head = None
+        self.query_traj_endpoint_head = None
+        self.query_traj_anchor_encoder = None
+        self.query_traj_anchor_corr_head = None
+        self.query_traj_anchor_gate_head = None
+        self.query_traj_xy_refine_encoder = None
+        self.query_traj_xy_refine_corr_head = None
+        self.query_traj_xy_refine_gate_head = None
+        self.query_traj_derivative_router = None
+        self.query_traj_static_gate_head = None
         self.query_traj_input_steps = max(0, int(self.num_past_frames) - 1) + max(
             0, int(self.query_traj_num_steps)
         )
         self.query_traj_input_dim = int(self.embed_dim) + 2
+        traj_head_num_modes = (
+            self.query_traj_learned_num_modes
+            if self.query_traj_static_gate_enabled
+            else self.query_traj_num_modes
+        )
         if self.query_traj_num_steps > 0:
-            self.query_traj_head = TrajectoryHead(
-                input_dim=(self.query_traj_input_steps * self.query_traj_input_dim),
-                hidden_dim=self.embed_dim,
-                out_dim=(self.query_traj_num_steps * 2),
-            )
+            if self.query_traj_static_gate_enabled:
+                self.query_traj_static_gate_head = MLP(
+                    in_dim=(self.query_traj_input_steps * self.query_traj_input_dim),
+                    hidden_dim=self.embed_dim,
+                    out_dim=1,
+                    num_layers=2,
+                    dropout=0.0,
+                    use_ln=True,
+                )
+            if self.query_traj_endpoint_conditioning:
+                self.query_traj_endpoint_head = EndpointHead(
+                    input_dim=(self.query_traj_input_steps * self.query_traj_input_dim),
+                    hidden_dim=self.embed_dim,
+                    num_modes=traj_head_num_modes,
+                    num_learned_modes=self.query_traj_learned_num_modes,
+                )
+                if self.query_traj_learned_num_modes > 0:
+                    self.query_traj_head = TrajectoryDecoderHead(
+                        input_dim=(self.query_traj_input_steps * self.query_traj_input_dim) + 2,
+                        hidden_dim=self.embed_dim,
+                        num_future_steps=self.query_traj_num_steps,
+                    )
+            else:
+                if self.query_traj_decoder_type == "bernstein":
+                    self.query_traj_head = BernsteinTrajectoryHead(
+                        input_dim=(self.query_traj_input_steps * self.query_traj_input_dim),
+                        hidden_dim=self.embed_dim,
+                        bernstein_degree=self.query_traj_bernstein_degree,
+                        num_modes=traj_head_num_modes,
+                        num_learned_modes=self.query_traj_learned_num_modes,
+                    )
+                else:
+                    self.query_traj_head = TrajectoryHead(
+                        input_dim=(self.query_traj_input_steps * self.query_traj_input_dim),
+                        hidden_dim=self.embed_dim,
+                        num_future_steps=self.query_traj_num_steps,
+                        num_modes=traj_head_num_modes,
+                        num_learned_modes=self.query_traj_learned_num_modes,
+                    )
+            if (
+                self.query_traj_derivative_routing_enabled
+                and self.query_traj_learned_num_modes > 0
+            ):
+                router_hidden_dim = max(
+                    1,
+                    self.query_traj_derivative_routing_hidden_dim
+                    if self.query_traj_derivative_routing_hidden_dim > 0
+                    else self.embed_dim,
+                )
+                self.query_traj_derivative_router = MLP(
+                    in_dim=self.query_traj_derivative_router_input_dim,
+                    hidden_dim=router_hidden_dim,
+                    out_dim=1,
+                    num_layers=2,
+                    dropout=0.0,
+                    use_ln=True,
+                )
+            if self.query_traj_anchor_refine_enabled:
+                anchor_steps = int(self.num_past_frames) + int(self.query_traj_num_steps)
+                anchor_input_dim = max(1, anchor_steps * 2)
+                self.query_traj_anchor_encoder = MLP(
+                    in_dim=anchor_input_dim,
+                    hidden_dim=self.embed_dim,
+                    out_dim=self.embed_dim,
+                    num_layers=2,
+                    dropout=0.0,
+                    use_ln=True,
+                )
+                self.query_traj_anchor_corr_head = MLP(
+                    in_dim=self.embed_dim,
+                    hidden_dim=self.embed_dim,
+                    out_dim=int(self.query_traj_num_steps) * 2,
+                    num_layers=2,
+                    dropout=0.0,
+                    use_ln=True,
+                )
+                self.query_traj_anchor_gate_head = MLP(
+                    in_dim=self.embed_dim,
+                    hidden_dim=self.embed_dim,
+                    out_dim=int(self.query_traj_num_steps),
+                    num_layers=2,
+                    dropout=0.0,
+                    use_ln=True,
+                )
+            if self.query_traj_xy_refine_enabled:
+                refine_hidden_dim = int(self.query_traj_xy_refine_hidden_dim)
+                if refine_hidden_dim <= 0:
+                    refine_hidden_dim = int(self.embed_dim)
+                refine_input_dim = (
+                    (int(self.num_past_frames) + int(self.query_traj_num_steps)) * 2
+                    + int(self.embed_dim)
+                    + int(self.num_query_classes)
+                    + 1
+                )
+                refine_num_layers = max(1, int(self.query_traj_xy_refine_num_layers))
+                self.query_traj_xy_refine_encoder = MLP(
+                    in_dim=refine_input_dim,
+                    hidden_dim=refine_hidden_dim,
+                    out_dim=refine_hidden_dim,
+                    num_layers=refine_num_layers,
+                    dropout=0.0,
+                    use_ln=True,
+                )
+                self.query_traj_xy_refine_corr_head = MLP(
+                    in_dim=refine_hidden_dim,
+                    hidden_dim=refine_hidden_dim,
+                    out_dim=int(self.query_traj_num_steps) * 2,
+                    num_layers=2,
+                    dropout=0.0,
+                    use_ln=True,
+                )
+                self.query_traj_xy_refine_gate_head = MLP(
+                    in_dim=refine_hidden_dim,
+                    hidden_dim=refine_hidden_dim,
+                    out_dim=int(self.query_traj_num_steps),
+                    num_layers=2,
+                    dropout=0.0,
+                    use_ln=True,
+                )
 
         # W,b of center-head final linear are scaled to widen initial center spread.
         center_last = self.center_head.mlp.net[-1]
@@ -462,7 +880,7 @@ class QueryHead(nn.Module):
         query_feat_tqd: torch.Tensor,
         centers_world_tq3: torch.Tensor,
     ):
-        if self.query_traj_head is None:
+        if self.query_traj_head is None and self.query_traj_endpoint_head is None:
             return None
         if (not torch.is_tensor(query_feat_tqd)) or query_feat_tqd.dim() != 3:
             raise ValueError("query_feat_tqd must be [T,Q,D] for trajectory input")
@@ -519,13 +937,310 @@ class QueryHead(nn.Module):
         motion_prior_tq2 = motion_prior_tq2.clamp(min=-1.0, max=1.0)
         return torch.cat([motion_feat_tqd, motion_prior_tq2], dim=-1).contiguous()
 
+    def _prepend_zero_control_point(self, ctrl_qmcp2: torch.Tensor) -> torch.Tensor:
+        if (not torch.is_tensor(ctrl_qmcp2)) or ctrl_qmcp2.dim() != 4:
+            return None
+        zero_qm12 = ctrl_qmcp2.new_zeros(
+            (int(ctrl_qmcp2.shape[0]), int(ctrl_qmcp2.shape[1]), 1, 2)
+        )
+        return torch.cat([zero_qm12, ctrl_qmcp2], dim=2)
+
+    def _build_bernstein_basis(self, num_steps: int, device, dtype):
+        num_steps = int(num_steps)
+        degree = int(self.query_traj_bernstein_degree)
+        if num_steps <= 0:
+            return None
+        tau_f = torch.linspace(
+            1.0 / float(num_steps),
+            1.0,
+            steps=num_steps,
+            device=device,
+            dtype=dtype,
+        )
+        basis = []
+        for idx in range(degree + 1):
+            coeff = float(math.comb(degree, idx))
+            basis.append(
+                coeff
+                * torch.pow(tau_f, idx)
+                * torch.pow((1.0 - tau_f), degree - idx)
+            )
+        return torch.stack(basis, dim=-1)
+
+    def _sample_bernstein_absolute_offsets(self, ctrl_qmcp2: torch.Tensor):
+        if (not torch.is_tensor(ctrl_qmcp2)) or ctrl_qmcp2.dim() != 4:
+            return None
+        basis_fc = self._build_bernstein_basis(
+            int(self.query_traj_num_steps),
+            device=ctrl_qmcp2.device,
+            dtype=ctrl_qmcp2.dtype,
+        )
+        if basis_fc is None:
+            return None
+        return torch.einsum("fc,qmcp->qmfp", basis_fc, ctrl_qmcp2)
+
+    @staticmethod
+    def _absolute_to_step_offsets(abs_qmfp2: torch.Tensor):
+        if (not torch.is_tensor(abs_qmfp2)) or abs_qmfp2.dim() != 4:
+            return None
+        deltas_qmfp2 = abs_qmfp2.clone()
+        if int(abs_qmfp2.shape[2]) > 1:
+            deltas_qmfp2[:, :, 1:, :] = abs_qmfp2[:, :, 1:, :] - abs_qmfp2[:, :, :-1, :]
+        return deltas_qmfp2
+
+    def _compute_bernstein_derivative_ctrl(self, ctrl_qmcp2: torch.Tensor, order: int = 1):
+        if (not torch.is_tensor(ctrl_qmcp2)) or ctrl_qmcp2.dim() != 4:
+            return None
+        out = ctrl_qmcp2
+        degree = int(self.query_traj_bernstein_degree)
+        for cur_order in range(int(order)):
+            cur_degree = degree - cur_order
+            if cur_degree <= 0 or int(out.shape[2]) <= 1:
+                return out.new_zeros((int(out.shape[0]), int(out.shape[1]), 0, 2))
+            out = (out[:, :, 1:, :] - out[:, :, :-1, :]) * float(cur_degree)
+        return out
+
+    @staticmethod
+    def _build_traj_scalar_summary_from_deltas(
+        traj_deltas_qmfp2: torch.Tensor,
+        traj_max_xy: torch.Tensor,
+    ):
+        if (
+            (not torch.is_tensor(traj_deltas_qmfp2))
+            or traj_deltas_qmfp2.dim() != 4
+            or (not torch.is_tensor(traj_max_xy))
+        ):
+            return None
+        step_norm_qmf = torch.norm(traj_deltas_qmfp2, p=2, dim=-1)
+        path_length_qm = step_norm_qmf.sum(dim=-1)
+        mean_speed_qm = path_length_qm / float(max(1, int(traj_deltas_qmfp2.shape[2])))
+        endpoint_vec_qm2 = traj_deltas_qmfp2.sum(dim=2)
+        endpoint_disp_qm = torch.norm(endpoint_vec_qm2, p=2, dim=-1)
+        straightness_qm = endpoint_disp_qm / path_length_qm.clamp_min(1e-6)
+        xy_scale = float(torch.norm(traj_max_xy.reshape(-1), p=2).item())
+        xy_scale = max(xy_scale, 1e-6)
+        step_scale = float(max(1, int(traj_deltas_qmfp2.shape[2])))
+        return torch.stack(
+            [
+                mean_speed_qm / xy_scale,
+                endpoint_disp_qm / (xy_scale * step_scale),
+                path_length_qm / (xy_scale * step_scale),
+                straightness_qm.clamp(0.0, 1.0),
+            ],
+            dim=-1,
+        )
+
+    def _infer_traj_mode_idx_from_logits(self, traj_mode_logits_qk: torch.Tensor) -> torch.Tensor:
+        if (not torch.is_tensor(traj_mode_logits_qk)) or traj_mode_logits_qk.dim() != 2:
+            raise ValueError("traj_mode_logits_qk must be a [Q, K] tensor")
+        traj_mode_logits_qk = traj_mode_logits_qk.to(torch.float32)
+        if self.query_traj_mode_infer_policy == "argmax":
+            return torch.argmax(traj_mode_logits_qk, dim=-1)
+        static_score_q = traj_mode_logits_qk[:, 0]
+        straight_score_q = torch.logsumexp(traj_mode_logits_qk[:, 1:3], dim=-1)
+        turn_score_q = torch.logsumexp(traj_mode_logits_qk[:, 3:5], dim=-1)
+        family_scores_qf = torch.stack(
+            (static_score_q, straight_score_q, turn_score_q),
+            dim=-1,
+        )
+        family_idx_q = torch.argmax(family_scores_qf, dim=-1)
+        straight_mode_idx_q = torch.argmax(traj_mode_logits_qk[:, 1:3], dim=-1) + 1
+        turn_mode_idx_q = torch.argmax(traj_mode_logits_qk[:, 3:5], dim=-1) + 3
+        traj_mode_idx_q = traj_mode_logits_qk.new_zeros(
+            (int(traj_mode_logits_qk.shape[0]),),
+            dtype=torch.long,
+        )
+        traj_mode_idx_q = torch.where(
+            family_idx_q == 1,
+            straight_mode_idx_q,
+            traj_mode_idx_q,
+        )
+        traj_mode_idx_q = torch.where(
+            family_idx_q == 2,
+            turn_mode_idx_q,
+            traj_mode_idx_q,
+        )
+        return traj_mode_idx_q
+
+    def _build_bernstein_router_features(
+        self,
+        ctrl_qmcp2: torch.Tensor,
+        abs_qmfp2: torch.Tensor,
+        traj_max_xy: torch.Tensor,
+    ):
+        if (
+            (not torch.is_tensor(ctrl_qmcp2))
+            or ctrl_qmcp2.dim() != 4
+            or (not torch.is_tensor(abs_qmfp2))
+            or abs_qmfp2.dim() != 4
+        ):
+            return None, None, None, None
+        d1_ctrl_qmcp2 = self._compute_bernstein_derivative_ctrl(ctrl_qmcp2, order=1)
+        d2_ctrl_qmcp2 = self._compute_bernstein_derivative_ctrl(ctrl_qmcp2, order=2)
+        traj_scale_12 = traj_max_xy.reshape(1, 1, 2).clamp_min(1e-6)
+        ctrl_norm = (ctrl_qmcp2 / traj_scale_12.unsqueeze(2)).reshape(int(ctrl_qmcp2.shape[0]), int(ctrl_qmcp2.shape[1]), -1)
+        d1_norm = (d1_ctrl_qmcp2 / traj_scale_12.unsqueeze(2)).reshape(int(ctrl_qmcp2.shape[0]), int(ctrl_qmcp2.shape[1]), -1)
+        d2_norm = (d2_ctrl_qmcp2 / traj_scale_12.unsqueeze(2)).reshape(int(ctrl_qmcp2.shape[0]), int(ctrl_qmcp2.shape[1]), -1)
+
+        step_offsets_qmfp2 = self._absolute_to_step_offsets(abs_qmfp2)
+        step_norm_qmf = torch.norm(step_offsets_qmfp2, p=2, dim=-1)
+        path_length_qm = step_norm_qmf.sum(dim=-1)
+        mean_speed_qm = path_length_qm / float(max(1, int(abs_qmfp2.shape[2])))
+        endpoint_qm2 = abs_qmfp2[:, :, -1, :]
+        endpoint_disp_qm = torch.norm(endpoint_qm2, p=2, dim=-1)
+        straightness_qm = endpoint_disp_qm / path_length_qm.clamp_min(1e-6)
+        xy_scale = float(torch.norm(traj_scale_12.reshape(-1), p=2).item())
+        xy_scale = max(xy_scale, 1e-6)
+        step_scale = float(max(1, int(abs_qmfp2.shape[2])))
+        scalar_summary_qm4 = torch.stack(
+            [
+                mean_speed_qm / xy_scale,
+                endpoint_disp_qm / (xy_scale * step_scale),
+                path_length_qm / (xy_scale * step_scale),
+                straightness_qm.clamp(0.0, 1.0),
+            ],
+            dim=-1,
+        )
+        router_input_qmd = torch.cat([ctrl_norm, d1_norm, d2_norm, scalar_summary_qm4], dim=-1)
+        return router_input_qmd, scalar_summary_qm4, d1_ctrl_qmcp2, d2_ctrl_qmcp2
+
+    def _build_offset_router_features(
+        self,
+        traj_deltas_qmfp2: torch.Tensor,
+        traj_max_xy: torch.Tensor,
+    ):
+        scalar_summary_qm4 = self._build_traj_scalar_summary_from_deltas(
+            traj_deltas_qmfp2,
+            traj_max_xy,
+        )
+        if scalar_summary_qm4 is None:
+            return None, None
+        return scalar_summary_qm4, scalar_summary_qm4
+
+    def _build_trajectory_mode_debug_stats(
+        self,
+        traj_mode_logits_qk: torch.Tensor,
+        learned_ctrl_qmcp2: torch.Tensor = None,
+        learned_d1_ctrl_qmcp2: torch.Tensor = None,
+        learned_d2_ctrl_qmcp2: torch.Tensor = None,
+        learned_scalar_summary_qm4: torch.Tensor = None,
+        learned_router_score_qm: torch.Tensor = None,
+    ):
+        if (not torch.is_tensor(traj_mode_logits_qk)) or traj_mode_logits_qk.dim() != 2:
+            return None
+        q_count, mode_count = [int(v) for v in traj_mode_logits_qk.shape]
+        if q_count <= 0 or mode_count <= 0:
+            return None
+        learned_start_idx = int(self.query_traj_builtin_mode_count)
+        learned_mode_count = max(0, mode_count - learned_start_idx)
+        has_learned_summary = (
+            torch.is_tensor(learned_scalar_summary_qm4)
+            and learned_scalar_summary_qm4.dim() == 3
+            and int(learned_scalar_summary_qm4.shape[2]) == 4
+            and int(learned_scalar_summary_qm4.shape[1]) == learned_mode_count
+        )
+        has_learned_ctrl = (
+            torch.is_tensor(learned_ctrl_qmcp2)
+            and torch.is_tensor(learned_d1_ctrl_qmcp2)
+            and torch.is_tensor(learned_d2_ctrl_qmcp2)
+            and int(learned_ctrl_qmcp2.shape[1]) == learned_mode_count
+            and int(learned_d1_ctrl_qmcp2.shape[1]) == learned_mode_count
+            and int(learned_d2_ctrl_qmcp2.shape[1]) == learned_mode_count
+        )
+        out = {}
+        zeros = traj_mode_logits_qk.new_zeros(())
+        out["dbg_query_traj_mode_count"] = traj_mode_logits_qk.new_tensor(float(mode_count))
+        out["dbg_query_traj_builtin_mode_count"] = traj_mode_logits_qk.new_tensor(float(learned_start_idx))
+        out["dbg_query_traj_learned_mode_count"] = traj_mode_logits_qk.new_tensor(float(learned_mode_count))
+        out["dbg_query_traj_bernstein_degree"] = traj_mode_logits_qk.new_tensor(
+            float(self.query_traj_bernstein_degree if self.query_traj_decoder_type == "bernstein" else 0.0)
+        )
+        if has_learned_summary:
+            out["dbg_query_traj_summary_mean_speed"] = learned_scalar_summary_qm4[..., 0].mean()
+            out["dbg_query_traj_summary_endpoint_displacement"] = learned_scalar_summary_qm4[..., 1].mean()
+            out["dbg_query_traj_summary_path_length"] = learned_scalar_summary_qm4[..., 2].mean()
+            out["dbg_query_traj_summary_straightness_ratio"] = learned_scalar_summary_qm4[..., 3].mean()
+        else:
+            out["dbg_query_traj_summary_mean_speed"] = zeros
+            out["dbg_query_traj_summary_endpoint_displacement"] = zeros
+            out["dbg_query_traj_summary_path_length"] = zeros
+            out["dbg_query_traj_summary_straightness_ratio"] = zeros
+
+        for mode_idx in range(mode_count):
+            learned_local_idx = mode_idx - learned_start_idx
+            out[f"dbg_query_traj_mode{mode_idx}_is_builtin"] = zeros.new_tensor(
+                float(1.0 if mode_idx < learned_start_idx else 0.0)
+            )
+            out[f"dbg_query_traj_mode{mode_idx}_is_stationary"] = zeros.new_tensor(
+                float(1.0 if (self.query_traj_use_stationary_mode and mode_idx == 0) else 0.0)
+            )
+            out[f"dbg_query_traj_mode{mode_idx}_is_cv"] = zeros.new_tensor(
+                float(
+                    1.0
+                    if (
+                        self.query_traj_use_cv_mode
+                        and mode_idx == int(self.query_traj_use_stationary_mode)
+                    )
+                    else 0.0
+                )
+            )
+            out[f"dbg_query_traj_mode{mode_idx}_is_learned"] = zeros.new_tensor(
+                float(1.0 if mode_idx >= learned_start_idx else 0.0)
+            )
+            out[f"dbg_query_traj_mode{mode_idx}_bernstein_degree"] = zeros.new_tensor(
+                float(
+                    self.query_traj_bernstein_degree
+                    if (
+                        self.query_traj_decoder_type == "bernstein"
+                        and mode_idx >= learned_start_idx
+                    )
+                    else 0.0
+                )
+            )
+            if has_learned_summary and 0 <= learned_local_idx < learned_mode_count:
+                scalar_q4 = learned_scalar_summary_qm4[:, learned_local_idx, :]
+                if has_learned_ctrl:
+                    ctrl_qcp2 = learned_ctrl_qmcp2[:, learned_local_idx, :, :]
+                    d1_qcp2 = learned_d1_ctrl_qmcp2[:, learned_local_idx, :, :]
+                    d2_qcp2 = learned_d2_ctrl_qmcp2[:, learned_local_idx, :, :]
+                score_q = (
+                    learned_router_score_qm[:, learned_local_idx]
+                    if torch.is_tensor(learned_router_score_qm)
+                    else traj_mode_logits_qk.new_zeros((q_count,))
+                )
+                out[f"dbg_query_traj_mode{mode_idx}_mean_speed"] = scalar_q4[:, 0].mean()
+                out[f"dbg_query_traj_mode{mode_idx}_endpoint_displacement"] = scalar_q4[:, 1].mean()
+                out[f"dbg_query_traj_mode{mode_idx}_path_length"] = scalar_q4[:, 2].mean()
+                out[f"dbg_query_traj_mode{mode_idx}_straightness_ratio"] = scalar_q4[:, 3].mean()
+                if has_learned_ctrl:
+                    out[f"dbg_query_traj_mode{mode_idx}_ctrl_abs_mean"] = ctrl_qcp2.abs().mean()
+                    out[f"dbg_query_traj_mode{mode_idx}_d1_ctrl_abs_mean"] = d1_qcp2.abs().mean()
+                    out[f"dbg_query_traj_mode{mode_idx}_d2_ctrl_abs_mean"] = d2_qcp2.abs().mean()
+                else:
+                    out[f"dbg_query_traj_mode{mode_idx}_ctrl_abs_mean"] = zeros
+                    out[f"dbg_query_traj_mode{mode_idx}_d1_ctrl_abs_mean"] = zeros
+                    out[f"dbg_query_traj_mode{mode_idx}_d2_ctrl_abs_mean"] = zeros
+                out[f"dbg_query_traj_mode{mode_idx}_score_mean"] = score_q.mean()
+                out[f"dbg_query_traj_mode{mode_idx}_score_abs_mean"] = score_q.abs().mean()
+            else:
+                out[f"dbg_query_traj_mode{mode_idx}_mean_speed"] = zeros
+                out[f"dbg_query_traj_mode{mode_idx}_endpoint_displacement"] = zeros
+                out[f"dbg_query_traj_mode{mode_idx}_path_length"] = zeros
+                out[f"dbg_query_traj_mode{mode_idx}_straightness_ratio"] = zeros
+                out[f"dbg_query_traj_mode{mode_idx}_ctrl_abs_mean"] = zeros
+                out[f"dbg_query_traj_mode{mode_idx}_d1_ctrl_abs_mean"] = zeros
+                out[f"dbg_query_traj_mode{mode_idx}_d2_ctrl_abs_mean"] = zeros
+                out[f"dbg_query_traj_mode{mode_idx}_score_mean"] = zeros
+                out[f"dbg_query_traj_mode{mode_idx}_score_abs_mean"] = zeros
+        return out
+
     def _predict_trajectory_from_inputs(
         self,
         motion_input_tqd2: torch.Tensor,
         query_feat_tqd: torch.Tensor,
     ):
-        if self.query_traj_head is None or motion_input_tqd2 is None:
-            return None, None
+        if motion_input_tqd2 is None:
+            return None, None, None, None, None
         if (not torch.is_tensor(motion_input_tqd2)) or motion_input_tqd2.dim() != 3:
             raise ValueError("motion_input_tqd2 must be [S,Q,D+2]")
         s_count, q_count, d_count = [int(v) for v in motion_input_tqd2.shape]
@@ -539,13 +1254,451 @@ class QueryHead(nn.Module):
             )
         motion_input_qsd = motion_input_tqd2.permute(1, 0, 2).contiguous()
         motion_input_qd = motion_input_qsd.reshape(q_count, s_count * d_count)
-        traj_logits_qf2 = self.query_traj_head(motion_input_qd).reshape(
-            q_count, int(self.query_traj_num_steps), 2
+        future_steps = int(self.query_traj_num_steps)
+        mode_count = int(self.query_traj_num_modes)
+        traj_logits_qkf2 = motion_input_tqd2.new_zeros((q_count, mode_count, future_steps, 2)).to(torch.float32)
+        traj_deltas_qkf2 = motion_input_tqd2.new_zeros((q_count, mode_count, future_steps, 2)).to(torch.float32)
+        traj_max_xy = query_feat_tqd.new_tensor(self.query_traj_residual_max_m).view(1, 1, 1, 2).to(torch.float32)
+        endpoint_logits_qm2 = None
+        endpoint_deltas_qm2 = None
+        endpoint_logits_qk2 = motion_input_tqd2.new_zeros((q_count, mode_count, 2)).to(torch.float32)
+        endpoint_deltas_qk2 = motion_input_tqd2.new_zeros((q_count, mode_count, 2)).to(torch.float32)
+        traj_mode_logits_qk = None
+        traj_mode_base_logits_qk = None
+        traj_mode_router_score_qk = motion_input_qd.new_zeros((q_count, mode_count)).to(torch.float32)
+        traj_mode_debug_stats = None
+        traj_static_gate_logits_q = None
+        traj_static_gate_probs_q = None
+        traj_moving_mode_logits_qm = None
+        learned_router_score_qm = None
+        bernstein_ctrl_qkcp2 = None
+        bernstein_d1_ctrl_qkcp2 = None
+        bernstein_d2_ctrl_qkcp2 = None
+        bernstein_scalar_summary_qk4 = None
+
+        mode_cursor = 0
+        if bool(self.query_traj_use_stationary_mode):
+            mode_cursor += 1
+
+        if bool(self.query_traj_use_cv_mode):
+            hist_steps = max(0, int(self.num_past_frames) - 1)
+            last_vel_q2 = motion_input_tqd2.new_zeros((q_count, 2)).to(torch.float32)
+            if hist_steps > 0 and int(motion_input_tqd2.shape[0]) >= hist_steps:
+                last_vel_q2 = motion_input_tqd2[hist_steps - 1, :, -2:].to(torch.float32)
+                last_vel_q2 = last_vel_q2 * traj_max_xy[0, 0, 0]
+            traj_deltas_qkf2[:, mode_cursor, :, :] = last_vel_q2.unsqueeze(1).expand(-1, future_steps, -1)
+            traj_logits_qkf2[:, mode_cursor, :, :] = traj_deltas_qkf2[:, mode_cursor, :, :]
+            endpoint_deltas_qk2[:, mode_cursor, :] = last_vel_q2 * float(future_steps)
+            endpoint_logits_qk2[:, mode_cursor, :] = endpoint_deltas_qk2[:, mode_cursor, :]
+            mode_cursor += 1
+
+        if self.query_traj_static_gate_enabled and self.query_traj_static_gate_head is not None:
+            traj_static_gate_logits_q = self.query_traj_static_gate_head(motion_input_qd).reshape(q_count).to(torch.float32)
+
+        if bool(self.query_traj_endpoint_conditioning):
+            if self.query_traj_endpoint_head is None:
+                return None, None, None, None, None
+            endpoint_logits_qm2, traj_mode_logits_qk = self.query_traj_endpoint_head(motion_input_qd)
+            if endpoint_logits_qm2 is not None and int(endpoint_logits_qm2.shape[1]) > 0:
+                learned_count = int(endpoint_logits_qm2.shape[1])
+                endpoint_max_xy = traj_max_xy[0, 0, 0] * float(max(1, future_steps))
+                endpoint_deltas_qm2 = torch.tanh(endpoint_logits_qm2.to(torch.float32)) * endpoint_max_xy.view(1, 1, 2)
+                endpoint_logits_qk2[:, mode_cursor:(mode_cursor + learned_count), :] = endpoint_logits_qm2.to(torch.float32)
+                endpoint_deltas_qk2[:, mode_cursor:(mode_cursor + learned_count), :] = endpoint_deltas_qm2
+                if self.query_traj_head is not None:
+                    motion_input_qmd = motion_input_qd.unsqueeze(1).expand(-1, learned_count, -1)
+                    traj_decoder_input_qmd = torch.cat([motion_input_qmd, endpoint_deltas_qm2], dim=-1)
+                    traj_decoder_logits = self.query_traj_head(
+                        traj_decoder_input_qmd.reshape(q_count * learned_count, -1)
+                    ).reshape(q_count, learned_count, future_steps, 2)
+                    learned_deltas_qmf2 = torch.tanh(traj_decoder_logits.to(torch.float32)) * traj_max_xy
+                    traj_logits_qkf2[:, mode_cursor:(mode_cursor + learned_count), :, :] = traj_decoder_logits.to(torch.float32)
+                    traj_deltas_qkf2[:, mode_cursor:(mode_cursor + learned_count), :, :] = learned_deltas_qmf2
+        else:
+            if self.query_traj_head is None:
+                return None, None, None, None, None
+            if self.query_traj_decoder_type == "bernstein":
+                learned_raw_qmcp2, traj_mode_logits_qk = self.query_traj_head(motion_input_qd)
+                if learned_raw_qmcp2 is not None and int(learned_raw_qmcp2.shape[1]) > 0:
+                    learned_count = int(learned_raw_qmcp2.shape[1])
+                    learned_ctrl_qmcp2 = torch.tanh(learned_raw_qmcp2.to(torch.float32)) * traj_max_xy[0, 0, 0].view(1, 1, 1, 2)
+                    learned_full_ctrl_qmcp2 = self._prepend_zero_control_point(learned_ctrl_qmcp2)
+                    learned_abs_qmfp2 = self._sample_bernstein_absolute_offsets(learned_full_ctrl_qmcp2)
+                    learned_deltas_qmfp2 = self._absolute_to_step_offsets(learned_abs_qmfp2)
+                    traj_logits_qkf2[:, mode_cursor:(mode_cursor + learned_count), :, :] = learned_deltas_qmfp2.to(torch.float32)
+                    traj_deltas_qkf2[:, mode_cursor:(mode_cursor + learned_count), :, :] = learned_deltas_qmfp2.to(torch.float32)
+                    endpoint_deltas_qk2[:, mode_cursor:(mode_cursor + learned_count), :] = learned_abs_qmfp2[:, :, -1, :].to(torch.float32)
+                    endpoint_logits_qk2[:, mode_cursor:(mode_cursor + learned_count), :] = endpoint_deltas_qk2[
+                        :, mode_cursor:(mode_cursor + learned_count), :
+                    ]
+                    bernstein_ctrl_qkcp2 = learned_full_ctrl_qmcp2
+                    (
+                        router_input_qmd,
+                        bernstein_scalar_summary_qk4,
+                        bernstein_d1_ctrl_qkcp2,
+                        bernstein_d2_ctrl_qkcp2,
+                    ) = self._build_bernstein_router_features(
+                        learned_full_ctrl_qmcp2,
+                        learned_abs_qmfp2,
+                        traj_max_xy[0, 0, 0],
+                    )
+                    if (
+                        self.query_traj_derivative_router is not None
+                        and torch.is_tensor(router_input_qmd)
+                        and int(router_input_qmd.shape[-1]) == int(self.query_traj_derivative_router_input_dim)
+                    ):
+                        learned_router_score_qm = self.query_traj_derivative_router(
+                            router_input_qmd.reshape(q_count * learned_count, -1)
+                        ).reshape(q_count, learned_count).to(torch.float32)
+                        traj_mode_router_score_qk[
+                            :, mode_cursor:(mode_cursor + learned_count)
+                        ] = learned_router_score_qm
+                        bernstein_scalar_summary_qk4 = bernstein_scalar_summary_qk4.to(torch.float32)
+                    else:
+                        learned_router_score_qm = None
+                    if not self.query_traj_static_gate_enabled:
+                        traj_mode_debug_stats = self._build_trajectory_mode_debug_stats(
+                            traj_mode_logits_qk if torch.is_tensor(traj_mode_logits_qk) else motion_input_qd.new_zeros((q_count, mode_count)),
+                            learned_ctrl_qmcp2=bernstein_ctrl_qkcp2,
+                            learned_d1_ctrl_qmcp2=bernstein_d1_ctrl_qkcp2,
+                            learned_d2_ctrl_qmcp2=bernstein_d2_ctrl_qkcp2,
+                            learned_scalar_summary_qm4=bernstein_scalar_summary_qk4,
+                            learned_router_score_qm=learned_router_score_qm,
+                        )
+            else:
+                learned_logits_qmf2, traj_mode_logits_qk = self.query_traj_head(motion_input_qd)
+                if learned_logits_qmf2 is not None and int(learned_logits_qmf2.shape[1]) > 0:
+                    learned_count = int(learned_logits_qmf2.shape[1])
+                    learned_deltas_qmf2 = torch.tanh(learned_logits_qmf2.to(torch.float32)) * traj_max_xy
+                    traj_logits_qkf2[:, mode_cursor:(mode_cursor + learned_count), :, :] = learned_logits_qmf2.to(torch.float32)
+                    traj_deltas_qkf2[:, mode_cursor:(mode_cursor + learned_count), :, :] = learned_deltas_qmf2
+                    if self.query_traj_derivative_router is not None:
+                        router_input_qmd, bernstein_scalar_summary_qk4 = self._build_offset_router_features(
+                            learned_deltas_qmf2,
+                            traj_max_xy[0, 0, 0],
+                        )
+                        if (
+                            torch.is_tensor(router_input_qmd)
+                            and int(router_input_qmd.shape[-1]) == int(self.query_traj_derivative_router_input_dim)
+                        ):
+                            learned_router_score_qm = self.query_traj_derivative_router(
+                                router_input_qmd.reshape(q_count * learned_count, -1)
+                            ).reshape(q_count, learned_count).to(torch.float32)
+                            traj_mode_router_score_qk[
+                                :, mode_cursor:(mode_cursor + learned_count)
+                            ] = learned_router_score_qm
+                        if not self.query_traj_static_gate_enabled:
+                            traj_mode_debug_stats = self._build_trajectory_mode_debug_stats(
+                                traj_mode_logits_qk if torch.is_tensor(traj_mode_logits_qk) else motion_input_qd.new_zeros((q_count, mode_count)),
+                                learned_scalar_summary_qm4=bernstein_scalar_summary_qk4,
+                                learned_router_score_qm=learned_router_score_qm,
+                            )
+
+        if traj_mode_logits_qk is None:
+            logits_mode_count = self.query_traj_learned_num_modes if self.query_traj_static_gate_enabled else mode_count
+            traj_mode_logits_qk = motion_input_qd.new_zeros((q_count, logits_mode_count)).to(torch.float32)
+        else:
+            traj_mode_logits_qk = traj_mode_logits_qk.to(torch.float32)
+        if self.query_traj_static_gate_enabled:
+            traj_moving_mode_logits_qm = traj_mode_logits_qk
+            traj_mode_base_logits_qk = motion_input_qd.new_zeros((q_count, mode_count)).to(torch.float32)
+            if int(self.query_traj_learned_num_modes) > 0:
+                traj_mode_base_logits_qk[:, mode_cursor:] = traj_moving_mode_logits_qm
+            if torch.is_tensor(traj_static_gate_logits_q):
+                traj_mode_base_logits_qk[:, 0] = traj_static_gate_logits_q
+            moving_mode_logits_qm = traj_moving_mode_logits_qm
+            if self.query_traj_derivative_router is not None:
+                moving_mode_logits_qm = moving_mode_logits_qm + traj_mode_router_score_qk[:, mode_cursor:]
+                if traj_mode_debug_stats is None:
+                    traj_mode_debug_stats = self._build_trajectory_mode_debug_stats(
+                        traj_mode_base_logits_qk,
+                        learned_ctrl_qmcp2=bernstein_ctrl_qkcp2,
+                        learned_d1_ctrl_qmcp2=bernstein_d1_ctrl_qkcp2,
+                        learned_d2_ctrl_qmcp2=bernstein_d2_ctrl_qkcp2,
+                        learned_scalar_summary_qm4=bernstein_scalar_summary_qk4,
+                        learned_router_score_qm=traj_mode_router_score_qk[:, mode_cursor:] if int(mode_count - mode_cursor) > 0 else None,
+                    )
+            traj_static_gate_probs_q = (
+                torch.sigmoid(traj_static_gate_logits_q)
+                if torch.is_tensor(traj_static_gate_logits_q)
+                else motion_input_qd.new_zeros((q_count,)).to(torch.float32)
+            )
+            moving_mode_probs_qm = F.softmax(moving_mode_logits_qm, dim=-1)
+            traj_mode_probs_qk = motion_input_qd.new_zeros((q_count, mode_count)).to(torch.float32)
+            traj_mode_probs_qk[:, 0] = traj_static_gate_probs_q
+            traj_mode_probs_qk[:, mode_cursor:] = (1.0 - traj_static_gate_probs_q).unsqueeze(-1) * moving_mode_probs_qm
+            traj_mode_logits_qk = torch.log(traj_mode_probs_qk.clamp_min(1e-6))
+            moving_mode_idx_q = torch.argmax(moving_mode_probs_qm, dim=-1) + mode_cursor
+            traj_mode_idx_q = torch.where(
+                traj_static_gate_probs_q >= float(self.query_traj_static_gate_threshold),
+                moving_mode_idx_q.new_zeros((q_count,)),
+                moving_mode_idx_q,
+            )
+        else:
+            traj_mode_base_logits_qk = traj_mode_logits_qk.clone()
+            if self.query_traj_derivative_router is not None:
+                traj_mode_logits_qk = traj_mode_logits_qk + traj_mode_router_score_qk
+                if traj_mode_debug_stats is None:
+                    traj_mode_debug_stats = self._build_trajectory_mode_debug_stats(
+                        traj_mode_logits_qk,
+                        learned_ctrl_qmcp2=bernstein_ctrl_qkcp2,
+                        learned_d1_ctrl_qmcp2=bernstein_d1_ctrl_qkcp2,
+                        learned_d2_ctrl_qmcp2=bernstein_d2_ctrl_qkcp2,
+                        learned_scalar_summary_qm4=bernstein_scalar_summary_qk4,
+                        learned_router_score_qm=traj_mode_router_score_qk[:, mode_cursor:] if int(mode_count - mode_cursor) > 0 else None,
+                    )
+            traj_mode_probs_qk = F.softmax(traj_mode_logits_qk, dim=-1)
+            traj_mode_idx_q = self._infer_traj_mode_idx_from_logits(traj_mode_logits_qk)
+        gather_idx = traj_mode_idx_q.view(q_count, 1, 1, 1).expand(-1, 1, future_steps, 2)
+        traj_deltas_qf2 = torch.gather(traj_deltas_qkf2, 1, gather_idx).squeeze(1)
+        traj_logits_qf2 = torch.gather(traj_logits_qkf2, 1, gather_idx).squeeze(1)
+        return (
+            traj_logits_qf2.permute(1, 0, 2).contiguous(),
+            traj_deltas_qf2.permute(1, 0, 2).contiguous(),
+            traj_logits_qkf2.permute(2, 0, 1, 3).contiguous(),
+            traj_deltas_qkf2.permute(2, 0, 1, 3).contiguous(),
+            {
+                "endpoint_logits_qk2": endpoint_logits_qk2.contiguous(),
+                "endpoint_deltas_qk2": endpoint_deltas_qk2.contiguous(),
+                "endpoint_logits_qm2": endpoint_logits_qm2.contiguous() if torch.is_tensor(endpoint_logits_qm2) else None,
+                "endpoint_deltas_qm2": endpoint_deltas_qm2.contiguous() if torch.is_tensor(endpoint_deltas_qm2) else None,
+                "traj_mode_base_logits_qk": traj_mode_base_logits_qk.contiguous(),
+                "traj_mode_router_score_qk": traj_mode_router_score_qk.contiguous(),
+                "traj_mode_logits_qk": traj_mode_logits_qk.contiguous(),
+                "traj_mode_probs_qk": traj_mode_probs_qk.contiguous(),
+                "traj_mode_idx_q": traj_mode_idx_q.contiguous(),
+                "traj_static_gate_logits_q": traj_static_gate_logits_q.contiguous() if torch.is_tensor(traj_static_gate_logits_q) else None,
+                "traj_static_gate_probs_q": traj_static_gate_probs_q.contiguous() if torch.is_tensor(traj_static_gate_probs_q) else None,
+                "traj_moving_mode_logits_qm": traj_moving_mode_logits_qm.contiguous() if torch.is_tensor(traj_moving_mode_logits_qm) else None,
+                "traj_mode_debug_stats": traj_mode_debug_stats,
+                "traj_mode_ctrl_qkcp2": bernstein_ctrl_qkcp2.contiguous() if torch.is_tensor(bernstein_ctrl_qkcp2) else None,
+                "traj_mode_d1_ctrl_qkcp2": bernstein_d1_ctrl_qkcp2.contiguous() if torch.is_tensor(bernstein_d1_ctrl_qkcp2) else None,
+                "traj_mode_d2_ctrl_qkcp2": bernstein_d2_ctrl_qkcp2.contiguous() if torch.is_tensor(bernstein_d2_ctrl_qkcp2) else None,
+                "traj_mode_summary_qk4": bernstein_scalar_summary_qk4.contiguous() if torch.is_tensor(bernstein_scalar_summary_qk4) else None,
+            },
         )
-        traj_logits_fq2 = traj_logits_qf2.permute(1, 0, 2).contiguous()
-        traj_max_xy = query_feat_tqd.new_tensor(self.query_traj_residual_max_m).view(1, 1, 2)
-        traj_deltas_fq2 = torch.tanh(traj_logits_fq2) * traj_max_xy
-        return traj_logits_fq2, traj_deltas_fq2
+
+    def refine_trajectory_with_gt_anchor(
+        self,
+        pred_traj_offsets_fq2: torch.Tensor,
+        pred_traj_offsets_fqk2: torch.Tensor,
+        pred_traj_mode_logits_qk: torch.Tensor,
+        inst_match_result: dict,
+        present_local_idx: int = 0,
+    ):
+        if (
+            (not bool(self.query_traj_anchor_refine_enabled))
+            or (self.query_traj_anchor_encoder is None)
+            or (self.query_traj_anchor_corr_head is None)
+            or (self.query_traj_anchor_gate_head is None)
+            or (not isinstance(inst_match_result, dict))
+            or int(self.query_traj_num_steps) <= 0
+        ):
+            return pred_traj_offsets_fq2, pred_traj_offsets_fqk2, None
+
+        matched_query_idx = inst_match_result.get("matched_query_idx", None)
+        matched_inst_idx = inst_match_result.get("matched_inst_idx", None)
+        gt_centers_tn3 = inst_match_result.get("gt_centers_tn3", None)
+        if (
+            (not torch.is_tensor(matched_query_idx))
+            or (not torch.is_tensor(matched_inst_idx))
+            or (not torch.is_tensor(gt_centers_tn3))
+            or gt_centers_tn3.dim() != 3
+            or matched_query_idx.numel() <= 0
+            or matched_query_idx.numel() != matched_inst_idx.numel()
+        ):
+            return pred_traj_offsets_fq2, pred_traj_offsets_fqk2, None
+
+        device = gt_centers_tn3.device
+        if torch.is_tensor(pred_traj_offsets_fqk2):
+            device = pred_traj_offsets_fqk2.device
+        elif torch.is_tensor(pred_traj_offsets_fq2):
+            device = pred_traj_offsets_fq2.device
+
+        anchor_steps = int(self.num_past_frames) + int(self.query_traj_num_steps)
+        present_local_idx = int(max(0, present_local_idx))
+        anchor_start_idx = max(0, present_local_idx - int(self.num_past_frames) + 1)
+        anchor_end_idx = anchor_start_idx + anchor_steps
+        if anchor_end_idx > int(gt_centers_tn3.shape[0]):
+            return pred_traj_offsets_fq2, pred_traj_offsets_fqk2, None
+
+        mq = matched_query_idx.to(device=device, dtype=torch.long).reshape(-1)
+        mi = matched_inst_idx.to(device=device, dtype=torch.long).reshape(-1)
+        keep = (
+            (mq >= 0)
+            & (mi >= 0)
+            & (mi < int(gt_centers_tn3.shape[1]))
+        )
+        if torch.is_tensor(pred_traj_offsets_fqk2):
+            keep = keep & (mq < int(pred_traj_offsets_fqk2.shape[1]))
+        elif torch.is_tensor(pred_traj_offsets_fq2):
+            keep = keep & (mq < int(pred_traj_offsets_fq2.shape[1]))
+        if not bool(keep.any().item()):
+            return pred_traj_offsets_fq2, pred_traj_offsets_fqk2, None
+        mq = mq[keep]
+        mi = mi[keep]
+        if mq.numel() <= 0:
+            return pred_traj_offsets_fq2, pred_traj_offsets_fqk2, None
+
+        anchor_xy_kp2 = gt_centers_tn3[
+            anchor_start_idx:anchor_end_idx, :, :2
+        ].to(device=device, dtype=torch.float32).index_select(1, mi).permute(1, 0, 2).contiguous()
+        anchor_feat_kd = self.query_traj_anchor_encoder(anchor_xy_kp2.reshape(int(mq.numel()), -1))
+        corr_logits_kf2 = self.query_traj_anchor_corr_head(anchor_feat_kd).reshape(
+            int(mq.numel()), int(self.query_traj_num_steps), 2
+        )
+        gate_kf1 = torch.sigmoid(
+            self.query_traj_anchor_gate_head(anchor_feat_kd).reshape(
+                int(mq.numel()), int(self.query_traj_num_steps), 1
+            )
+        )
+        traj_max_xy = anchor_xy_kp2.new_tensor(self.query_traj_residual_max_m).view(1, 1, 2)
+        corr_kf2 = torch.tanh(corr_logits_kf2) * traj_max_xy
+        correction_kf2 = gate_kf1 * corr_kf2
+
+        refined_fq2 = pred_traj_offsets_fq2
+        refined_fqk2 = pred_traj_offsets_fqk2
+        correction_fq2 = correction_kf2.permute(1, 0, 2).contiguous()
+
+        if (
+            torch.is_tensor(pred_traj_offsets_fqk2)
+            and pred_traj_offsets_fqk2.dim() == 4
+            and int(pred_traj_offsets_fqk2.shape[0]) == int(self.query_traj_num_steps)
+        ):
+            refined_fqk2 = pred_traj_offsets_fqk2.clone()
+            mode_start_idx = int(self.query_traj_builtin_mode_count)
+            if int(refined_fqk2.shape[2]) > mode_start_idx:
+                refined_fqk2[:, mq, mode_start_idx:, :] = (
+                    refined_fqk2[:, mq, mode_start_idx:, :]
+                    + correction_fq2.unsqueeze(2)
+                )
+            else:
+                refined_fqk2[:, mq, :, :] = refined_fqk2[:, mq, :, :] + correction_fq2.unsqueeze(2)
+            if (
+                torch.is_tensor(pred_traj_mode_logits_qk)
+                and pred_traj_mode_logits_qk.dim() == 2
+                and int(pred_traj_mode_logits_qk.shape[0]) == int(refined_fqk2.shape[1])
+                and int(pred_traj_mode_logits_qk.shape[1]) == int(refined_fqk2.shape[2])
+            ):
+                mode_idx_q = self._infer_traj_mode_idx_from_logits(pred_traj_mode_logits_qk)
+                gather_idx = mode_idx_q.view(1, -1, 1, 1).expand(
+                    int(refined_fqk2.shape[0]), -1, 1, 2
+                )
+                refined_fq2 = torch.gather(refined_fqk2, 2, gather_idx).squeeze(2).contiguous()
+        elif (
+            torch.is_tensor(pred_traj_offsets_fq2)
+            and pred_traj_offsets_fq2.dim() == 3
+            and int(pred_traj_offsets_fq2.shape[0]) == int(self.query_traj_num_steps)
+        ):
+            refined_fq2 = pred_traj_offsets_fq2.clone()
+            refined_fq2[:, mq, :] = refined_fq2[:, mq, :] + correction_fq2
+
+        debug_pack = {
+            "anchor_gate_mean": gate_kf1.detach().mean(),
+            "anchor_corr_abs_mean": correction_kf2.detach().abs().mean(),
+            "anchor_match_count": correction_kf2.new_tensor(float(int(mq.numel()))),
+        }
+        return refined_fq2, refined_fqk2, debug_pack
+
+    def refine_trajectory_absolute_xy(
+        self,
+        query_feat_tqd: torch.Tensor,
+        query_cls_scores_qc: torch.Tensor,
+        centers_world_tq3: torch.Tensor,
+        pred_traj_offsets_fq2: torch.Tensor,
+        present_local_idx: int = 0,
+    ):
+        if (
+            (not bool(self.query_traj_xy_refine_enabled))
+            or (self.query_traj_xy_refine_encoder is None)
+            or (self.query_traj_xy_refine_corr_head is None)
+            or (self.query_traj_xy_refine_gate_head is None)
+            or (not torch.is_tensor(query_feat_tqd))
+            or query_feat_tqd.dim() != 3
+            or (not torch.is_tensor(query_cls_scores_qc))
+            or query_cls_scores_qc.dim() != 2
+            or (not torch.is_tensor(centers_world_tq3))
+            or centers_world_tq3.dim() != 3
+            or (not torch.is_tensor(pred_traj_offsets_fq2))
+            or pred_traj_offsets_fq2.dim() != 3
+            or int(self.query_traj_num_steps) <= 0
+        ):
+            return None, None, None
+
+        t_hist, q_count, _ = [int(v) for v in centers_world_tq3.shape]
+        future_steps = int(self.query_traj_num_steps)
+        if (
+            int(query_feat_tqd.shape[0]) != t_hist
+            or int(query_feat_tqd.shape[1]) != q_count
+            or int(query_cls_scores_qc.shape[0]) != q_count
+        ):
+            return None, None, None
+
+        present_local_idx = int(max(0, min(t_hist - 1, int(present_local_idx))))
+        hist_xy_tq2 = centers_world_tq3[:(present_local_idx + 1), :, :2].to(torch.float32)
+        if int(hist_xy_tq2.shape[0]) != int(self.num_past_frames):
+            return None, None, None
+
+        base_offsets_fq2 = pred_traj_offsets_fq2.to(torch.float32)
+        if int(base_offsets_fq2.shape[0]) < future_steps:
+            pad = base_offsets_fq2.new_zeros((future_steps - int(base_offsets_fq2.shape[0]), q_count, 2))
+            base_offsets_fq2 = torch.cat([base_offsets_fq2, pad], dim=0)
+        else:
+            base_offsets_fq2 = base_offsets_fq2[:future_steps]
+
+        present_xy_q2 = hist_xy_tq2[present_local_idx]
+        base_future_xy = []
+        cur_xy_q2 = present_xy_q2
+        for step in range(future_steps):
+            cur_xy_q2 = cur_xy_q2 + base_offsets_fq2[step]
+            base_future_xy.append(cur_xy_q2)
+        base_future_xy_fq2 = torch.stack(base_future_xy, dim=0).contiguous()
+
+        center_context_tq2 = torch.cat([hist_xy_tq2, base_future_xy_fq2], dim=0)
+        center_context_qd = center_context_tq2.permute(1, 0, 2).reshape(q_count, -1)
+        refine_query_feat_qd = self._build_query_cls_feature_qd(query_feat_tqd, query_feat_tqd).to(torch.float32)
+        cls_prob_qc = query_cls_scores_qc.to(torch.float32)
+        entropy_q1 = -(cls_prob_qc * torch.log(cls_prob_qc.clamp_min(1e-6))).sum(dim=-1, keepdim=True)
+        if int(self.num_query_classes) > 1:
+            entropy_q1 = entropy_q1 / float(np.log(float(self.num_query_classes)))
+        refine_input_qd = torch.cat(
+            [center_context_qd, refine_query_feat_qd, cls_prob_qc, entropy_q1],
+            dim=-1,
+        )
+
+        refine_feat_qd = self.query_traj_xy_refine_encoder(refine_input_qd)
+        corr_logits_qf2 = self.query_traj_xy_refine_corr_head(refine_feat_qd).reshape(q_count, future_steps, 2)
+        gate_qf1 = torch.sigmoid(
+            self.query_traj_xy_refine_gate_head(refine_feat_qd).reshape(q_count, future_steps, 1)
+        )
+        traj_max_xy = refine_input_qd.new_tensor(self.query_traj_residual_max_m).view(1, 1, 2)
+        corr_qf2 = torch.tanh(corr_logits_qf2) * traj_max_xy
+        base_future_xy_qf2 = base_future_xy_fq2.permute(1, 0, 2).contiguous()
+        refined_future_xy_qf2 = base_future_xy_qf2 + (gate_qf1 * corr_qf2)
+
+        pc_min_xy = refined_future_xy_qf2.new_tensor(self.point_cloud_range[:2]).view(1, 1, 2)
+        pc_max_xy = refined_future_xy_qf2.new_tensor(self.point_cloud_range[3:5]).view(1, 1, 2)
+        refined_future_xy_qf2 = torch.max(
+            torch.min(refined_future_xy_qf2, pc_max_xy),
+            pc_min_xy,
+        )
+
+        refined_offsets_qf2 = refined_future_xy_qf2.clone()
+        refined_offsets_qf2[:, 0, :] = refined_future_xy_qf2[:, 0, :] - present_xy_q2
+        if future_steps > 1:
+            refined_offsets_qf2[:, 1:, :] = (
+                refined_future_xy_qf2[:, 1:, :] - refined_future_xy_qf2[:, :-1, :]
+            )
+
+        debug_pack = {
+            "traj_xy_refine_gate_mean": gate_qf1.detach().mean(),
+            "traj_xy_refine_corr_abs_mean": corr_qf2.detach().abs().mean(),
+        }
+        return (
+            refined_future_xy_qf2.permute(1, 0, 2).contiguous(),
+            refined_offsets_qf2.permute(1, 0, 2).contiguous(),
+            debug_pack,
+        )
 
     @staticmethod
     def _resolve_center_branch_input(
@@ -686,7 +1839,6 @@ class QueryHead(nn.Module):
         outputs: dict,
         centers_world: torch.Tensor,
         detach_query_for_center: bool = None,
-        defer_trajectory: bool = False,
     ) -> dict:
         if not isinstance(outputs, dict):
             raise TypeError("outputs must be a dict returned by QueryHead.forward")
@@ -723,16 +1875,24 @@ class QueryHead(nn.Module):
         traj_motion_input_tqd2 = None
         traj_logits_fq2 = None
         traj_offsets_fq2 = None
+        traj_logits_fqk2 = None
+        traj_offsets_fqk2 = None
+        traj_mode_pack = None
         if self.query_traj_head is not None:
             traj_motion_input_tqd2 = self._build_query_trajectory_input(
                 query_feat_tqd=query_feat_tqd,
                 centers_world_tq3=centers_world,
             )
-            if not defer_trajectory:
-                traj_logits_fq2, traj_offsets_fq2 = self._predict_trajectory_from_inputs(
-                    motion_input_tqd2=traj_motion_input_tqd2,
-                    query_feat_tqd=query_feat_tqd,
-                )
+            (
+                traj_logits_fq2,
+                traj_offsets_fq2,
+                traj_logits_fqk2,
+                traj_offsets_fqk2,
+                traj_mode_pack,
+            ) = self._predict_trajectory_from_inputs(
+                motion_input_tqd2=traj_motion_input_tqd2,
+                query_feat_tqd=query_feat_tqd,
+            )
 
         outputs = dict(outputs)
         outputs.update({
@@ -746,10 +1906,19 @@ class QueryHead(nn.Module):
             "traj_motion_input_tqd2": traj_motion_input_tqd2,
             "traj_logits_fq2": traj_logits_fq2,
             "traj_offsets_fq2": traj_offsets_fq2,
+            "traj_logits_fqk2": traj_logits_fqk2,
+            "traj_offsets_fqk2": traj_offsets_fqk2,
             "traj_deltas_fq2": traj_offsets_fq2,
+            "traj_deltas_fqk2": traj_offsets_fqk2,
             "query_traj_logits_fq2": traj_logits_fq2,
             "query_traj_offsets_fq2": traj_offsets_fq2,
             "query_traj_deltas_fq2": traj_offsets_fq2,
+            "query_traj_logits_fqk2": traj_logits_fqk2,
+            "query_traj_offsets_fqk2": traj_offsets_fqk2,
+            "query_traj_deltas_fqk2": traj_offsets_fqk2,
+            "traj_mode_logits_qk": traj_mode_pack["traj_mode_logits_qk"] if isinstance(traj_mode_pack, dict) else None,
+            "traj_mode_probs_qk": traj_mode_pack["traj_mode_probs_qk"] if isinstance(traj_mode_pack, dict) else None,
+            "traj_mode_idx_q": traj_mode_pack["traj_mode_idx_q"] if isinstance(traj_mode_pack, dict) else None,
             "centers_world": centers_world,
             "center_logits": center_logits,
             "gaussian_sigmas_world": query_sigma_world_tq3,
@@ -1139,26 +2308,34 @@ class QueryHead(nn.Module):
                         _blend_patch(patch, outline_mask, color_i, float(outline_alpha))
 
     def _get_query_vis_palette(self):
-        base_palette = np.asarray(
-            [
-                [110, 110, 110],  # background query
-                [255, 170, 40],   # bicycle
-                [80, 180, 255],   # bus
-                [255, 80, 80],    # car
-                [255, 220, 80],   # construction
-                [180, 100, 255],  # motorcycle
-                [80, 255, 200],   # pedestrian
-                [140, 255, 100],  # trailer
-                [255, 120, 220],  # truck
-                [255, 255, 120],
-                [120, 220, 255],
-                [255, 160, 120],
-            ],
-            dtype=np.uint8,
-        )
+        # Fixed raw-id -> color mapping: colors stay stable even if the
+        # query_class_ids set changes (e.g. pedestrian excluded).
+        fixed_palette = {
+            0: [110, 110, 110],   # background query
+            2: [255, 170, 40],    # bicycle
+            3: [80, 180, 255],    # bus
+            4: [255, 80, 80],     # car
+            5: [255, 220, 80],    # construction
+            6: [180, 100, 255],   # motorcycle
+            7: [80, 255, 200],    # pedestrian
+            9: [140, 255, 100],   # trailer
+            10: [255, 120, 220],  # truck
+        }
+        extra_palette = [
+            [255, 255, 120],
+            [120, 220, 255],
+            [255, 160, 120],
+        ]
         color_map = {}
-        for idx, raw_id in enumerate(self.query_class_ids):
-            color_map[int(raw_id)] = base_palette[idx % len(base_palette)]
+        extra_idx = 0
+        for raw_id in self.query_class_ids:
+            raw_id = int(raw_id)
+            if raw_id in fixed_palette:
+                color = fixed_palette[raw_id]
+            else:
+                color = extra_palette[extra_idx % len(extra_palette)]
+                extra_idx += 1
+            color_map[raw_id] = np.asarray(color, dtype=np.uint8)
         return color_map
 
     def _draw_query_vis_legend(self, draw, x_start: int, y_start: int, canvas_w: int) -> int:
@@ -1399,7 +2576,12 @@ class QueryHead(nn.Module):
         )
         traj_logits_fq2 = None
         traj_offsets_fq2 = None
+        traj_logits_fqk2 = None
+        traj_offsets_fqk2 = None
         traj_motion_input_tqd2 = None
+        traj_mode_pack = None
+        endpoint_logits_qk2 = None
+        endpoint_deltas_qk2 = None
 
         centers_world = None
         center_logits = None
@@ -1423,15 +2605,24 @@ class QueryHead(nn.Module):
                 mixture_yaw_tqg,
                 mixture_weights_tqg,
             ) = self._compute_gaussian_outputs(center_input_tqd, centers_world)
-            if self.query_traj_head is not None:
+            if self.query_traj_head is not None or self.query_traj_endpoint_head is not None:
                 traj_motion_input_tqd2 = self._build_query_trajectory_input(
                     query_feat_tqd=query_feat_tqd,
                     centers_world_tq3=centers_world,
                 )
-                traj_logits_fq2, traj_offsets_fq2 = self._predict_trajectory_from_inputs(
+                (
+                    traj_logits_fq2,
+                    traj_offsets_fq2,
+                    traj_logits_fqk2,
+                    traj_offsets_fqk2,
+                    traj_mode_pack,
+                ) = self._predict_trajectory_from_inputs(
                     motion_input_tqd2=traj_motion_input_tqd2,
                     query_feat_tqd=query_feat_tqd,
                 )
+                if isinstance(traj_mode_pack, dict):
+                    endpoint_logits_qk2 = traj_mode_pack.get("endpoint_logits_qk2", None)
+                    endpoint_deltas_qk2 = traj_mode_pack.get("endpoint_deltas_qk2", None)
 
         outputs = {
             "centers_world_tq3": centers_world,
@@ -1451,10 +2642,23 @@ class QueryHead(nn.Module):
             "traj_motion_input_tqd2": traj_motion_input_tqd2,
             "traj_logits_fq2": traj_logits_fq2,
             "traj_offsets_fq2": traj_offsets_fq2,
+            "traj_logits_fqk2": traj_logits_fqk2,
+            "traj_offsets_fqk2": traj_offsets_fqk2,
             "traj_deltas_fq2": traj_offsets_fq2,
+            "traj_deltas_fqk2": traj_offsets_fqk2,
+            "endpoint_logits_qk2": endpoint_logits_qk2,
+            "endpoint_deltas_qk2": endpoint_deltas_qk2,
             "query_traj_logits_fq2": traj_logits_fq2,
             "query_traj_offsets_fq2": traj_offsets_fq2,
             "query_traj_deltas_fq2": traj_offsets_fq2,
+            "query_traj_logits_fqk2": traj_logits_fqk2,
+            "query_traj_offsets_fqk2": traj_offsets_fqk2,
+            "query_traj_deltas_fqk2": traj_offsets_fqk2,
+            "query_endpoint_logits_qk2": endpoint_logits_qk2,
+            "query_endpoint_deltas_qk2": endpoint_deltas_qk2,
+            "traj_mode_logits_qk": traj_mode_pack["traj_mode_logits_qk"] if isinstance(traj_mode_pack, dict) else None,
+            "traj_mode_probs_qk": traj_mode_pack["traj_mode_probs_qk"] if isinstance(traj_mode_pack, dict) else None,
+            "traj_mode_idx_q": traj_mode_pack["traj_mode_idx_q"] if isinstance(traj_mode_pack, dict) else None,
             # Legacy aliases for compatibility with older call sites.
             "centers_world": centers_world,
             "center_logits": center_logits,
@@ -1715,12 +2919,12 @@ class QueryHead(nn.Module):
     ) -> None:
         """
         Query-center-focused BEV visualization.
-        - row1: GT occupancy BEV (from gt_occ_inst when provided)
+        - row1: GT semantic BEV (query classes, class-colored)
         - row2: all query centers (class-agnostic; high/low confidence contrasted)
         - row3: high-confidence query centers only (class-agnostic)
         - row4: high-confidence query centers only (class-colored)
         - row5: Hungarian-matched query centers only
-        - row6: GT semantic BEV (query classes, class-colored)
+        - row6: trajectory overlay
         """
         vis_every = int(getattr(self, "debug_vis_every", 0))
         if vis_every <= 0:
@@ -1736,7 +2940,7 @@ class QueryHead(nn.Module):
 
         try:
             import os
-            from PIL import Image, ImageDraw
+            from PIL import Image, ImageDraw, ImageFont
         except Exception:
             return
 
@@ -1867,6 +3071,7 @@ class QueryHead(nn.Module):
         def _project_points(points_t, scores_t=None, class_ids_t=None):
             if points_t is None:
                 return None, None, None, None, None
+            points_t = points_t.to(device=pc_min.device, dtype=torch.float32)
             ix_t = (points_t[..., 0] - pc_min[0]) / voxel_size[0] - off
             iy_t = (points_t[..., 1] - pc_min[1]) / voxel_size[1] - off
             iz_t = (points_t[..., 2] - pc_min[2]) / voxel_size[2] - off
@@ -1881,14 +3086,16 @@ class QueryHead(nn.Module):
             scores_np = None
             class_np = None
             if torch.is_tensor(scores_t):
-                scores_np = scores_t.to(torch.float32).clamp(0.0, 1.0).cpu().numpy()
+                scores_np = scores_t.to(device=pc_min.device, dtype=torch.float32).clamp(0.0, 1.0).cpu().numpy()
             if torch.is_tensor(class_ids_t):
-                class_np = class_ids_t.to(torch.long).cpu().numpy()
+                class_np = class_ids_t.to(device=pc_min.device, dtype=torch.long).cpu().numpy()
             return ix_i, iy_i, valid_np, scores_np, class_np
 
         def _project_gaussians(points_t, sigmas_t, yaw_t=None, weight_t=None):
             if points_t is None or sigmas_t is None:
                 return None, None, None, None, None, None, None
+            points_t = points_t.to(device=pc_min.device, dtype=torch.float32)
+            sigmas_t = sigmas_t.to(device=pc_min.device, dtype=torch.float32)
             ix_t = (points_t[..., 0] - pc_min[0]) / voxel_size[0] - off
             iy_t = (points_t[..., 1] - pc_min[1]) / voxel_size[1] - off
             sigma_x_t = (sigmas_t[..., 0] / voxel_size[0]).to(torch.float32)
@@ -1906,9 +3113,9 @@ class QueryHead(nn.Module):
             yaw_np = None
             weight_np = None
             if torch.is_tensor(yaw_t):
-                yaw_np = yaw_t[:T].to(torch.float32).cpu().numpy()
+                yaw_np = yaw_t[:T].to(device=pc_min.device, dtype=torch.float32).cpu().numpy()
             if torch.is_tensor(weight_t):
-                weight_np = weight_t[:T].to(torch.float32).cpu().numpy()
+                weight_np = weight_t[:T].to(device=pc_min.device, dtype=torch.float32).cpu().numpy()
             valid_np = valid_t.cpu().numpy()
             return ix_i, iy_i, sx_np, sy_np, yaw_np, weight_np, valid_np
 
@@ -2030,10 +3237,11 @@ class QueryHead(nn.Module):
 
         row_gt = []
         row_all = []
-        row_hi = []
         row_hi_cls = []
         row_matched = []
         row_gt_cls = []
+        row_traj = []
+        row_base_traj = []
         stats_valid = []
         stats_hi = []
         stats_lo = []
@@ -2045,6 +3253,8 @@ class QueryHead(nn.Module):
         hi_color = np.array([30, 255, 255], dtype=np.uint8)
         lo_color = np.array([255, 60, 60], dtype=np.uint8)
         matched_color = np.array([255, 80, 255], dtype=np.uint8)
+        traj_pred_color = np.array([255, 48, 48], dtype=np.uint8)
+        traj_gt_color = np.array([80, 255, 255], dtype=np.uint8)
         ego_color = np.array([255, 255, 0], dtype=np.uint8)
         ego_outline_color = np.array([0, 0, 0], dtype=np.uint8)
         ego_cross_arm = max(2, marker_radius + 3)
@@ -2060,9 +3270,68 @@ class QueryHead(nn.Module):
         ego_ix = int(np.round(ego_ix_f)) if ego_visible else -1
         ego_iy = int(np.round(ego_iy_f)) if ego_visible else -1
         class_palette = self._get_query_vis_palette()
+        pred_cls_palette = [
+            class_palette.get(int(rid), hi_color) for rid in self.query_class_ids
+        ]
         gaussian_vis_mode = str(getattr(self, "debug_query_gaussian_vis_mode", "ellipse")).lower()
         gaussian_prob_threshold = float(getattr(self, "debug_query_gaussian_prob_threshold", 0.5))
         gaussian_prob_alpha_scale = float(getattr(self, "debug_query_gaussian_prob_alpha_scale", 4.0))
+        traj_points_tq3 = None
+        base_traj_points_tq3 = None
+        matched_gt_traj_tn3 = None
+        matched_gt_valid_tn = None
+        matched_traj_mode_idx_q = None
+        all_gt_traj_tn3 = None
+        all_gt_valid_tn = None
+        if isinstance(query_vis_bundle, dict):
+            if torch.is_tensor(query_vis_bundle.get("matched_points_tq3", None)):
+                traj_points_tq3 = query_vis_bundle["matched_points_tq3"]
+            if torch.is_tensor(query_vis_bundle.get("base_matched_points_tq3", None)):
+                base_traj_points_tq3 = query_vis_bundle["base_matched_points_tq3"]
+            if torch.is_tensor(query_vis_bundle.get("matched_gt_traj_tn3", None)):
+                matched_gt_traj_tn3 = query_vis_bundle["matched_gt_traj_tn3"]
+            if torch.is_tensor(query_vis_bundle.get("matched_gt_valid_tn", None)):
+                matched_gt_valid_tn = query_vis_bundle["matched_gt_valid_tn"]
+            if torch.is_tensor(query_vis_bundle.get("matched_traj_mode_idx_q", None)):
+                matched_traj_mode_idx_q = query_vis_bundle["matched_traj_mode_idx_q"]
+            if torch.is_tensor(query_vis_bundle.get("all_gt_traj_tn3", None)):
+                all_gt_traj_tn3 = query_vis_bundle["all_gt_traj_tn3"]
+            if torch.is_tensor(query_vis_bundle.get("all_gt_valid_tn", None)):
+                all_gt_valid_tn = query_vis_bundle["all_gt_valid_tn"]
+        traj_x_i, traj_y_i, traj_valid_np, _, _ = _project_points(traj_points_tq3)
+        base_traj_x_i, base_traj_y_i, base_traj_valid_np, _, _ = _project_points(base_traj_points_tq3)
+        gt_traj_points_tn3 = all_gt_traj_tn3 if torch.is_tensor(all_gt_traj_tn3) else matched_gt_traj_tn3
+        gt_traj_valid_tn = all_gt_valid_tn if torch.is_tensor(all_gt_valid_tn) else matched_gt_valid_tn
+        gt_traj_x_i, gt_traj_y_i, gt_traj_valid_np, _, _ = _project_points(gt_traj_points_tn3)
+        if torch.is_tensor(gt_traj_valid_tn) and gt_traj_valid_np is not None:
+            gt_traj_valid_np = gt_traj_valid_np & gt_traj_valid_tn.to(torch.bool).cpu().numpy()
+
+        def _draw_traj_arrow(draw_ctx, x0, y0, x1, y1, color, outline=(0, 0, 0)):
+            dx = float(x1 - x0)
+            dy = float(y1 - y0)
+            norm = float(np.hypot(dx, dy))
+            if norm < 1e-6:
+                r = 3
+                draw_ctx.ellipse((x1 - r - 1, y1 - r - 1, x1 + r + 1, y1 + r + 1), fill=outline)
+                draw_ctx.ellipse((x1 - r, y1 - r, x1 + r, y1 + r), fill=color)
+                return
+            ux = dx / norm
+            uy = dy / norm
+            head_len = max(8.0, min(16.0, norm * 0.45))
+            head_ang = 0.55
+            c = float(np.cos(head_ang))
+            s = float(np.sin(head_ang))
+            lx = x1 - head_len * (ux * c - uy * s)
+            ly = y1 - head_len * (uy * c + ux * s)
+            rx = x1 - head_len * (ux * c + uy * s)
+            ry = y1 - head_len * (uy * c - ux * s)
+            draw_ctx.line((x0, y0, x1, y1), fill=outline, width=4)
+            draw_ctx.line((x1, y1, lx, ly), fill=outline, width=5)
+            draw_ctx.line((x1, y1, rx, ry), fill=outline, width=5)
+            draw_ctx.line((x0, y0, x1, y1), fill=color, width=2)
+            draw_ctx.line((x1, y1, lx, ly), fill=color, width=3)
+            draw_ctx.line((x1, y1, rx, ry), fill=color, width=3)
+
         for t in range(T):
             gt_bev = (gt_np[t] == 1).any(axis=0).T.astype(np.bool_)
             gt_rgb = np.zeros((Y, X, 3), dtype=np.uint8)
@@ -2099,6 +3368,8 @@ class QueryHead(nn.Module):
             hi_cls_ov[gt_bev] = gt_color
             matched_ov = np.zeros((Y, X, 3), dtype=np.uint8)
             matched_ov[gt_bev] = gt_color
+            traj_ov = np.zeros((Y, X, 3), dtype=np.uint8)
+            traj_ov[gt_bev] = gt_color
 
             valid_count = 0
             hi_count = 0
@@ -2170,7 +3441,9 @@ class QueryHead(nn.Module):
                             raw_cls_hi = sel_cls_np[t].reshape(-1)
                             hi_gauss_colors = np.stack(
                                 [
-                                    class_palette.get(int(cls_id), hi_color)
+                                    pred_cls_palette[int(cls_id)]
+                                    if 0 <= int(cls_id) < len(pred_cls_palette)
+                                    else hi_color
                                     for cls_id in raw_cls_hi.tolist()
                                 ],
                                 axis=0,
@@ -2259,7 +3532,9 @@ class QueryHead(nn.Module):
                             raw_cls_hi = sel_cls_np[t].reshape(-1)[vt_s]
                             hi_colors = np.stack(
                                 [
-                                    class_palette.get(int(cls_id), hi_color)
+                                    pred_cls_palette[int(cls_id)]
+                                    if 0 <= int(cls_id) < len(pred_cls_palette)
+                                    else hi_color
                                     for cls_id in raw_cls_hi.tolist()
                                 ],
                                 axis=0,
@@ -2332,7 +3607,9 @@ class QueryHead(nn.Module):
                             raw_cls_hi = cand_cls_np[t].reshape(-1)[hi]
                             hi_colors = np.stack(
                                 [
-                                    class_palette.get(int(cls_id), hi_color)
+                                    pred_cls_palette[int(cls_id)]
+                                    if 0 <= int(cls_id) < len(pred_cls_palette)
+                                    else hi_color
                                     for cls_id in raw_cls_hi.tolist()
                                 ],
                                 axis=0,
@@ -2350,7 +3627,7 @@ class QueryHead(nn.Module):
                 matched_count = 0
 
             if ego_visible:
-                for row_canvas in (gt_rgb, all_ov, hi_ov, hi_cls_ov, matched_ov, gt_cls_rgb):
+                for row_canvas in (gt_rgb, gt_cls_rgb, all_ov, hi_ov, hi_cls_ov, matched_ov, traj_ov):
                     self._draw_cross_marker(
                         row_canvas,
                         center_x=ego_ix,
@@ -2365,10 +3642,11 @@ class QueryHead(nn.Module):
 
             row_gt.append(gt_rgb)
             row_all.append(all_ov)
-            row_hi.append(hi_ov)
             row_hi_cls.append(hi_cls_ov)
             row_matched.append(matched_ov)
             row_gt_cls.append(gt_cls_rgb)
+            row_traj.append(traj_ov)
+            row_base_traj.append(traj_ov.copy())
             stats_valid.append(valid_count)
             stats_hi.append(hi_count)
             stats_lo.append(lo_count)
@@ -2378,7 +3656,12 @@ class QueryHead(nn.Module):
         text_h = 18
         row_h = Y
         canvas_w = T * X + (T - 1) * gap
-        num_rows = 6
+        has_base_traj_row = (
+            base_traj_x_i is not None
+            and base_traj_y_i is not None
+            and base_traj_valid_np is not None
+        )
+        num_rows = 6 if has_base_traj_row else 5
         legend_h = 120
         canvas_h = text_h + num_rows * row_h + (num_rows - 1) * gap + legend_h
         canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
@@ -2391,15 +3674,23 @@ class QueryHead(nn.Module):
             y3 = y2 + row_h + gap
             y4 = y3 + row_h + gap
             y5 = y4 + row_h + gap
-            canvas[y0:y0 + row_h, x0:x0 + X] = row_gt[t]
+            canvas[y0:y0 + row_h, x0:x0 + X] = row_gt_cls[t]
             canvas[y1:y1 + row_h, x0:x0 + X] = row_all[t]
-            canvas[y2:y2 + row_h, x0:x0 + X] = row_hi[t]
-            canvas[y3:y3 + row_h, x0:x0 + X] = row_hi_cls[t]
-            canvas[y4:y4 + row_h, x0:x0 + X] = row_matched[t]
-            canvas[y5:y5 + row_h, x0:x0 + X] = row_gt_cls[t]
+            canvas[y2:y2 + row_h, x0:x0 + X] = row_hi_cls[t]
+            canvas[y3:y3 + row_h, x0:x0 + X] = row_matched[t]
+            canvas[y4:y4 + row_h, x0:x0 + X] = row_traj[t]
+            if has_base_traj_row:
+                canvas[y5:y5 + row_h, x0:x0 + X] = row_base_traj[t]
 
         img = Image.fromarray(canvas, mode="RGB")
         draw = ImageDraw.Draw(img)
+        traj_row_start_y = text_h + 4 * (row_h + gap)
+        base_traj_row_start_y = text_h + 5 * (row_h + gap)
+        traj_mode_font = None
+        try:
+            traj_mode_font = ImageFont.truetype("DejaVuSans-Bold.ttf", size=13)
+        except Exception:
+            traj_mode_font = None
         gaussian_vis_mode = str(getattr(self, "debug_query_gaussian_vis_mode", "ellipse")).lower()
         if gaussian_vis_mode == "prob":
             gaussian_desc = (
@@ -2429,12 +3720,13 @@ class QueryHead(nn.Module):
                 else:
                     cam_mean = float(cam_attn_score_q.float().mean().item())
             header = (
-                f"row1: gt_occ_inst occupancy BEV  "
+                f"row1: GT class BEV(gt_occ_inst cls)  "
                 f"row2: candidates(all queries, bg+fg)  "
-                f"row3: selected(score>=thr + topk)  "
-                f"row4: selected(class-colored)  "
-                f"row5: Hungarian-matched query centers only  "
-                f"row6: GT class BEV(gt_occ_inst cls) | topk={bundle_top_k} thr={bundle_score_thr:.2f} "
+                f"row3: selected(class-colored)  "
+                f"row4: Hungarian-matched query centers only  "
+                f"row5: refined traj(prev->cur; pred=red, all GT=cyan)  "
+                f"{'row6: base traj(prev->cur; pred=red, all GT=cyan)  ' if has_base_traj_row else ''}"
+                f"| topk={bundle_top_k} thr={bundle_score_thr:.2f} "
                 f"w_iou={bundle_w_iou:.2f} w_cls={bundle_w_cls:.2f} w_cam={bundle_w_cam:.2f} "
                 f"mean(iou/cls/cam/score)=({iou_mean:.3f}/{cls_mean:.3f}/{cam_mean:.3f}/{score_mean:.3f})"
             )
@@ -2442,12 +3734,12 @@ class QueryHead(nn.Module):
                 header += f" | Gaussian vis: {gaussian_desc}"
         else:
             header = (
-                f"row1: gt_occ_inst occupancy BEV  "
+                f"row1: GT class BEV(gt_occ_inst cls), class-colored  "
                 f"row2: all query centers (green=gt, cyan=conf>={conf_thr:.2f}, red=conf<{conf_thr:.2f})  "
-                f"row3: query centers with conf>={conf_thr:.2f} only  "
-                f"row4: query centers with conf>={conf_thr:.2f} only, class-colored  "
-                f"row5: Hungarian-matched query centers only  "
-                f"row6: GT class BEV(gt_occ_inst cls), class-colored"
+                f"row3: query centers with conf>={conf_thr:.2f} only, class-colored  "
+                f"row4: Hungarian-matched query centers only  "
+                f"row5: refined traj(prev->cur; pred=red, all GT=cyan)  "
+                f"{'row6: base traj(prev->cur; pred=red, all GT=cyan)' if has_base_traj_row else ''}"
             )
         if ego_visible:
             header += f" | ego(+)=xy(0,0)->pix({ego_ix},{ego_iy})"
@@ -2463,23 +3755,139 @@ class QueryHead(nn.Module):
             y3 = y2 + row_h + gap
             y4 = y3 + row_h + gap
             y5 = y4 + row_h + gap
-            draw.text((x0 + 2, y0 + 2), f"t={t}", fill=(255, 255, 255))
+            draw.text((x0 + 2, y0 + 2), "GT class", fill=(255, 255, 255))
             if use_score_bundle:
-                draw.text((x0 + 2, y1 + 2), f"cand={stats_valid[t]} sel={stats_hi[t]} drop={stats_lo[t]}", fill=(255, 255, 255))
+                draw.text((x0 + 2, y1 + 2), f"t={t} cand={stats_valid[t]} sel={stats_hi[t]} drop={stats_lo[t]}", fill=(255, 255, 255))
             else:
-                draw.text((x0 + 2, y1 + 2), f"all={stats_valid[t]} hi={stats_hi[t]} lo={stats_lo[t]}", fill=(255, 255, 255))
-            draw.text((x0 + 2, y2 + 2), f"hi={stats_hi[t]}", fill=(255, 255, 255))
-            draw.text((x0 + 2, y3 + 2), f"hi(class)={stats_hi[t]}", fill=(255, 255, 255))
-            draw.text((x0 + 2, y4 + 2), f"matched={stats_matched[t]}", fill=(255, 255, 255))
-            draw.text((x0 + 2, y5 + 2), "GT class", fill=(255, 255, 255))
+                draw.text((x0 + 2, y1 + 2), f"t={t} all={stats_valid[t]} hi={stats_hi[t]} lo={stats_lo[t]}", fill=(255, 255, 255))
+            draw.text((x0 + 2, y2 + 2), f"hi(class)={stats_hi[t]}", fill=(255, 255, 255))
+            draw.text((x0 + 2, y3 + 2), f"matched={stats_matched[t]}", fill=(255, 255, 255))
+            draw.text((x0 + 2, y4 + 2), "refined traj", fill=(255, 255, 255))
+            if has_base_traj_row:
+                draw.text((x0 + 2, y5 + 2), "base traj", fill=(255, 255, 255))
 
             # Thin white border for readability across every grid tile.
-            for yy in (y0, y1, y2, y3, y4, y5):
+            border_rows = (y0, y1, y2, y3, y4, y5) if has_base_traj_row else (y0, y1, y2, y3, y4)
+            for yy in border_rows:
                 draw.rectangle(
                     [x0, yy, x0 + X - 1, yy + row_h - 1],
                     outline=(255, 255, 255),
                     width=1,
                 )
+
+            if t > 0:
+                if (
+                    traj_x_i is not None
+                    and traj_y_i is not None
+                    and traj_valid_np is not None
+                    and t < int(traj_valid_np.shape[0])
+                ):
+                    pred_valid = traj_valid_np[t - 1].reshape(-1) & traj_valid_np[t].reshape(-1)
+                    if pred_valid.any():
+                        pred_valid_idx = np.nonzero(pred_valid)[0]
+                        x_prev = traj_x_i[t - 1].reshape(-1)[pred_valid]
+                        y_prev = traj_y_i[t - 1].reshape(-1)[pred_valid]
+                        x_cur = traj_x_i[t].reshape(-1)[pred_valid]
+                        y_cur = traj_y_i[t].reshape(-1)[pred_valid]
+                        for draw_idx, (px0, py0, px1, py1) in enumerate(zip(x_prev.tolist(), y_prev.tolist(), x_cur.tolist(), y_cur.tolist())):
+                            _draw_traj_arrow(
+                                draw,
+                                x0 + int(px0),
+                                traj_row_start_y + int(py0),
+                                x0 + int(px1),
+                                traj_row_start_y + int(py1),
+                                tuple(int(v) for v in traj_pred_color.tolist()),
+                            )
+                            if (
+                                matched_traj_mode_idx_q is not None
+                                and int(draw_idx) < int(pred_valid_idx.shape[0])
+                                and int(pred_valid_idx[draw_idx]) < int(matched_traj_mode_idx_q.numel())
+                            ):
+                                mode_label = str(int(matched_traj_mode_idx_q[int(pred_valid_idx[draw_idx])].item()))
+                                draw.text(
+                                    (x0 + int(px1) + 4, traj_row_start_y + int(py1) - 10),
+                                    mode_label,
+                                    fill=(255, 255, 0),
+                                    font=traj_mode_font,
+                                )
+                if (
+                    gt_traj_x_i is not None
+                    and gt_traj_y_i is not None
+                    and gt_traj_valid_np is not None
+                    and t < int(gt_traj_valid_np.shape[0])
+                ):
+                    gt_valid = gt_traj_valid_np[t - 1].reshape(-1) & gt_traj_valid_np[t].reshape(-1)
+                    if gt_valid.any():
+                        gx_prev = gt_traj_x_i[t - 1].reshape(-1)[gt_valid]
+                        gy_prev = gt_traj_y_i[t - 1].reshape(-1)[gt_valid]
+                        gx_cur = gt_traj_x_i[t].reshape(-1)[gt_valid]
+                        gy_cur = gt_traj_y_i[t].reshape(-1)[gt_valid]
+                        for px0, py0, px1, py1 in zip(gx_prev.tolist(), gy_prev.tolist(), gx_cur.tolist(), gy_cur.tolist()):
+                            _draw_traj_arrow(
+                                draw,
+                                x0 + int(px0),
+                                traj_row_start_y + int(py0),
+                                x0 + int(px1),
+                                traj_row_start_y + int(py1),
+                                tuple(int(v) for v in traj_gt_color.tolist()),
+                            )
+                if (
+                    has_base_traj_row
+                    and base_traj_x_i is not None
+                    and base_traj_y_i is not None
+                    and base_traj_valid_np is not None
+                    and t < int(base_traj_valid_np.shape[0])
+                ):
+                    base_valid = base_traj_valid_np[t - 1].reshape(-1) & base_traj_valid_np[t].reshape(-1)
+                    if base_valid.any():
+                        bx_prev = base_traj_x_i[t - 1].reshape(-1)[base_valid]
+                        by_prev = base_traj_y_i[t - 1].reshape(-1)[base_valid]
+                        bx_cur = base_traj_x_i[t].reshape(-1)[base_valid]
+                        by_cur = base_traj_y_i[t].reshape(-1)[base_valid]
+                        base_valid_idx = np.nonzero(base_valid)[0]
+                        for draw_idx, (px0, py0, px1, py1) in enumerate(zip(bx_prev.tolist(), by_prev.tolist(), bx_cur.tolist(), by_cur.tolist())):
+                            _draw_traj_arrow(
+                                draw,
+                                x0 + int(px0),
+                                base_traj_row_start_y + int(py0),
+                                x0 + int(px1),
+                                base_traj_row_start_y + int(py1),
+                                tuple(int(v) for v in traj_pred_color.tolist()),
+                            )
+                            if (
+                                matched_traj_mode_idx_q is not None
+                                and int(draw_idx) < int(base_valid_idx.shape[0])
+                                and int(base_valid_idx[draw_idx]) < int(matched_traj_mode_idx_q.numel())
+                            ):
+                                mode_label = str(int(matched_traj_mode_idx_q[int(base_valid_idx[draw_idx])].item()))
+                                draw.text(
+                                    (x0 + int(px1) + 4, base_traj_row_start_y + int(py1) - 10),
+                                    mode_label,
+                                    fill=(255, 255, 0),
+                                    font=traj_mode_font,
+                                )
+                if (
+                    has_base_traj_row
+                    and gt_traj_x_i is not None
+                    and gt_traj_y_i is not None
+                    and gt_traj_valid_np is not None
+                    and t < int(gt_traj_valid_np.shape[0])
+                ):
+                    gt_valid = gt_traj_valid_np[t - 1].reshape(-1) & gt_traj_valid_np[t].reshape(-1)
+                    if gt_valid.any():
+                        gx_prev = gt_traj_x_i[t - 1].reshape(-1)[gt_valid]
+                        gy_prev = gt_traj_y_i[t - 1].reshape(-1)[gt_valid]
+                        gx_cur = gt_traj_x_i[t].reshape(-1)[gt_valid]
+                        gy_cur = gt_traj_y_i[t].reshape(-1)[gt_valid]
+                        for px0, py0, px1, py1 in zip(gx_prev.tolist(), gy_prev.tolist(), gx_cur.tolist(), gy_cur.tolist()):
+                            _draw_traj_arrow(
+                                draw,
+                                x0 + int(px0),
+                                base_traj_row_start_y + int(py0),
+                                x0 + int(px1),
+                                base_traj_row_start_y + int(py1),
+                                tuple(int(v) for v in traj_gt_color.tolist()),
+                            )
 
         legend_y = text_h + num_rows * row_h + (num_rows - 1) * gap + 4
         draw.text((2, legend_y), "Legend:", fill=(255, 255, 255))
@@ -2890,12 +4298,15 @@ class QueryHead(nn.Module):
                     "matched_mixture_yaw_tqg",
                     "matched_mixture_weights_tqg",
                     "selected_query_idx_q",
+                    "base_points_tq3",
+                    "base_mixture_centers_tqg3",
                 ):
                     val = query_vis_bundle.get(key, None)
                     if torch.is_tensor(val):
                         sidecar[key] = val.detach().cpu()
                 sidecar["top_k"] = int(query_vis_bundle.get("top_k", 0))
                 sidecar["score_thr"] = float(query_vis_bundle.get("score_thr", 0.0))
+                sidecar["distance_nms_radius_m"] = float(query_vis_bundle.get("distance_nms_radius_m", 0.0))
                 sidecar["w_iou"] = float(query_vis_bundle.get("w_iou", 0.5))
                 sidecar["w_cls"] = float(query_vis_bundle.get("w_cls", 0.5))
                 sidecar["w_cam"] = float(query_vis_bundle.get("w_cam", 0.0))

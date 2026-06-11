@@ -146,6 +146,7 @@ def main():
         distributed = False
     else:
         distributed = True
+        torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
         init_dist(args.launcher, **cfg.dist_params)
         # re-set gpu_ids with distributed training mode
         _, world_size = get_dist_info()

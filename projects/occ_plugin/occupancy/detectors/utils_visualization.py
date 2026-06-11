@@ -1210,11 +1210,15 @@ class EfficientOCFVisualizationMixin:
         query_cls_scores_qc: torch.Tensor,
         inst_match_result: dict,
         gt_segmentation_instance3d_txyz: torch.Tensor,
+        gt_instance_centers_full_tn3: torch.Tensor = None,
+        gt_instance_valid_full_tn: torch.Tensor = None,
+        gt_instance_ids_full_n: torch.Tensor = None,
         gaussian_sigmas_world_tq3: torch.Tensor = None,
         mixture_centers_world_tqg3: torch.Tensor = None,
         mixture_sigmas_world_tqg3: torch.Tensor = None,
         mixture_yaw_tqg: torch.Tensor = None,
         mixture_weights_tqg: torch.Tensor = None,
+        traj_mode_idx_q: torch.Tensor = None,
         query_attn_cam_score_pack: dict = None,
     ):
         if (not torch.is_tensor(centers_world_tq3)) or centers_world_tq3.dim() != 3:
@@ -1345,9 +1349,32 @@ class EfficientOCFVisualizationMixin:
 
         if int(selected_candidate_idx.numel()) > 0 and int(self.debug_query_score_topk) > 0:
             cand_scores = score_q.index_select(0, selected_candidate_idx)
+            order = torch.argsort(cand_scores, descending=True)
+            selected_candidate_idx = selected_candidate_idx.index_select(0, order)
+            nms_radius = max(0.0, float(getattr(self, "debug_query_distance_nms_radius_m", 0.0)))
+            if nms_radius > 0.0 and int(selected_candidate_idx.numel()) > 0:
+                center_frame_idx = min(
+                    max(0, int(getattr(self, "time_receptive_field", 1)) - 1),
+                    int(centers_world_tq3.shape[0]) - 1,
+                )
+                centers_xy_q2 = centers_world_tq3[center_frame_idx, :, :2].to(torch.float32)
+                kept = []
+                radius_sq = float(nms_radius * nms_radius)
+                for qid in selected_candidate_idx.tolist():
+                    qid = int(qid)
+                    if len(kept) > 0:
+                        prev = torch.as_tensor(kept, device=centers_xy_q2.device, dtype=torch.long)
+                        dist_sq = ((centers_xy_q2.index_select(0, prev) - centers_xy_q2[qid]) ** 2).sum(dim=-1)
+                        if bool((dist_sq <= radius_sq).any().item()):
+                            continue
+                    kept.append(qid)
+                selected_candidate_idx = torch.as_tensor(
+                    kept,
+                    device=selected_candidate_idx.device,
+                    dtype=torch.long,
+                )
             topk = min(int(self.debug_query_score_topk), int(selected_candidate_idx.numel()))
-            order = torch.topk(cand_scores, k=topk, largest=True, sorted=True).indices
-            selected_idx = selected_candidate_idx.index_select(0, order)
+            selected_idx = selected_candidate_idx[:topk]
         else:
             selected_idx = selected_candidate_idx.new_empty((0,), dtype=torch.long)
 
@@ -1481,6 +1508,43 @@ class EfficientOCFVisualizationMixin:
             if (has_mixture and int(matched_idx.numel()) > 0) else None
         )
 
+        all_gt_traj_tn3 = None
+        all_gt_valid_tn = None
+        matched_gt_traj_tn3 = None
+        matched_gt_valid_tn = None
+        if (
+            torch.is_tensor(gt_instance_centers_full_tn3)
+            and gt_instance_centers_full_tn3.dim() == 3
+        ):
+            all_gt_traj_tn3 = gt_instance_centers_full_tn3.detach()
+            if (
+                torch.is_tensor(gt_instance_valid_full_tn)
+                and gt_instance_valid_full_tn.dim() == 2
+                and int(gt_instance_valid_full_tn.shape[0]) == int(gt_instance_centers_full_tn3.shape[0])
+                and int(gt_instance_valid_full_tn.shape[1]) == int(gt_instance_centers_full_tn3.shape[1])
+            ):
+                all_gt_valid_tn = gt_instance_valid_full_tn.detach()
+            if (
+                torch.is_tensor(matched_inst_idx)
+                and int(matched_inst_idx.numel()) > 0
+            ):
+                matched_keep = (
+                    (matched_inst_idx >= 0)
+                    & (matched_inst_idx < int(gt_instance_centers_full_tn3.shape[1]))
+                )
+                if bool(matched_keep.any().item()):
+                    matched_inst_idx_vis = matched_inst_idx[matched_keep].to(
+                        device=gt_instance_centers_full_tn3.device,
+                        dtype=torch.long,
+                    )
+                    matched_gt_traj_tn3 = gt_instance_centers_full_tn3.index_select(
+                        1, matched_inst_idx_vis
+                    ).detach()
+                    if torch.is_tensor(all_gt_valid_tn):
+                        matched_gt_valid_tn = all_gt_valid_tn.index_select(
+                            1, matched_inst_idx_vis
+                        ).detach()
+
         return {
             "candidate_points_tq3": candidate_points.detach(),
             "candidate_sigmas_tq3": candidate_sigmas.detach(),
@@ -1500,6 +1564,17 @@ class EfficientOCFVisualizationMixin:
             "matched_query_idx_q": matched_idx.detach(),
             "matched_inst_idx_q": matched_inst_idx.detach(),
             "matched_gt_ids_q": matched_gt_ids.detach(),
+            "matched_gt_traj_tn3": matched_gt_traj_tn3,
+            "matched_gt_valid_tn": matched_gt_valid_tn,
+            "matched_traj_mode_idx_q": (
+                traj_mode_idx_q.index_select(0, matched_idx).detach()
+                if torch.is_tensor(traj_mode_idx_q) else None
+            ),
+            "all_gt_traj_tn3": all_gt_traj_tn3,
+            "all_gt_valid_tn": all_gt_valid_tn,
+            "gt_instance_centers_full_tn3": gt_instance_centers_full_tn3.detach() if torch.is_tensor(gt_instance_centers_full_tn3) else None,
+            "gt_instance_valid_full_tn": gt_instance_valid_full_tn.detach() if torch.is_tensor(gt_instance_valid_full_tn) else None,
+            "gt_instance_ids_full_n": gt_instance_ids_full_n.detach() if torch.is_tensor(gt_instance_ids_full_n) else None,
             "score_q": score_q.detach(),
             "iou_q": iou_q.detach(),
             "cls_prob_q": cls_prob_q.detach(),
@@ -1520,8 +1595,10 @@ class EfficientOCFVisualizationMixin:
             "matched_mixture_sigmas_tqg3": matched_mix_sigmas.detach() if matched_mix_sigmas is not None else None,
             "matched_mixture_yaw_tqg": matched_mix_yaw.detach() if matched_mix_yaw is not None else None,
             "matched_mixture_weights_tqg": matched_mix_weights.detach() if matched_mix_weights is not None else None,
+            "traj_mode_idx_q": traj_mode_idx_q.detach() if torch.is_tensor(traj_mode_idx_q) else None,
             "top_k": int(self.debug_query_score_topk),
             "score_thr": float(self.debug_query_score_threshold),
+            "distance_nms_radius_m": float(getattr(self, "debug_query_distance_nms_radius_m", 0.0)),
             "w_iou": float(w_iou),
             "w_cls": float(w_cls),
             "w_cam": float(w_cam),

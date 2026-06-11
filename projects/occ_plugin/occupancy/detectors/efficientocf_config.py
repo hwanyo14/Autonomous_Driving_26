@@ -17,6 +17,7 @@ MODEL_CFG_DEFAULTS = {
     "query_gt2p_instance_labeled_tau": 1.0,
     "query_gt2p_instance_labeled_assign_sigma_xyz": (4.0, 4.0, 1.5),
     "query_gt2p_instance_labeled_sigma_policy": "fixed",
+    "query_require_history_all_valid": False,
     "query_gt2p_cooldown_enabled": False,
     "query_gt2p_cooldown_start_iter": 0,
     "query_gt2p_cooldown_iters": 0,
@@ -46,6 +47,37 @@ MODEL_CFG_DEFAULTS = {
     "query_traj_loss_type": "l1",
     "query_traj_residual_max_m": (8.0, 8.0),
     "query_traj_prior_detach": True,
+    "query_traj_num_modes": 1,
+    "query_traj_decoder_type": "offset",
+    "query_traj_bernstein_degree": 3,
+    "query_traj_use_stationary_mode": False,
+    "query_traj_use_cv_mode": False,
+    "query_traj_static_gate_enabled": False,
+    "query_traj_static_gate_loss_weight": 0.0,
+    "query_traj_static_gate_threshold": 0.5,
+    "query_traj_derivative_routing_enabled": False,
+    "query_traj_derivative_routing_hidden_dim": 0,
+    "query_traj_teacher_forcing_enabled": False,
+    "query_traj_teacher_forcing_mix_enabled": False,
+    "query_traj_teacher_forcing_gt_ratio": 1.0,
+    "query_traj_teacher_forcing_schedule_iters": (),
+    "query_traj_teacher_forcing_schedule_gt_ratios": (),
+    "query_traj_pred_target_enabled": False,
+    "query_traj_anchor_refine_enabled": False,
+    "query_traj_xy_refine_enabled": False,
+    "query_traj_xy_refine_loss_weight": 0.0,
+    "query_traj_xy_refine_num_layers": 2,
+    "query_traj_xy_refine_hidden_dim": 0,
+    "query_traj_endpoint_conditioning": False,
+    "query_endpoint_loss_weight": 0.0,
+    "query_traj_semantic_routing_enabled": False,
+    "query_traj_rule_turn_family_enabled": False,
+    "query_traj_rule_based_mode_enabled": False,
+    "query_traj_rule_turn_threshold_deg": 10.0,
+    "query_traj_static_threshold_m": 0.8,
+    "query_traj_cv_error_threshold_m": 0.5,
+    "query_traj_mode_cls_loss_weight": 0.0,
+    "query_traj_mode_infer_policy": "argmax",
     "query_traj_moving_reweight_enabled": False,
     "query_traj_moving_threshold_m": 0.5,
     "query_traj_moving_weight": 5.0,
@@ -74,12 +106,15 @@ MODEL_CFG_DEFAULTS = {
     "query_ca_kv_identity_init": False,
     "query_ca_attn_tau": 1.0,
     "query_decor_loss_weight": 0.0,
+    "query_attn_overlap_loss_weight": 0.0,
     "use_query_attn_bbox_loss": False,
     "query_attn_bbox_loss_weight": 1.0,
     "query_attn_bbox_unmatched_weight": 0.25,
+    "query_attn_bbox_other_weight": 0.0,
     "query_attn_bbox_eps": 1e-6,
     "query_attn_bbox_camera_reduce_mode": "camera_aggregated_first",
     "query_attn_bbox_unmatched_mode": "inverse_union",
+    "query_attn_bbox_other_mode": "union",
     "query_attn_match_cost_weight": 0.0,
     "query_attn_match_metric": "soft_iou",
     "query_attn_match_pred_norm": "amax",
@@ -125,6 +160,7 @@ VISUALIZATION_CFG_DEFAULTS = {
     "debug_query_score_iou_weight": 0.5,
     "debug_query_score_cls_weight": 0.5,
     "debug_query_score_cam_attn_weight": 0.0,
+    "debug_query_distance_nms_radius_m": 3.0,
     "debug_instance_img_vis_dir": "./work_dirs/instance_img_debug_vis",
     "debug_instance_img_vis_max_frames": 3,
     "debug_instance_img_vis_max_instances": 24,
@@ -183,6 +219,7 @@ def apply_model_cfg(self, cfg):
     self.query_gt2p_instance_labeled_sigma_policy = str(
         cfg["query_gt2p_instance_labeled_sigma_policy"]
     ).lower()
+    self.query_require_history_all_valid = bool(cfg["query_require_history_all_valid"])
     self.center_only_mode = bool(cfg["center_only_mode"])
     self.query_feat_cosine_threshold = float(cfg["query_feat_cosine_threshold"])
     self.query_center_distance_threshold_m = float(cfg["query_center_distance_threshold_m"])
@@ -225,6 +262,41 @@ def apply_model_cfg(self, cfg):
     self.query_traj_loss_type = str(cfg["query_traj_loss_type"]).lower()
     self.query_traj_residual_max_m = tuple(float(v) for v in cfg["query_traj_residual_max_m"])
     self.query_traj_prior_detach = bool(cfg["query_traj_prior_detach"])
+    self.query_traj_num_modes = int(cfg["query_traj_num_modes"])
+    self.query_traj_decoder_type = str(cfg["query_traj_decoder_type"]).lower()
+    self.query_traj_bernstein_degree = int(cfg["query_traj_bernstein_degree"])
+    self.query_traj_use_stationary_mode = bool(cfg["query_traj_use_stationary_mode"])
+    self.query_traj_use_cv_mode = bool(cfg["query_traj_use_cv_mode"])
+    self.query_traj_static_gate_enabled = bool(cfg["query_traj_static_gate_enabled"])
+    self.query_traj_static_gate_loss_weight = float(cfg["query_traj_static_gate_loss_weight"])
+    self.query_traj_static_gate_threshold = float(cfg["query_traj_static_gate_threshold"])
+    self.query_traj_derivative_routing_enabled = bool(cfg["query_traj_derivative_routing_enabled"])
+    self.query_traj_derivative_routing_hidden_dim = int(cfg["query_traj_derivative_routing_hidden_dim"])
+    self.query_traj_teacher_forcing_enabled = bool(cfg["query_traj_teacher_forcing_enabled"])
+    self.query_traj_teacher_forcing_mix_enabled = bool(cfg["query_traj_teacher_forcing_mix_enabled"])
+    self.query_traj_teacher_forcing_gt_ratio = float(cfg["query_traj_teacher_forcing_gt_ratio"])
+    self.query_traj_teacher_forcing_schedule_iters = tuple(
+        int(v) for v in cfg["query_traj_teacher_forcing_schedule_iters"]
+    )
+    self.query_traj_teacher_forcing_schedule_gt_ratios = tuple(
+        float(v) for v in cfg["query_traj_teacher_forcing_schedule_gt_ratios"]
+    )
+    self.query_traj_pred_target_enabled = bool(cfg["query_traj_pred_target_enabled"])
+    self.query_traj_anchor_refine_enabled = bool(cfg["query_traj_anchor_refine_enabled"])
+    self.query_traj_xy_refine_enabled = bool(cfg["query_traj_xy_refine_enabled"])
+    self.query_traj_xy_refine_loss_weight = float(cfg["query_traj_xy_refine_loss_weight"])
+    self.query_traj_xy_refine_num_layers = int(cfg["query_traj_xy_refine_num_layers"])
+    self.query_traj_xy_refine_hidden_dim = int(cfg["query_traj_xy_refine_hidden_dim"])
+    self.query_traj_endpoint_conditioning = bool(cfg["query_traj_endpoint_conditioning"])
+    self.query_endpoint_loss_weight = float(cfg["query_endpoint_loss_weight"])
+    self.query_traj_semantic_routing_enabled = bool(cfg["query_traj_semantic_routing_enabled"])
+    self.query_traj_rule_turn_family_enabled = bool(cfg["query_traj_rule_turn_family_enabled"])
+    self.query_traj_rule_based_mode_enabled = bool(cfg["query_traj_rule_based_mode_enabled"])
+    self.query_traj_rule_turn_threshold_deg = float(cfg["query_traj_rule_turn_threshold_deg"])
+    self.query_traj_static_threshold_m = float(cfg["query_traj_static_threshold_m"])
+    self.query_traj_cv_error_threshold_m = float(cfg["query_traj_cv_error_threshold_m"])
+    self.query_traj_mode_cls_loss_weight = float(cfg["query_traj_mode_cls_loss_weight"])
+    self.query_traj_mode_infer_policy = str(cfg["query_traj_mode_infer_policy"]).lower()
     self.query_traj_moving_reweight_enabled = bool(cfg["query_traj_moving_reweight_enabled"])
     self.query_traj_moving_threshold_m = float(cfg["query_traj_moving_threshold_m"])
     self.query_traj_moving_weight = float(cfg["query_traj_moving_weight"])
@@ -253,12 +325,15 @@ def apply_model_cfg(self, cfg):
     self.query_ca_kv_identity_init = bool(cfg["query_ca_kv_identity_init"])
     self.query_ca_attn_tau = float(cfg["query_ca_attn_tau"])
     self.query_decor_loss_weight = float(cfg["query_decor_loss_weight"])
+    self.query_attn_overlap_loss_weight = float(cfg["query_attn_overlap_loss_weight"])
     self.use_query_attn_bbox_loss = bool(cfg["use_query_attn_bbox_loss"])
     self.query_attn_bbox_loss_weight = float(cfg["query_attn_bbox_loss_weight"])
     self.query_attn_bbox_unmatched_weight = float(cfg["query_attn_bbox_unmatched_weight"])
+    self.query_attn_bbox_other_weight = float(cfg["query_attn_bbox_other_weight"])
     self.query_attn_bbox_eps = float(cfg["query_attn_bbox_eps"])
     self.query_attn_bbox_camera_reduce_mode = str(cfg["query_attn_bbox_camera_reduce_mode"]).lower()
     self.query_attn_bbox_unmatched_mode = str(cfg["query_attn_bbox_unmatched_mode"]).lower()
+    self.query_attn_bbox_other_mode = str(cfg["query_attn_bbox_other_mode"]).lower()
     self.query_attn_match_cost_weight = float(cfg["query_attn_match_cost_weight"])
     self.query_attn_match_metric = str(cfg["query_attn_match_metric"]).lower()
     self.query_attn_match_pred_norm = str(cfg["query_attn_match_pred_norm"]).lower()
@@ -320,6 +395,7 @@ def apply_visualization_cfg(self, cfg):
     self.debug_query_score_iou_weight = float(cfg["debug_query_score_iou_weight"])
     self.debug_query_score_cls_weight = float(cfg["debug_query_score_cls_weight"])
     self.debug_query_score_cam_attn_weight = float(cfg["debug_query_score_cam_attn_weight"])
+    self.debug_query_distance_nms_radius_m = max(0.0, float(cfg["debug_query_distance_nms_radius_m"]))
     self.debug_instance_img_vis_dir = str(cfg["debug_instance_img_vis_dir"])
     self.debug_instance_img_vis_max_frames = max(1, int(cfg["debug_instance_img_vis_max_frames"]))
     self.debug_instance_img_vis_max_instances = max(1, int(cfg["debug_instance_img_vis_max_instances"]))

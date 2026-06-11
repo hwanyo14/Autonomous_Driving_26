@@ -13,7 +13,7 @@ import copy
 
 @PIPELINES.register_module()
 class LoadInstanceWithFlow(object):
-    def __init__(self, ocf_dataset_path, grid_size=[512, 512, 40], pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0], background=0, use_flow=True, use_separate_classes=False, use_lyft=False, validate_cache=False, write_cache=True, load_segmentation_instance3d=False, segmentation_instance3d_path=None, segmentation_instance3d_key='segmentation_instance_saved_list2', load_segmentation_cls_instance3d=False, segmentation_cls_dataset_path=None, segmentation_cls_key='segmentation_saved_list2', validate_segmentation_cls_instance3d_alignment=False, load_gt_occ_inst=False, gt_occ_inst_dataset_path=None, gt_occ_inst_key='segmentation_instance_saved_list2'):
+    def __init__(self, ocf_dataset_path, grid_size=[512, 512, 40], pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0], background=0, use_flow=True, use_separate_classes=False, use_lyft=False, validate_cache=False, write_cache=True, load_segmentation_instance3d=False, segmentation_instance3d_path=None, segmentation_instance3d_key='segmentation_instance_saved_list2', load_segmentation_cls_instance3d=False, segmentation_cls_dataset_path=None, segmentation_cls_key='segmentation_saved_list2', validate_segmentation_cls_instance3d_alignment=False, load_gt_occ_inst=False, gt_occ_inst_dataset_path=None, gt_occ_inst_key='segmentation_instance_saved_list2', exclude_occ_class_ids=()):
         '''
         Loading sequential occupancy labels and instance flows for training and testing
         '''
@@ -42,6 +42,7 @@ class LoadInstanceWithFlow(object):
         self.load_gt_occ_inst = bool(load_gt_occ_inst)
         self.gt_occ_inst_dataset_path = gt_occ_inst_dataset_path
         self.gt_occ_inst_key = str(gt_occ_inst_key)
+        self.exclude_occ_class_ids = tuple(int(v) for v in exclude_occ_class_ids)
         if self.load_segmentation_cls_instance3d and (not self.load_segmentation_instance3d):
             raise ValueError(
                 "load_segmentation_cls_instance3d=True requires "
@@ -112,6 +113,16 @@ class LoadInstanceWithFlow(object):
             return rows
         order = np.lexsort((rows[:, 2], rows[:, 1], rows[:, 0]))
         return rows[order]
+
+    def _filter_sparse_rows_by_class(self, rows, class_col):
+        arr = np.asarray(rows, dtype=np.int64)
+        exclude_occ_class_ids = tuple(int(v) for v in getattr(self, "exclude_occ_class_ids", ()))
+        if arr.size == 0 or len(exclude_occ_class_ids) <= 0:
+            return arr
+        if arr.ndim != 2 or arr.shape[1] <= int(class_col):
+            return arr
+        keep = ~np.isin(arr[:, int(class_col)], np.asarray(exclude_occ_class_ids, dtype=np.int64))
+        return arr[keep]
 
     def _coords_to_struct(self, xyz):
         xyz = np.asarray(xyz, dtype=np.int64)
@@ -1122,7 +1133,15 @@ class LoadInstanceWithFlow(object):
             gt_list = load_list_from_npz(npz_path, self.segmentation_cls_key)
             if len(gt_list) == 0:
                 raise ValueError(f"bboxcls segmentation list is empty: {npz_path}")
-            return gt_list
+            out = []
+            for rows_raw in gt_list:
+                rows = self._normalize_sparse_rows(
+                    rows_raw,
+                    min_cols=4,
+                    label="segmentation_cls",
+                )
+                out.append(self._filter_sparse_rows_by_class(rows, class_col=3))
+            return out
 
         def load_gt_occ_inst_sparse_list_or_raise(expected_seq_len):
             if gt_occ_inst_label_path is None:
@@ -1144,6 +1163,7 @@ class LoadInstanceWithFlow(object):
                     min_cols=5,
                     label="gt_occ_inst",
                 )
+                rows = self._filter_sparse_rows_by_class(rows, class_col=3)
                 out.append(rows.astype(np.int64, copy=False))
             return out
 
@@ -1307,9 +1327,16 @@ class LoadInstanceWithFlow(object):
         if self.load_segmentation_instance3d and (not need_regen) and (seg_instance3d_label_path is not None) and os.path.exists(seg_instance3d_label_path + ".npz"):
             try:
                 gt_list = load_list_from_npz(seg_instance3d_label_path + ".npz", self.segmentation_instance3d_key)
-                segmentation_instance3d_sparse_list = gt_list
+                segmentation_instance3d_sparse_list = []
                 for j in range(len(gt_list)):
-                    segmentation_instance3d = sparse_instance3d_to_dense(gt_list[j]).long()
+                    rows = self._normalize_sparse_rows(
+                        gt_list[j],
+                        min_cols=4,
+                        label="segmentation_instance3d",
+                    )
+                    rows = self._filter_sparse_rows_by_class(rows, class_col=-1)
+                    segmentation_instance3d_sparse_list.append(rows)
+                    segmentation_instance3d = sparse_instance3d_to_dense(rows).long()
                     segmentation_instance3d_list.append(segmentation_instance3d.unsqueeze(0))
             except Exception as e:
                 print(f"[BAD_NPZ] {seg_instance3d_label_path}.npz err={repr(e)}", flush=True)

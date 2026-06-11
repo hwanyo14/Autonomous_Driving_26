@@ -49,6 +49,8 @@ class TransformerModule(nn.Module):
                  ca_attn_tau=1.0,
                  query_decor_loss_weight=0.0,
                  query_decor_eps=1e-6,
+                 query_attn_overlap_loss_weight=0.0,
+                 query_attn_overlap_eps=1e-6,
                  attn_vis_every=0,
                  attn_vis_dir="./work_dirs/query_attn_vis",
                  attn_vis_max_frames=3,
@@ -83,6 +85,15 @@ class TransformerModule(nn.Module):
         self.query_decor_eps = float(query_decor_eps)
         if self.query_decor_eps <= 0.0:
             raise ValueError(f"query_decor_eps must be positive, got {self.query_decor_eps}")
+        self.query_attn_overlap_loss_weight = float(query_attn_overlap_loss_weight)
+        if self.query_attn_overlap_loss_weight < 0.0:
+            raise ValueError(
+                "query_attn_overlap_loss_weight must be non-negative, "
+                f"got {self.query_attn_overlap_loss_weight}"
+            )
+        self.query_attn_overlap_eps = float(query_attn_overlap_eps)
+        if self.query_attn_overlap_eps <= 0.0:
+            raise ValueError(f"query_attn_overlap_eps must be positive, got {self.query_attn_overlap_eps}")
         self.attn_vis_every = int(attn_vis_every)
         self.attn_vis_dir = str(attn_vis_dir)
         self.attn_vis_max_frames = int(attn_vis_max_frames)
@@ -149,6 +160,8 @@ class TransformerModule(nn.Module):
         self.last_query_context_pool = None
         self.last_query_decor_loss = None
         self.last_query_decor_loss_raw = None
+        self.last_query_attn_overlap_loss = None
+        self.last_query_attn_overlap_loss_raw = None
         self._install_debug_grad_hooks()
 
 
@@ -464,6 +477,24 @@ class TransformerModule(nn.Module):
         loss_b = off.pow(2).sum(dim=(1, 2)) / denom
         return loss_b.mean()
 
+    def _compute_query_attn_overlap_loss_from_w1(self, w1: torch.Tensor) -> torch.Tensor:
+        if (not torch.is_tensor(w1)) or (w1.dim() not in (3, 4)):
+            return self.query.sum() * 0.0
+
+        if w1.dim() == 4:
+            attn = w1.mean(dim=1)
+        else:
+            attn = w1
+        b, q, _ = [int(v) for v in attn.shape]
+        if q <= 1:
+            return attn.sum() * 0.0
+
+        x = F.normalize(attn.to(torch.float32), p=2, dim=-1, eps=self.query_attn_overlap_eps)
+        sim = torch.bmm(x, x.transpose(1, 2)).clamp(0.0, 1.0)
+        eye = torch.eye(q, device=sim.device, dtype=torch.bool).unsqueeze(0)
+        off = sim.masked_fill(eye, 0.0)
+        return off.sum(dim=(1, 2)).div(float(q * (q - 1))).mean()
+
     @staticmethod
     def _format_ca1_attn_weights_tqnhw(
         attn_weights: torch.Tensor,
@@ -527,6 +558,8 @@ class TransformerModule(nn.Module):
         S = Ncam * H * W
         self.last_query_decor_loss = None
         self.last_query_decor_loss_raw = None
+        self.last_query_attn_overlap_loss = None
+        self.last_query_attn_overlap_loss_raw = None
         attn_step = self._get_train_iteration(advance_if_unsynced=True)
         attn_vis_now = (
             self.training
@@ -569,10 +602,12 @@ class TransformerModule(nn.Module):
         q = q0
         q_list = []
         decor_terms = []
+        attn_overlap_terms = []
         attn_list = [] if return_attn_weights else None
         attn_vis_list = [] if attn_vis_now else None
         pooled_list = [] if return_attn_pool else None
-        need_weights = bool(return_attn_pool or return_attn_weights or attn_vis_now)
+        use_attn_overlap_loss = self.training and self.query_attn_overlap_loss_weight > 0.0
+        need_weights = bool(return_attn_pool or return_attn_weights or attn_vis_now or use_attn_overlap_loss)
 
         for t in range(T):
             kv = x[t].reshape(1, S, C)  # [1, S, C]
@@ -594,6 +629,8 @@ class TransformerModule(nn.Module):
                     average_attn_weights=average_attn_weights,
                 )
                 q1 = self.q_norm1_layers[layer_idx](q_in + out1)
+                if use_attn_overlap_loss:
+                    attn_overlap_terms.append(self._compute_query_attn_overlap_loss_from_w1(w1))
 
                 # SA1
                 out2, _ = self.sa_layers[layer_idx](
@@ -665,6 +702,12 @@ class TransformerModule(nn.Module):
             decor_raw = q_final.sum() * 0.0
         self.last_query_decor_loss_raw = decor_raw
         self.last_query_decor_loss = decor_raw * float(self.query_decor_loss_weight)
+        if len(attn_overlap_terms) > 0:
+            attn_overlap_raw = torch.stack(attn_overlap_terms, dim=0).mean()
+        else:
+            attn_overlap_raw = q_final.sum() * 0.0
+        self.last_query_attn_overlap_loss_raw = attn_overlap_raw
+        self.last_query_attn_overlap_loss = attn_overlap_raw * float(self.query_attn_overlap_loss_weight)
 
         if dbg_now and self._is_rank0():
             gmsg = {

@@ -55,6 +55,17 @@ def format_iou_results(mean_ious, return_dic=False):
             0: 'free',
             1: 'movable objects',
         }
+    elif len(mean_ious) == 8:
+        class_map = {
+            0: 'free',
+            1: 'bicycle',
+            2: 'bus',
+            3: 'car',
+            4: 'construction',
+            5: 'motorcycle',
+            6: 'trailer',
+            7: 'truck',
+        }
     else:
         class_map = {
             0: 'free',
@@ -87,18 +98,30 @@ def format_iou_results(mean_ious, return_dic=False):
         return x
 
 def format_vel_results(mean_epe, return_dic=False):
-    class_map = {
-        0: 'barrier',
-        1: 'bicycle',
-        2: 'bus',
-        3: 'car',
-        4: 'construction_vehicle',
-        5: 'motorcycle',
-        6: 'pedestrian',
-        7: 'traffic_cone',
-        8: 'trailer',
-        9: 'truck',
-    }
+    if len(mean_epe) == 8:
+        class_map = {
+            0: 'barrier',
+            1: 'bicycle',
+            2: 'bus',
+            3: 'car',
+            4: 'construction_vehicle',
+            5: 'motorcycle',
+            6: 'trailer',
+            7: 'truck',
+        }
+    else:
+        class_map = {
+            0: 'barrier',
+            1: 'bicycle',
+            2: 'bus',
+            3: 'car',
+            4: 'construction_vehicle',
+            5: 'motorcycle',
+            6: 'pedestrian',
+            7: 'traffic_cone',
+            8: 'trailer',
+            9: 'truck',
+        }
     x = PrettyTable()
     x.field_names = ['class', 'EPE']
     class_names = list(class_map.values())

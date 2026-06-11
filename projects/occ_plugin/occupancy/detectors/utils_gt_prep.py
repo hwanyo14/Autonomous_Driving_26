@@ -474,6 +474,61 @@ class EfficientOCFGTPrepMixin:
         ).contiguous()
 
     @staticmethod
+    def _build_history_all_valid_instance_ids(
+        gt_instance_centers_valid=None,
+        gt_instance_ids=None,
+        time_receptive_field: int = 3,
+    ):
+        if (not torch.is_tensor(gt_instance_centers_valid)) or (not torch.is_tensor(gt_instance_ids)):
+            return None
+        valid_tn = gt_instance_centers_valid
+        ids_n = gt_instance_ids.to(torch.long).contiguous()
+        if valid_tn.dim() != 2 or ids_n.dim() != 1:
+            return None
+        if int(valid_tn.shape[1]) != int(ids_n.numel()):
+            return None
+        t_hist = int(time_receptive_field)
+        if t_hist <= 0 or int(valid_tn.shape[0]) < t_hist:
+            return None
+        keep_n = valid_tn[:t_hist].to(torch.bool).all(dim=0)
+        return ids_n[keep_n].contiguous()
+
+    @staticmethod
+    def _filter_dense_instance_ids(
+        dense_gt=None,
+        keep_instance_ids=None,
+        background_index: int = 0,
+        ignore_index: int = 255,
+    ):
+        if (not torch.is_tensor(dense_gt)) or (not torch.is_tensor(keep_instance_ids)):
+            return dense_gt
+        if dense_gt.dim() == 4:
+            inst = dense_gt.to(torch.long)
+            keep = inst == int(background_index)
+            keep |= inst == int(ignore_index)
+            for instance_id in keep_instance_ids.detach().cpu().tolist():
+                keep |= inst == int(instance_id)
+            if bool(keep.all().item()):
+                return dense_gt
+            out = inst.clone()
+            out[~keep] = int(background_index)
+            return out.contiguous()
+        if dense_gt.dim() == 5 and int(dense_gt.shape[1]) == 2:
+            out = dense_gt.to(torch.long).clone()
+            cls = out[:, 0]
+            inst = out[:, 1]
+            keep = inst == int(background_index)
+            keep |= inst == int(ignore_index)
+            for instance_id in keep_instance_ids.detach().cpu().tolist():
+                keep |= inst == int(instance_id)
+            drop = ~keep
+            if bool(drop.any().item()):
+                cls[drop] = int(background_index)
+                inst[drop] = int(background_index)
+            return out.contiguous()
+        return dense_gt
+
+    @staticmethod
     def _filter_instance_targets_by_intersection_ids(
         centers_world_tn3=None,
         centers_valid_tn=None,
@@ -975,6 +1030,34 @@ class EfficientOCFGTPrepMixin:
             dim=1,
         ).contiguous()
 
+    def _filter_gt_occ_inst_sparse_list_by_query_classes(
+        self,
+        sparse_list,
+        background_index: int = 0,
+        ignore_index: int = 255,
+    ):
+        if not isinstance(sparse_list, (list, tuple)):
+            return sparse_list
+        allowed_raw_ids = set(int(v) for v in getattr(self, "query_class_ids", tuple()))
+        if len(allowed_raw_ids) <= 0:
+            return sparse_list
+
+        filtered = []
+        for rows in sparse_list:
+            arr = np.asarray(rows, dtype=np.int64)
+            if arr.size <= 0:
+                filtered.append(arr.reshape(0, 5))
+                continue
+            if arr.ndim != 2 or arr.shape[1] < 5:
+                filtered.append(arr)
+                continue
+            cls = arr[:, 3]
+            keep = (cls == int(background_index)) | (cls == int(ignore_index))
+            for raw_id in allowed_raw_ids:
+                keep |= (cls == int(raw_id))
+            filtered.append(arr[keep].copy())
+        return filtered
+
     def _prepare_gt_occ_inst_primary_targets(
         self,
         gt_occ_inst=None,
@@ -983,6 +1066,7 @@ class EfficientOCFGTPrepMixin:
         sparse = self._extract_gt_occ_inst_sparse_list(gt_occ_inst=gt_occ_inst)
         if sparse is None:
             return None
+        sparse = self._filter_gt_occ_inst_sparse_list_by_query_classes(sparse)
         dense_inst, dense_cls = self._build_dense_from_gt_occ_inst_sparse(
             sparse_list=sparse,
             fallback_segmentation_instance3d_txyz=fallback_segmentation_instance3d_txyz,
@@ -1059,7 +1143,23 @@ class EfficientOCFGTPrepMixin:
                 f"Unsupported segmentation_cls_instance3d shape: {tuple(seg.shape)}"
             )
 
-        return seg.to(torch.long).contiguous()
+        seg = seg.to(torch.long).contiguous()
+        allowed_raw_ids = set(int(v) for v in getattr(self, "query_class_ids", tuple()))
+        if len(allowed_raw_ids) <= 0:
+            return seg
+
+        cls_txyz = seg[:, 0]
+        inst_txyz = seg[:, 1]
+        keep_mask = (cls_txyz == 0) | (cls_txyz == 255)
+        for raw_id in allowed_raw_ids:
+            keep_mask |= (cls_txyz == int(raw_id))
+        if bool((~keep_mask).any().item()):
+            cls_txyz = cls_txyz.clone()
+            inst_txyz = inst_txyz.clone()
+            cls_txyz[~keep_mask] = 0
+            inst_txyz[~keep_mask] = 0
+            seg = torch.stack((cls_txyz, inst_txyz), dim=1).contiguous()
+        return seg
 
     def _validate_query_class_id_tensor(
         self,

@@ -514,7 +514,7 @@ custom_hooks = [
 log_config = dict(
     interval=1,
     hooks=[
-        dict(type='TextLoggerHook'),
+        dict(type='TextLoggerHookNoDbg'),
         dict(type='TensorboardLoggerHookSplitTabs'),
         # dict(
         #     type='WandbLoggerHook',

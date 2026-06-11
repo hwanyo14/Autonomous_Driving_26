@@ -29,7 +29,8 @@ class LoadOccupancy(object):
                  dt_type='float16',
                  strict_dt=True,
                  validate_height_cache=True,
-                 write_height_cache=True):
+                 write_height_cache=True,
+                 exclude_occ_class_ids=()):
         '''
         Read sequential fine-grained occupancy labels from nuScenes-Occupancy if use_fine_occ=True
         '''
@@ -51,6 +52,7 @@ class LoadOccupancy(object):
         self.strict_dt = strict_dt
         self.validate_height_cache = bool(validate_height_cache)
         self.write_height_cache = bool(write_height_cache)
+        self.exclude_occ_class_ids = tuple(int(v) for v in exclude_occ_class_ids)
 
     def _load_single_dt(self, scene_token, lidar_token):
         p = os.path.join(self.dt_path, f"scene_{scene_token}", "dt", f"{lidar_token}.npz")
