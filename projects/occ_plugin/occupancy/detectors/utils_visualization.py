@@ -1603,3 +1603,215 @@ class EfficientOCFVisualizationMixin:
             "w_cls": float(w_cls),
             "w_cam": float(w_cam),
         }
+
+    _QUERY_CLS_NAMES_8 = ("bg", "bicycle", "bus", "car", "constr_veh", "motorcycle", "trailer", "truck")
+
+    def maybe_save_query_mixture_3d_vis(
+        self,
+        query_vis_bundle=None,
+        gt_instance_occ3d_txyz=None,
+        gt_inst_center_world_tn3=None,
+        gt_inst_center_valid_tn=None,
+        gt_inst_cls_n=None,
+        img_metas=None,
+        step: int = 0,
+    ) -> None:
+        vis_every = int(getattr(self, "debug_query_mixture3d_vis_every", 0))
+        if vis_every <= 0:
+            return
+        if (int(step) % vis_every) != 0:
+            return
+        if not self._is_main_process():
+            return
+        if not isinstance(query_vis_bundle, dict):
+            return
+        if (not torch.is_tensor(gt_instance_occ3d_txyz)) or gt_instance_occ3d_txyz.dim() != 4:
+            return
+        sel_points_tq3 = query_vis_bundle.get("selected_points_tq3", None)
+        if (not torch.is_tensor(sel_points_tq3)) or sel_points_tq3.dim() != 3:
+            return
+        try:
+            import numpy as np
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            from matplotlib import cm
+        except Exception:
+            return
+
+        pc = [float(v) for v in self.point_cloud_range]
+        x_dim, y_dim, z_dim = [int(v) for v in gt_instance_occ3d_txyz.shape[1:4]]
+        vx = (pc[3] - pc[0]) / x_dim
+        vy = (pc[4] - pc[1]) / y_dim
+        vz = (pc[5] - pc[2]) / z_dim
+        t_present = max(0, int(getattr(self, "time_receptive_field", 3)) - 1)
+
+        # GT instance voxels (present frame) -> world-coordinate scatter points.
+        t_occ = min(t_present, int(gt_instance_occ3d_txyz.shape[0]) - 1)
+        occ = gt_instance_occ3d_txyz[t_occ].detach()
+        occ_idx = torch.nonzero(occ > 0, as_tuple=False)
+        inst_ids = occ[occ_idx[:, 0], occ_idx[:, 1], occ_idx[:, 2]].to(torch.long)
+        max_pts = int(getattr(self, "debug_query_mixture3d_vis_max_gt_points", 40000))
+        if int(occ_idx.shape[0]) > max_pts:
+            stride = -(-int(occ_idx.shape[0]) // max_pts)
+            occ_idx = occ_idx[::stride]
+            inst_ids = inst_ids[::stride]
+        occ_xyz = occ_idx.to(torch.float32).cpu().numpy()
+        occ_xyz[:, 0] = pc[0] + (occ_xyz[:, 0] + 0.5) * vx
+        occ_xyz[:, 1] = pc[1] + (occ_xyz[:, 1] + 0.5) * vy
+        occ_xyz[:, 2] = pc[2] + (occ_xyz[:, 2] + 0.5) * vz
+        occ_colors = cm.tab20((inst_ids.cpu().numpy() % 20) / 19.0)
+
+        # GT centers (present frame) with class labels.
+        gt_centers = None
+        gt_cls = None
+        if torch.is_tensor(gt_inst_center_world_tn3) and gt_inst_center_world_tn3.dim() == 3:
+            t_gt = min(t_present, int(gt_inst_center_world_tn3.shape[0]) - 1)
+            centers_n3 = gt_inst_center_world_tn3[t_gt].detach()
+            valid_n = (
+                gt_inst_center_valid_tn[t_gt].detach().to(torch.bool)
+                if torch.is_tensor(gt_inst_center_valid_tn)
+                and gt_inst_center_valid_tn.dim() == 2
+                and int(gt_inst_center_valid_tn.shape[1]) == int(centers_n3.shape[0])
+                else torch.ones((int(centers_n3.shape[0]),), device=centers_n3.device, dtype=torch.bool)
+            )
+            gt_centers = centers_n3[valid_n].cpu().numpy()
+            if torch.is_tensor(gt_inst_cls_n) and int(gt_inst_cls_n.numel()) == int(centers_n3.shape[0]):
+                gt_cls = gt_inst_cls_n.detach().reshape(-1)[valid_n.cpu()].to(torch.long).cpu().numpy()
+
+        # Selected queries (score-based selection from the bundle), present frame.
+        max_q = int(getattr(self, "debug_query_mixture3d_vis_max_queries", 50))
+        t_q = min(t_present, int(sel_points_tq3.shape[0]) - 1)
+        sel_pts = sel_points_tq3[t_q, :max_q].detach().cpu().numpy()
+        sel_cls = query_vis_bundle.get("selected_pred_cls_q", None)
+        sel_cls = (
+            sel_cls.detach()[:max_q].to(torch.long).cpu().numpy()
+            if torch.is_tensor(sel_cls) else np.zeros((sel_pts.shape[0],), dtype=np.int64)
+        )
+        sel_score = query_vis_bundle.get("selected_score_q", None)
+        sel_score = (
+            sel_score.detach()[:max_q].cpu().numpy()
+            if torch.is_tensor(sel_score) else np.zeros((sel_pts.shape[0],), dtype=np.float32)
+        )
+        sel_idx = query_vis_bundle.get("selected_query_idx_q", None)
+        matched_idx = query_vis_bundle.get("matched_query_idx_q", None)
+        matched_set = (
+            set(int(v) for v in matched_idx.detach().cpu().tolist())
+            if torch.is_tensor(matched_idx) else set()
+        )
+        sel_is_matched = np.array(
+            [int(v) in matched_set for v in sel_idx.detach()[:max_q].cpu().tolist()]
+            if torch.is_tensor(sel_idx) else [False] * sel_pts.shape[0],
+            dtype=bool,
+        )
+
+        mix_centers = query_vis_bundle.get("selected_mixture_centers_tqg3", None)
+        mix_sigmas = query_vis_bundle.get("selected_mixture_sigmas_tqg3", None)
+        mix_yaw = query_vis_bundle.get("selected_mixture_yaw_tqg", None)
+        mix_weights = query_vis_bundle.get("selected_mixture_weights_tqg", None)
+        has_mixture = all(torch.is_tensor(v) for v in (mix_centers, mix_sigmas, mix_yaw, mix_weights))
+        if has_mixture:
+            t_m = min(t_present, int(mix_centers.shape[0]) - 1)
+            mix_centers = mix_centers[t_m, :max_q].detach().cpu().numpy()
+            mix_sigmas = mix_sigmas[t_m, :max_q].detach().cpu().numpy()
+            mix_yaw = mix_yaw[t_m, :max_q].detach().cpu().numpy()
+            mix_weights = mix_weights[t_m, :max_q].detach().cpu().numpy()
+
+        def _cls_color(cls_id):
+            return cm.tab10((int(cls_id) % 10) / 9.0)
+
+        def _cls_name(cls_id):
+            cls_id = int(cls_id)
+            if 0 <= cls_id < len(self._QUERY_CLS_NAMES_8):
+                return self._QUERY_CLS_NAMES_8[cls_id]
+            return f"c{cls_id}"
+
+        def _ellipsoid_wire(center, sigma, yaw):
+            u = np.linspace(0.0, 2.0 * np.pi, 13)
+            v = np.linspace(0.0, np.pi, 7)
+            xs = np.outer(np.cos(u), np.sin(v)) * sigma[0]
+            ys = np.outer(np.sin(u), np.sin(v)) * sigma[1]
+            zs = np.outer(np.ones_like(u), np.cos(v)) * sigma[2]
+            c, s = np.cos(yaw), np.sin(yaw)
+            return (
+                c * xs - s * ys + center[0],
+                s * xs + c * ys + center[1],
+                zs + center[2],
+            )
+
+        # 3 views: oblique / oblique-rear (z exaggerated ~2.8x) + low side (true z ratio).
+        views = (
+            ("oblique z*2.8", 35.0, -60.0, 0.22),
+            ("oblique rear z*2.8", 35.0, 120.0, 0.22),
+            ("low side true-z", 8.0, -90.0, 0.078),
+        )
+        try:
+            fig = plt.figure(figsize=(27, 9))
+            for view_i, (view_name, elev, azim, z_aspect) in enumerate(views):
+                ax = fig.add_subplot(1, 3, view_i + 1, projection="3d")
+                if occ_xyz.shape[0] > 0:
+                    ax.scatter(
+                        occ_xyz[:, 0], occ_xyz[:, 1], occ_xyz[:, 2],
+                        c=occ_colors, s=1.0, alpha=0.35, linewidths=0,
+                    )
+                if gt_centers is not None and gt_centers.shape[0] > 0:
+                    ax.scatter(
+                        gt_centers[:, 0], gt_centers[:, 1], gt_centers[:, 2],
+                        marker="x", c="lime", s=60, linewidths=2.0,
+                    )
+                    if gt_cls is not None and view_i == 0:
+                        for n_i in range(gt_centers.shape[0]):
+                            ax.text(
+                                gt_centers[n_i, 0], gt_centers[n_i, 1], gt_centers[n_i, 2] + 0.5,
+                                _cls_name(gt_cls[n_i]), color="lime", fontsize=6,
+                            )
+                for q_i in range(sel_pts.shape[0]):
+                    q_color = _cls_color(sel_cls[q_i])
+                    ax.scatter(
+                        sel_pts[q_i, 0], sel_pts[q_i, 1], sel_pts[q_i, 2],
+                        c=[q_color], s=50,
+                        edgecolors="black" if sel_is_matched[q_i] else "none",
+                        linewidths=1.2,
+                    )
+                    if view_i == 0:
+                        ax.text(
+                            sel_pts[q_i, 0], sel_pts[q_i, 1], sel_pts[q_i, 2] + 0.8,
+                            f"{sel_score[q_i]:.2f}", color="black", fontsize=5,
+                        )
+                    if has_mixture:
+                        w_g = mix_weights[q_i]
+                        ax.scatter(
+                            mix_centers[q_i, :, 0], mix_centers[q_i, :, 1], mix_centers[q_i, :, 2],
+                            c=[q_color], s=4.0 + 30.0 * (w_g / max(float(w_g.max()), 1e-6)),
+                            alpha=0.8, linewidths=0,
+                        )
+                        for g_i in np.argsort(-w_g)[:6]:
+                            ex, ey, ez = _ellipsoid_wire(
+                                mix_centers[q_i, g_i], mix_sigmas[q_i, g_i], mix_yaw[q_i, g_i]
+                            )
+                            ax.plot_wireframe(ex, ey, ez, color=q_color, linewidth=0.4, alpha=0.45)
+                ax.set_xlim(pc[0], pc[3])
+                ax.set_ylim(pc[1], pc[4])
+                ax.set_zlim(pc[2], pc[5])
+                ax.set_box_aspect((1.0, 1.0, float(z_aspect)))
+                ax.view_init(elev=elev, azim=azim)
+                ax.set_title(f"{view_name} | iter {int(step)} t={t_occ}", fontsize=9)
+            fig.suptitle(
+                f"selected={sel_pts.shape[0]} matched(sel)={int(sel_is_matched.sum())} "
+                f"gt_inst={0 if gt_centers is None else gt_centers.shape[0]}",
+                fontsize=10,
+            )
+            scene_token, lidar_token = self._extract_meta_tokens(img_metas)
+            vis_dir = os.path.join(
+                str(getattr(self, "debug_query_mixture3d_vis_dir", "./work_dirs/query_mixture3d_vis")),
+                f"iter_{int(step):06d}",
+            )
+            os.makedirs(vis_dir, exist_ok=True)
+            fig.savefig(
+                os.path.join(vis_dir, f"mix3v_{scene_token}_{lidar_token}.png"),
+                dpi=120, bbox_inches="tight",
+            )
+        except Exception as exc:
+            print(f"[query_mixture3d_vis] render failed at iter {int(step)}: {exc}")
+        finally:
+            plt.close("all")

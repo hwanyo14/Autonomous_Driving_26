@@ -35,19 +35,19 @@ segmentation_cls_dataset_path = "./data/efficientocf_bboxcls/"
 gt_occ_inst_dataset_path = "./data/nuScenes-Occupancy_inst3d/"
 
 # Query/GMO foreground semantic classes use sparse raw nuScenes occupancy ids:
-# [2, 3, 4, 5, 6, 7, 9, 10] + background(0)
+# [2, 3, 4, 5, 6, 9, 10] + background(0); pedestrian(7) excluded
 class_names = [
     'bicycle',
     'bus',
     'car',
     'construction',
     'motorcycle',
-    'pedestrian',
     'trailer',
     'truck',
 ]
-query_class_ids = [0, 2, 3, 4, 5, 6, 7, 9, 10]
+query_class_ids = [0, 2, 3, 4, 5, 6, 9, 10]
 query_class_names = ['background'] + class_names
+exclude_occ_class_ids = (7,)  # pedestrian: 로드 단계에서 제거 (nohuman)
 validate_segmentation_cls_instance3d_alignment = True
 strict_query_class_id_validation = True
 use_separate_classes = False
@@ -137,6 +137,7 @@ train_pipeline = [
         validate_segmentation_cls_instance3d_alignment=validate_segmentation_cls_instance3d_alignment,
         load_gt_occ_inst=True,
         gt_occ_inst_dataset_path=gt_occ_inst_dataset_path,
+        exclude_occ_class_ids=exclude_occ_class_ids,
     ),
     dict(
         type='LoadMultiViewImageFromFiles_BEVDet',
@@ -167,6 +168,7 @@ train_pipeline = [
         strict_dt=True,
         validate_height_cache=False,
         write_height_cache=write_height_cache,
+        exclude_occ_class_ids=exclude_occ_class_ids,
     ),
     dict(type='OccDefaultFormatBundle3D', class_names=class_names),
     dict(
@@ -235,6 +237,7 @@ test_pipeline = [
         validate_segmentation_cls_instance3d_alignment=validate_segmentation_cls_instance3d_alignment,
         load_gt_occ_inst=True,
         gt_occ_inst_dataset_path=gt_occ_inst_dataset_path,
+        exclude_occ_class_ids=exclude_occ_class_ids,
     ),
     dict(
         type='LoadMultiViewImageFromFiles_BEVDet',
@@ -368,21 +371,60 @@ model_cfg = dict(
     query_class_names=query_class_names,
     strict_query_class_id_validation=strict_query_class_id_validation,
     query_num_classes=len(query_class_ids),
-    query_cls_loss_class_weights=[0.1] + [1.0] * (len(query_class_ids) - 1),
-    query_attn_match_cost_weight=0.5,
+    query_cls_loss_class_weights=[0.02, 1.4, 1.3, 0.30, 1.4, 1.4, 1.2, 0.9],
+    query_attn_match_metric='inside_log',
+    query_attn_match_cost_weight=0.3,
     query_embed_dim=bev_feat_dim,
     query_id_reinject_scale=0.2,
     query_decor_loss_weight=1.0,
     use_query_attn_bbox_loss=True,
+    query_attn_bbox_other_weight=0.3,
+    query_attn_bbox_other_mode='union',
+    query_attn_bbox_unmatched_weight=0.0,
+    query_require_history_all_valid=True,
     query_attn_cam_gaussian_truncate_sigma=1.777,
-    query_center_match_cost_weight=4.0,
-    query_temporal_offset_match_cost_weight=2.0,
+    query_num_queries=200,
+    query_cls_match_cost_weight=0.075,
+    query_center_match_cost_weight=10.0,
+    query_temporal_offset_match_cost_weight=0.5,
     query_center_routed_loss_weight=0.3,
-    query_traj_loss_weight=0.5,
+    # --- trajectory: 2-mode (TRAJECTORY_CONFIG.md / cen10_6) ---
+    query_traj_num_modes=2,
+    query_traj_use_stationary_mode=True,
+    query_traj_use_cv_mode=False,
+    query_traj_decoder_type='offset',
     query_traj_residual_max_m=(15.0, 15.0),
+    # 라우팅 (정답 라벨 생성)
+    query_traj_semantic_routing_enabled=True,
+    query_traj_rule_turn_family_enabled=False,
+    query_traj_static_threshold_m=0.8,
+    # 추론
+    query_traj_mode_infer_policy='argmax',
+    # loss 가중 (warmup이 epoch별로 덮어씀)
+    query_traj_loss_weight=0.5,
+    query_traj_mode_cls_loss_weight=0.1,
+    query_traj_static_weight=1.0,
+    query_traj_moving_weight=5.0,
     query_traj_moving_reweight_enabled=True,
     query_traj_moving_threshold_m=0.8,
-    query_matched_gmo_bce_occ_size=(64, 64, 20),
+    # xy refine
+    query_traj_xy_refine_enabled=True,
+    query_traj_xy_refine_loss_weight=0.1,
+    query_traj_xy_refine_num_layers=2,
+    query_traj_xy_refine_hidden_dim=64,
+    # 비활성
+    query_traj_static_gate_enabled=False,
+    query_traj_derivative_routing_enabled=False,
+    # teacher forcing: iter 스케줄 비활성 → warmup hook이 gt_ratio를 epoch 단위로 제어
+    # (GPU 수와 무관; 원본 1-GPU 기준 epoch 0.75~2.0 전환을 epoch 계단으로 근사)
+    query_traj_teacher_forcing_enabled=True,
+    query_traj_teacher_forcing_mix_enabled=True,
+    query_traj_teacher_forcing_gt_ratio=1.0,
+    query_traj_teacher_forcing_schedule_iters=(),
+    query_traj_teacher_forcing_schedule_gt_ratios=(),
+    # shape Run 1: lowres 상향 (xy 1.6m→0.8m, 차가 3x1→6x2 복셀) + dice를 BEV 2D→3D로 (z 모양 supervise)
+    query_matched_gmo_bce_occ_size=(128, 128, 40),
+    query_gmo_dice_3d=True,
     query_num_gaussians=16,
     query_multi_gaussian_offset_max_m=(3.0, 3.0, 0.7),
     query_multi_gaussian_sigma_min_m=(0.15, 0.15, 0.15),
@@ -406,8 +448,8 @@ visualization_cfg = dict(
     debug_query_vis_dir="./work_dirs/query_debug_vis_no_pretrain",
     debug_query_gaussian_vis_mode='prob',
     debug_query_score_iou_weight=0.0,
-    debug_query_score_cls_weight=0.3,
-    debug_query_score_cam_attn_weight=0.7,
+    debug_query_score_cls_weight=1.0,
+    debug_query_score_cam_attn_weight=0.0,
     debug_instance_img_vis_dir="./work_dirs/instance_img_debug_vis_no_pretrain",
     debug_instance_img_vis_max_frames=n_future_frames_plus,
     debug_query_cam_gaussian_vis_dir="./work_dirs/query_cam_gaussian_vis_no_pretrain",
@@ -486,7 +528,7 @@ optimizer = dict(
 
 optimizer_config = dict(
     type='GradientCumulativeOptimizerHook',
-    cumulative_iters=8,
+    cumulative_iters=2,
     grad_clip=dict(max_norm=35, norm_type=2),
 )
 
@@ -508,8 +550,34 @@ evaluation = dict(
     rule='greater',
 )
 
+# 주의: hook은 매 epoch 시작 시 begin_epoch ≤ 현재 epoch인 "마지막 stage 하나"만 적용함.
+# 따라서 각 stage는 전체 키를 다 들고 있어야 함 (누적 merge 아님).
+# teacher forcing gt_ratio도 여기서 epoch 단위로 제어 (iter 스케줄은 비활성).
+# mode_cls는 0.1 고정. TF는 epoch 1~4 풀 유지 → 5~7 ramp(0.9/0.7/0.5) → 8부터 0.
+traj_warmup_schedule = [
+    dict(begin_epoch=1, query_traj_loss_weight=0.05, query_traj_xy_refine_loss_weight=0.00,
+         query_traj_mode_cls_loss_weight=0.10, query_traj_teacher_forcing_enabled=True,
+         query_traj_teacher_forcing_gt_ratio=1.0),
+    dict(begin_epoch=5, query_traj_loss_weight=0.15, query_traj_xy_refine_loss_weight=0.02,
+         query_traj_mode_cls_loss_weight=0.10, query_traj_teacher_forcing_enabled=True,
+         query_traj_teacher_forcing_gt_ratio=0.9),
+    dict(begin_epoch=6, query_traj_loss_weight=0.15, query_traj_xy_refine_loss_weight=0.02,
+         query_traj_mode_cls_loss_weight=0.10, query_traj_teacher_forcing_enabled=True,
+         query_traj_teacher_forcing_gt_ratio=0.7),
+    dict(begin_epoch=7, query_traj_loss_weight=0.15, query_traj_xy_refine_loss_weight=0.02,
+         query_traj_mode_cls_loss_weight=0.10, query_traj_teacher_forcing_enabled=True,
+         query_traj_teacher_forcing_gt_ratio=0.5),
+    dict(begin_epoch=8, query_traj_loss_weight=0.25, query_traj_xy_refine_loss_weight=0.05,
+         query_traj_mode_cls_loss_weight=0.10, query_traj_teacher_forcing_enabled=True,
+         query_traj_teacher_forcing_gt_ratio=0.0),
+    dict(begin_epoch=11, query_traj_loss_weight=0.50, query_traj_xy_refine_loss_weight=0.10,
+         query_traj_mode_cls_loss_weight=0.10, query_traj_teacher_forcing_enabled=True,
+         query_traj_teacher_forcing_gt_ratio=0.0),
+]
+
 custom_hooks = [
     dict(type='OccEfficiencyHook'),
+    dict(type='TrajectoryWarmupHook', schedule=traj_warmup_schedule),
 ]
 
 # W&B logging for sweeps

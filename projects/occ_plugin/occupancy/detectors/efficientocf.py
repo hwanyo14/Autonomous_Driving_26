@@ -2235,6 +2235,16 @@ class EfficientOCF(
                 point_class_ids_all=query_cls_pred_tq.detach(),
                 query_vis_bundle=query_vis_bundle,
             )
+        with torch.no_grad():
+            self.maybe_save_query_mixture_3d_vis(
+                query_vis_bundle=query_vis_bundle,
+                gt_instance_occ3d_txyz=gt_instance_occ3d_txyz_query_vis,
+                gt_inst_center_world_tn3=gt_inst_center_world_full_tn3,
+                gt_inst_center_valid_tn=gt_inst_center_valid_full_tn,
+                gt_inst_cls_n=gt_inst_cls_full_n,
+                img_metas=img_metas,
+                step=cur_train_iter,
+            )
         self.maybe_save_instance_img_debug(
             debug_bundle=instance_img_debug_bundle,
             segmentation_instance3d=gt_instance_occ3d_txyz_primary,

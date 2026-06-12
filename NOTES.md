@@ -1,5 +1,21 @@
 # NOTES
 
+## 2026-06-12 KST — CUDA ext 빌드
+- 이 레포는 `occ_pool_ext` CUDA extension이 빌드 안 된 상태였음 (학습/full import 시 ImportError). 소스가 cost 레포와 동일함을 diff로 확인 후 빌드된 `occ_pool_ext.cpython-310-x86_64-linux-gnu.so`를 cost 레포에서 복사해 해결. **python/torch 버전이나 서버가 바뀌면 `projects/occ_plugin/ops/occ_pooling/setup.py`로 재빌드 필요.**
+
+## 2026-06-12 KST — shape Run 1 (dice 3D + lowres 128) 관련
+- `loss_gmo_dice` 절대값은 기존 run과 **직접 비교 불가** (3D dice는 본질적으로 더 어려움). 비교는 `dbg_gmo_dice_bev`(항상 BEV 기준으로 같이 로깅됨)로 할 것.
+- (128,128,40) voxelizer 메모리 미측정 — 학습 첫 iter OOM 시: ① `query_multi_gaussian_pair_chunk` 8→4, ② 그래도 안 되면 `query_matched_gmo_bce_occ_size=(128,128,20)` (z는 dice 3D가 0.4m에서도 잡으므로 손해 적음).
+- shape 지표 해석: 학습이 잘 가면 `dbg_gmo_shape_z_extent_ratio`·`bev_area_ratio`·`vol_ratio`가 1로 수렴하고 `iou3d` 상승. z_ratio만 1로 가고 area_ratio가 안 내려오면 ①만 먹고 ②가 부족하다는 뜻 → bbox prior(Run 2) 근거.
+- dice가 3D가 되면서 tversky 분모가 커져 gradient 스케일 변화 가능 — `query_gmo_dice_loss_weight=0.5` 기본 유지로 시작했으나 dice가 BCE를 압도/실종하면 조정.
+- Run 2(bbox prior) 사전 확인사항: 이 파이프라인엔 3D GT bbox가 없음 (attn_bbox는 카메라 평면 mask). GT instance 복셀에서 box 유도(yaw=BEV PCA) 방식 권장.
+
+## 2026-06-12 KST — query mixture 3D 시각화 관련
+- 선별은 기존 score 기반(selected)을 재사용 (사용자 결정). 3D_SHAPE_ANALYSIS.md §4가 권장한 margin(fg−bg≥0.15) 선별은 미구현 — 필요 시 `debug_query_score_mode='margin'` 옵션을 `_build_query_visualization_bundle`에 추가해야 함.
+- matplotlib 3D는 axis limit 밖 점을 clip하지 않음 — pc_range 밖 query가 패널 밖으로 비어져 보일 수 있음 (무해).
+- 렌더는 present frame(t=2)만. future frame 렌더가 필요하면 `t_present` 부분을 루프로 확장.
+- `debug_query_mixture3d_vis_every` 기본값은 0(off), EfficientOCF_V1.1_1gpu.py에서만 48로 켜져 있음. 다른 config(test_traj.py 등)에서 쓰려면 debug_cfg/visualization_cfg에 키 추가 필요.
+
 ## 2026-06-11 KST — Trajectory 2-mode 이식 관련
 - ~~TF 스케줄 재스케일 주의~~ → **해결됨 (6/11)**: TF를 epoch 기준으로 전환. iter 스케줄은 빈 튜플로 비활성, `gt_ratio`를 TrajectoryWarmupHook stage(epoch 1=1.0, 2=0.5, 3+=0.0)가 제어. GPU 수 변경 시 재스케일 불필요.
 - TrajectoryWarmupHook은 **마지막 매칭 stage 하나만 통째로 적용** (누적 merge 아님). stage 추가 시 모든 키를 다 들고 있어야 함.

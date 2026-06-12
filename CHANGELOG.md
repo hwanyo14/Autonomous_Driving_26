@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-06-12 KST (2차)
+
+### shape Run 1: dice 3D화 + lowres 상향 + shape dbg 지표 (test_traj_shape.py)
+
+- **dice 3D화** (`utils_loss.py`): 새 플래그 `query_gmo_dice_3d`(기본 False). True면 matched gmo dice를 BEV 2D(amax z-collapse) 대신 **3D tversky**로 계산 — z 모양이 처음으로 supervise됨. mixture grouped/surrogate single 두 경로 모두 적용, 공용 헬퍼 `_compute_pair_dice_bev_and_3d`로 정리.
+- **lowres 상향** (test_traj_shape.py): `query_matched_gmo_bce_occ_size` (64,64,20)→**(128,128,40)** — xy 복셀 1.6m→0.8m (차 3×1→6×2 복셀). 코드 수정 없음 (voxelizer가 init에서 자동 재구성).
+- **shape dbg 지표 추가** (matched pair lowres, hard thr 0.5, 매 iter TB 로깅):
+  - `dbg_gmo_dice_bev` / `dbg_gmo_dice_3d`: 두 dice를 항상 모두 계산해 로깅 (loss 채택은 플래그 따름) → 기존 BEV-dice run과 비교 가능. `dbg_gmo_dice_is_3d`로 모드 확인.
+  - `dbg_gmo_shape_iou3d` / `dbg_gmo_shape_iou_bev`: matched pair 평균 hard IoU.
+  - `dbg_gmo_shape_z_extent_ratio`: pred/GT 점유 z-슬라이스 수 비율 (blob이면 ≫1, 목표 →1).
+  - `dbg_gmo_shape_bev_area_ratio`, `dbg_gmo_shape_vol_ratio`: BEV 면적/3D 부피 비율 (blob 팽창도).
+  - `dbg_gmo_shape_pair_count`: 지표 모집단 크기.
+  - 헬퍼 `_gmo_pair_shape_stats` (detach, gradient 무관).
+- config: `query_gmo_dice_3d` 기본값 efficientocf_config.py에 추가. test_traj_shape.py에 `query_gmo_dice_3d=True` + mixture 3D vis 키(`debug_query_mixture3d_vis_every=48`, dir)도 추가.
+- 검증: py_compile 통과 + 더미 pair 단위 테스트 (3D dice > BEV dice for z-blob, z_ratio=3.6 정확, 가드 None, gradient OK).
+- **미검증**: (128,128,40)에서의 voxelizer 메모리 — 학습 시작 직후 1 iter OOM 여부 확인 필요. OOM 시 1차 완충은 `query_multi_gaussian_pair_chunk` 축소(8→4), 2차는 (128,128,20).
+
+## 2026-06-12 KST (1차)
+
+### 학습 중 query mixture 3D 시각화 추가
+
+- `utils_visualization.py`에 `maybe_save_query_mixture_3d_vis` 추가 (3D_SHAPE_ANALYSIS.md §3.2 mix3v 포팅).
+  - present frame(t=2)만 렌더, 3-view 1장: oblique(z aspect 0.22≈2.8x) / oblique rear / low side(진비율 0.078).
+  - GT instance 복셀 산점도(tab20, 상한 `debug_query_mixture3d_vis_max_gt_points=40000` 초과 시 stride 다운샘플) + GT center(lime X, 1번 패널에 클래스 라벨).
+  - query 선별은 bundle의 기존 score 선별(selected) 재사용, matched는 검은 테두리. mixture 16성분 center 점(크기∝weight) + weight 상위 6성분 yaw 반영 1σ wireframe ellipsoid.
+  - 렌더 예외는 print 후 무시 (학습 보호), rank0 only, matplotlib Agg.
+- 호출: `efficientocf.py`의 `maybe_save_query_debug_vis` 직후, bundle + `gt_instance_occ3d_txyz_query_vis` + GT center/cls full 텐서 전달.
+- config 키 추가 (efficientocf_config.py 기본값 + EfficientOCF_V1.1_1gpu.py):
+  `debug_query_mixture3d_vis_every=48` (기본 0=off), `debug_query_mixture3d_vis_dir`, `_max_queries=50`, `_max_gt_points=40000`.
+- 산출 구조: **호출 iter마다 새 폴더** `{vis_dir}/iter_000048/mix3v_{scene}_{lidar}.png`.
+- 검증: py_compile 4파일 통과, 더미 텐서 standalone 스모크 테스트로 PNG 생성 확인.
+
 ## 2026-06-11 KST (9차)
 
 ### suppress weight 변경 (test_traj.py)

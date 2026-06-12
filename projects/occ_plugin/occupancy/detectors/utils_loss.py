@@ -2485,6 +2485,65 @@ class EfficientOCFLossMixin:
         score = (tp + float(eps)) / (denom + float(eps))
         return 1.0 - score.clamp(0.0, 1.0)
 
+    @staticmethod
+    def _gmo_pair_shape_stats(p_t1zyx, t_t1zyx, valid_t, threshold: float = 0.5):
+        """
+        Hard-threshold shape stats for one matched pair at lowres.
+        Returns [iou3d, iou_bev, z_extent_ratio, bev_area_ratio, vol_ratio] or None.
+        """
+        vm = valid_t.reshape(-1).to(torch.bool)
+        if not bool(vm.any().item()):
+            return None
+        pb = p_t1zyx.detach()[vm, 0] > float(threshold)
+        tb = t_t1zyx.detach()[vm, 0] > float(threshold)
+        t_vol = tb.sum(dim=(1, 2, 3))
+        frame_ok = t_vol > 0
+        if not bool(frame_ok.any().item()):
+            return None
+        pb = pb[frame_ok]
+        tb = tb[frame_ok]
+        inter = (pb & tb).sum().float()
+        union = (pb | tb).sum().float().clamp_min(1.0)
+        pb_bev = pb.any(dim=1)
+        tb_bev = tb.any(dim=1)
+        inter_bev = (pb_bev & tb_bev).sum().float()
+        union_bev = (pb_bev | tb_bev).sum().float().clamp_min(1.0)
+        p_z = pb.any(dim=-1).any(dim=-1).sum(dim=-1).float()
+        t_z = tb.any(dim=-1).any(dim=-1).sum(dim=-1).float()
+        p_area = pb_bev.sum(dim=(1, 2)).float()
+        t_area = tb_bev.sum(dim=(1, 2)).float()
+        p_vol = pb.sum(dim=(1, 2, 3)).float()
+        return torch.stack([
+            inter / union,
+            inter_bev / union_bev,
+            (p_z / t_z.clamp_min(1.0)).mean(),
+            (p_area / t_area.clamp_min(1.0)).mean(),
+            (p_vol / t_vol[frame_ok].float().clamp_min(1.0)).mean(),
+        ])
+
+    def _compute_pair_dice_bev_and_3d(self, p_t1zyx, t_t1zyx, valid_t, tversky_alpha, tversky_beta, eps):
+        valid_3d = valid_t[:, None, None, None, None].expand_as(t_t1zyx)
+        dice_3d = self._compute_foreground_tversky_pair_loss(
+            pred_occ=p_t1zyx,
+            gt_occ=t_t1zyx,
+            valid_mask=valid_3d,
+            alpha=float(tversky_alpha),
+            beta=float(tversky_beta),
+            eps=float(eps),
+        )
+        p_bev = p_t1zyx.amax(dim=2)
+        t_bev = t_t1zyx.amax(dim=2)
+        valid_bev = valid_t[:, None, None, None].expand_as(p_bev)
+        dice_bev = self._compute_foreground_tversky_pair_loss(
+            pred_occ=p_bev,
+            gt_occ=t_bev,
+            valid_mask=valid_bev,
+            alpha=float(tversky_alpha),
+            beta=float(tversky_beta),
+            eps=float(eps),
+        )
+        return dice_bev, dice_3d
+
     def _compute_matched_pair_gmo_losses(
         self,
         centers_world_tq3: torch.Tensor,
@@ -2510,6 +2569,7 @@ class EfficientOCFLossMixin:
         z = centers_world_tq3.sum() * 0.0
         loss_type = str(loss_type).lower()
         loss_key = "loss_gmo_focal" if loss_type in ("balanced_focal", "focal") else "loss_gmo_bce"
+        dice_use_3d = bool(getattr(self, "query_gmo_dice_3d", False))
         out = {
             "dbg_gmo_bce_pair_count": z,
             "dbg_gmo_bce_lowres_x": z,
@@ -2519,6 +2579,15 @@ class EfficientOCFLossMixin:
             "dbg_gmo_dice_pair_count": z,
             "dbg_gmo_dice_alpha": z.new_tensor(float(tversky_alpha)),
             "dbg_gmo_dice_beta": z.new_tensor(float(tversky_beta)),
+            "dbg_gmo_dice_is_3d": z.new_tensor(1.0 if dice_use_3d else 0.0),
+            "dbg_gmo_dice_bev": z,
+            "dbg_gmo_dice_3d": z,
+            "dbg_gmo_shape_pair_count": z,
+            "dbg_gmo_shape_iou3d": z,
+            "dbg_gmo_shape_iou_bev": z,
+            "dbg_gmo_shape_z_extent_ratio": z,
+            "dbg_gmo_shape_bev_area_ratio": z,
+            "dbg_gmo_shape_vol_ratio": z,
         }
         out[loss_key] = z
         if loss_key == "loss_gmo_focal":
@@ -2571,6 +2640,9 @@ class EfficientOCFLossMixin:
 
         pair_losses = []
         dice_pair_losses = []
+        dice_bev_vals = []
+        dice_3d_vals = []
+        shape_stats = []
         use_mixture = (
             torch.is_tensor(mixture_centers_world_tqg3)
             and torch.is_tensor(mixture_sigmas_world_tqg3)
@@ -2612,19 +2684,20 @@ class EfficientOCFLossMixin:
                 if pair_loss is not None:
                     pair_losses.append(pair_loss)
                 if compute_dice:
-                    p_bev = p[:, :, 0].amax(dim=2)
-                    t_bev = t[:, :, 0].amax(dim=2)
-                    valid_bev = valid_tk[:, k:k + 1, None, None].expand_as(p_bev)
-                    dice_loss = self._compute_foreground_tversky_pair_loss(
-                        pred_occ=p_bev,
-                        gt_occ=t_bev,
-                        valid_mask=valid_bev,
-                        alpha=float(tversky_alpha),
-                        beta=float(tversky_beta),
-                        eps=float(eps),
+                    dice_bev, dice_3d = self._compute_pair_dice_bev_and_3d(
+                        p[:, :, 0], t[:, :, 0], valid_tk[:, k],
+                        tversky_alpha, tversky_beta, eps,
                     )
+                    dice_loss = dice_3d if dice_use_3d else dice_bev
                     if dice_loss is not None:
                         dice_pair_losses.append(dice_loss)
+                    if dice_bev is not None:
+                        dice_bev_vals.append(dice_bev.detach())
+                    if dice_3d is not None:
+                        dice_3d_vals.append(dice_3d.detach())
+                    stats = self._gmo_pair_shape_stats(p[:, :, 0], t[:, :, 0], valid_tk[:, k])
+                    if stats is not None:
+                        shape_stats.append(stats)
         else:
             for k in range(int(mq.numel())):
                 q_idx = int(mq[k].item())
@@ -2655,19 +2728,20 @@ class EfficientOCFLossMixin:
                 if pair_loss is not None:
                     pair_losses.append(pair_loss)
                 if compute_dice:
-                    p_bev = p.amax(dim=2)
-                    t_bev = t.amax(dim=2)
-                    valid_bev = valid_frame_t[:, None, None, None].expand_as(p_bev)
-                    dice_loss = self._compute_foreground_tversky_pair_loss(
-                        pred_occ=p_bev,
-                        gt_occ=t_bev,
-                        valid_mask=valid_bev,
-                        alpha=float(tversky_alpha),
-                        beta=float(tversky_beta),
-                        eps=float(eps),
+                    dice_bev, dice_3d = self._compute_pair_dice_bev_and_3d(
+                        p, t, valid_frame_t,
+                        tversky_alpha, tversky_beta, eps,
                     )
+                    dice_loss = dice_3d if dice_use_3d else dice_bev
                     if dice_loss is not None:
                         dice_pair_losses.append(dice_loss)
+                    if dice_bev is not None:
+                        dice_bev_vals.append(dice_bev.detach())
+                    if dice_3d is not None:
+                        dice_3d_vals.append(dice_3d.detach())
+                    stats = self._gmo_pair_shape_stats(p, t, valid_frame_t)
+                    if stats is not None:
+                        shape_stats.append(stats)
 
         if len(pair_losses) <= 0 and len(dice_pair_losses) <= 0:
             return out
@@ -2685,6 +2759,18 @@ class EfficientOCFLossMixin:
         out["dbg_gmo_bce_lowres_y"] = centers_world_tq3.new_tensor(float(low_y))
         out["dbg_gmo_bce_lowres_z"] = centers_world_tq3.new_tensor(float(low_z))
         out["dbg_gmo_dice_pair_count"] = centers_world_tq3.new_tensor(float(len(dice_pair_losses)))
+        if len(dice_bev_vals) > 0:
+            out["dbg_gmo_dice_bev"] = torch.stack(dice_bev_vals, dim=0).mean()
+        if len(dice_3d_vals) > 0:
+            out["dbg_gmo_dice_3d"] = torch.stack(dice_3d_vals, dim=0).mean()
+        if len(shape_stats) > 0:
+            stats_mean = torch.stack(shape_stats, dim=0).mean(dim=0)
+            out["dbg_gmo_shape_pair_count"] = centers_world_tq3.new_tensor(float(len(shape_stats)))
+            out["dbg_gmo_shape_iou3d"] = stats_mean[0]
+            out["dbg_gmo_shape_iou_bev"] = stats_mean[1]
+            out["dbg_gmo_shape_z_extent_ratio"] = stats_mean[2]
+            out["dbg_gmo_shape_bev_area_ratio"] = stats_mean[3]
+            out["dbg_gmo_shape_vol_ratio"] = stats_mean[4]
         return out
 
     def _build_query_objectness_targets(

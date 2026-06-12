@@ -9,6 +9,7 @@ MODEL_CFG_DEFAULTS = {
     "query_gmo_tversky_alpha": 0.7,
     "query_gmo_tversky_beta": 0.3,
     "use_query_gmo_dice_loss": True,
+    "query_gmo_dice_3d": False,
     "use_query_inst_center_match_loss": True,
     "use_query_dt_loss": True,
     "use_query_gt2p_instance_labeled_loss": False,
@@ -145,6 +146,7 @@ DEBUG_CFG_DEFAULTS = {
     "debug_gt_alignment_vis_every": 0,
     "debug_query_inst_depth_lift_vis_every": 0,
     "debug_query_attn_softargmax_vis_every": 0,
+    "debug_query_mixture3d_vis_every": 0,
 }
 
 VISUALIZATION_CFG_DEFAULTS = {
@@ -179,6 +181,9 @@ VISUALIZATION_CFG_DEFAULTS = {
     "debug_query_attn_softargmax_vis_max_frames": 2,
     "debug_query_attn_softargmax_vis_max_cams": 3,
     "debug_query_attn_softargmax_vis_max_queries": 16,
+    "debug_query_mixture3d_vis_dir": "./work_dirs/query_mixture3d_vis",
+    "debug_query_mixture3d_vis_max_queries": 50,
+    "debug_query_mixture3d_vis_max_gt_points": 40000,
     "query_attn_vis_dir": "./work_dirs/query_attn_vis",
 }
 
@@ -203,6 +208,7 @@ def apply_model_cfg(self, cfg):
     self.query_gmo_tversky_alpha = float(cfg["query_gmo_tversky_alpha"])
     self.query_gmo_tversky_beta = float(cfg["query_gmo_tversky_beta"])
     self.use_query_gmo_dice_loss = bool(cfg["use_query_gmo_dice_loss"])
+    self.query_gmo_dice_3d = bool(cfg["query_gmo_dice_3d"])
     self.use_query_inst_center_match_loss = bool(cfg["use_query_inst_center_match_loss"])
     self.use_query_dt_loss = bool(cfg["use_query_dt_loss"])
     self.use_query_gt2p_instance_labeled_loss = bool(cfg["use_query_gt2p_instance_labeled_loss"])
@@ -376,6 +382,7 @@ def apply_debug_cfg(self, cfg):
     self.debug_gt_alignment_vis_every = int(cfg["debug_gt_alignment_vis_every"])
     self.debug_query_inst_depth_lift_vis_every = int(cfg["debug_query_inst_depth_lift_vis_every"])
     self.debug_query_attn_softargmax_vis_every = int(cfg["debug_query_attn_softargmax_vis_every"])
+    self.debug_query_mixture3d_vis_every = int(cfg["debug_query_mixture3d_vis_every"])
 
     return cfg
 
@@ -416,6 +423,9 @@ def apply_visualization_cfg(self, cfg):
     self.debug_query_attn_softargmax_vis_max_frames = max(1, int(cfg["debug_query_attn_softargmax_vis_max_frames"]))
     self.debug_query_attn_softargmax_vis_max_cams = max(1, int(cfg["debug_query_attn_softargmax_vis_max_cams"]))
     self.debug_query_attn_softargmax_vis_max_queries = max(1, int(cfg["debug_query_attn_softargmax_vis_max_queries"]))
+    self.debug_query_mixture3d_vis_dir = str(cfg["debug_query_mixture3d_vis_dir"])
+    self.debug_query_mixture3d_vis_max_queries = max(1, int(cfg["debug_query_mixture3d_vis_max_queries"]))
+    self.debug_query_mixture3d_vis_max_gt_points = max(1000, int(cfg["debug_query_mixture3d_vis_max_gt_points"]))
     self.query_attn_vis_dir = str(cfg["query_attn_vis_dir"])
 
     return cfg
