@@ -336,7 +336,7 @@ val_config['test_capacity'] = 100
 # In our work we use 8 NVIDIA A100 GPUs.
 data = dict(
     samples_per_gpu=1,
-    workers_per_gpu=0,
+    workers_per_gpu=1,
     train=train_config,
     # val=test_config,
     val=val_config,
@@ -380,7 +380,7 @@ model_cfg = dict(
     query_require_history_all_valid=True,
     query_attn_cam_gaussian_truncate_sigma=1.777,
     query_num_queries=200,
-    query_cls_match_cost_weight=0.075,
+    query_cls_match_cost_weight=0.2,
     query_center_match_cost_weight=10.0,
     query_temporal_offset_match_cost_weight=0.5,
     query_center_routed_loss_weight=0.3,
@@ -490,7 +490,7 @@ optimizer = dict(
 
 optimizer_config = dict(
     type='GradientCumulativeOptimizerHook',
-    cumulative_iters=16,
+    cumulative_iters=1,
     grad_clip=dict(max_norm=35, norm_type=2),
 )
 
