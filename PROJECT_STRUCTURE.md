@@ -8,6 +8,9 @@
 ├── PROJECT_STRUCTURE.md  # 이 문서
 ├── CHANGELOG.md  # 코드 수정/구현 기록
 ├── NOTES.md  # 구현 중 주의사항·경고·후속 작업 메모
+├── GPU_MULTIJOB_NOTES.md  # 한 노드에서 학습 잡 여러 개 동시 실행 시 GPU oversubscription 원인·진단·해결(분할/MPS/순차) 가이드(포터블)
+├── MPS_MULTIJOB_RUNBOOK.md  # 8장 공유로 2잡 동시 실행 시 MPS 적용 실행 런북(실측 검증)
+├── stop_mps.sh  # MPS 데몬 종료/정리 스크립트 (dist_train.sh가 자동 시작한 데몬을 끌 때)
 ├── run.sh  # 학습용 진입 스크립트; config 확인 후 tools/dist_train.sh 호출
 ├── run_eval.sh  # 평가용 진입 스크립트; config/checkpoint 확인 후 tools/dist_test.sh 호출
 ├── run_lss_pretrain.sh  # LSS view-transformer만 pretrain하도록 dist_train.sh를 감싼 래퍼

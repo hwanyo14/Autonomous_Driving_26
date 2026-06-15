@@ -1,5 +1,38 @@
 # Changelog
 
+## 2026-06-15 KST (3차)
+
+### MPS 상시 자동 적용 (tools/dist_train.sh) + stop_mps.sh
+
+- 목표: 그냥 학습을 실행만 해도 NVIDIA MPS 클라이언트가 되게 (8장 공유 멀티잡 시 시분할 오버헤드 제거). MPS_MULTIJOB_RUNBOOK.md의 "상시적용" 절차를 실제 구현.
+- `tools/dist_train.sh`: torchrun 호출 **이전**에 MPS 부트스트랩 블록 추가.
+  - `USE_MPS`(기본 1). 0이면 스킵.
+  - `CUDA_MPS_PIPE_DIRECTORY`/`CUDA_MPS_LOG_DIRECTORY` 기본 `/tmp/nvidia-mps[-log]`(override 가능) export → 이 launch의 모든 프로세스가 MPS 클라이언트가 됨 (컨텍스트 생성 전 env 설정이라 유효).
+  - 데몬 멱등 시작: `pgrep -f "[n]vidia-cuda-mps-control -d"`로 떠있으면 재사용, 없으면 `nvidia-cuda-mps-control -d`로 시작(실패해도 학습은 계속). 대괄호 트릭으로 셸 자기매칭 방지.
+  - 모든 실행 경로 커버: train_total.sh → run.sh → dist_train.sh, 직접 호출 모두. (run.sh는 단순 포워딩, dist_train.sh 이전에 CUDA 컨텍스트 생성 없음 확인.)
+- `stop_mps.sh`(신규, 루트): MPS 데몬 종료 + 정리. 순서 준수(quit → pkill → rm), 학습 잡은 안 건드림.
+- 검증: bash -n 통과(dist_train.sh/stop_mps.sh), 멱등 감지 동작 확인(이미 떠있는 데몬 재사용), `nvidia-cuda-mps-control` 응답 100.0. PROJECT_STRUCTURE.md에 stop_mps.sh/런북 항목 추가.
+
+## 2026-06-15 KST (2차)
+
+### GPU 멀티잡 운용 가이드 문서 추가 (GPU_MULTIJOB_NOTES.md)
+
+- 한 노드 8 GPU에서 학습 잡 2개 동시 실행 시 iter 9s→40s(>4x) 슬로다운 분석 결과를 포터블 md로 정리.
+- 원인: 두 잡이 같은 물리 GPU를 겹쳐 점유(oversubscription) → 시분할 + 컨텍스트 스위치 + CPU/NUMA 가중. 데이터/Lustre IO는 무죄(로그상 data_time ~6%).
+- 내용: 원인 설명, 진단 명령(로그 time/data_time 분해, 프로세스→GPU 매핑, dmon, NUMA), 해결 3안(GPU 분할 4+4 / MPS 공유 / 순차) + 처리량 비교표, MPS 개념, 체크리스트, 오해 정리. 이 노드 실측값은 부록으로 분리.
+- 멀티 GPU 다중 워크플로(병렬 조사 4갈래 + 종합)로 시스템 직접 측정해 도출. PROJECT_STRUCTURE.md에 항목 추가.
+
+## 2026-06-15 KST
+
+### mix3v(query mixture 3D) 시각화 저장 경로를 다른 vis와 동일 구조로 통일
+
+- 기존에 다른 모든 vis는 `_configure_visualization_dirs`(`mmdet_train.py`)가 `{work_dir}/vis/{timestamp}/{folder}`로 자동 배치하는데, **mix3v만 이 map에서 누락**되어 있었음 → mix3v만 자체 `iter_NNNNNN/` 폴더로 따로 저장되던 문제.
+- 수정: `_configure_visualization_dirs`의 `detector_dir_map`에 `"debug_query_mixture3d_vis_dir": "query_mixture3d_vis"` 한 줄 추가. → 다른 vis와 똑같이 `{work_dir}/vis/{timestamp}/query_mixture3d_vis/`로 자동 저장 (실행 config 이름·timestamp 자동).
+- `utils_visualization.py`(mix3v 저장부): 위에서 설정된 `self.debug_query_mixture3d_vis_dir`를 그대로 사용, 파일명만 `iter_{step:06d}.png`로 변경 (이전 `iter_NNNNNN/` 하위폴더 + `mix3v_{scene}_{lidar}.png` → 하위폴더 제거, iter는 파일명에만).
+- 최종 경로 예: `work_dirs/test_traj_shape/vis/20260615_111210/query_mixture3d_vis/iter_000048.png`
+- mix3v는 iter당 1장 저장이라 파일명에 scene/lidar 토큰 없어도 충돌 없음.
+- 검증: py_compile 통과 (train.py/mmdet_train.py/efficientocf_config.py/utils_visualization.py/test_traj_shape.py).
+
 ## 2026-06-12 KST (2차)
 
 ### shape Run 1: dice 3D화 + lowres 상향 + shape dbg 지표 (test_traj_shape.py)

@@ -1801,14 +1801,12 @@ class EfficientOCFVisualizationMixin:
                 f"gt_inst={0 if gt_centers is None else gt_centers.shape[0]}",
                 fontsize=10,
             )
-            scene_token, lidar_token = self._extract_meta_tokens(img_metas)
-            vis_dir = os.path.join(
-                str(getattr(self, "debug_query_mixture3d_vis_dir", "./work_dirs/query_mixture3d_vis")),
-                f"iter_{int(step):06d}",
-            )
+            # vis_dir은 다른 vis처럼 _configure_visualization_dirs가
+            # {work_dir}/vis/{timestamp}/query_mixture3d_vis 로 자동 설정. iter는 파일명에만.
+            vis_dir = str(getattr(self, "debug_query_mixture3d_vis_dir", "./work_dirs/query_mixture3d_vis"))
             os.makedirs(vis_dir, exist_ok=True)
             fig.savefig(
-                os.path.join(vis_dir, f"mix3v_{scene_token}_{lidar_token}.png"),
+                os.path.join(vis_dir, f"iter_{int(step):06d}.png"),
                 dpi=120, bbox_inches="tight",
             )
         except Exception as exc:

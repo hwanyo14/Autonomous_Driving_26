@@ -52,6 +52,7 @@ def _configure_visualization_dirs(model, work_dir, timestamp):
         "debug_gt_alignment_vis_dir": "gt_alignment_vis",
         "debug_query_inst_depth_lift_vis_dir": "query_inst_depth_lift_vis",
         "debug_query_attn_softargmax_vis_dir": "query_attn_softargmax_vis",
+        "debug_query_mixture3d_vis_dir": "query_mixture3d_vis",
         "query_attn_vis_dir": "query_attn_vis",
     }
 
