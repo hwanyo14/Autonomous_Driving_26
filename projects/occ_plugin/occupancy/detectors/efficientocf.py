@@ -123,6 +123,7 @@ class EfficientOCF(
             num_queries=self.query_num_queries,
             num_heads=4,
             num_layers=self.query_transformer_num_layers,
+            kv_resolutions=self.query_transformer_kv_resolutions,
             num_cams=6,
             embed_dim=self.query_embed_dim,
             max_time=self.time_receptive_field,

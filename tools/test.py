@@ -16,6 +16,7 @@ from projects.occ_plugin.datasets.builder import build_dataloader
 from mmdet3d.models import build_model
 from mmdet.apis import set_random_seed
 from projects.occ_plugin.occupancy.apis.test import custom_single_gpu_test, custom_multi_gpu_test
+from config_pipeline_utils import sync_occ_dt_loading_with_model_cfg
 from mmdet.datasets import replace_ImageToTensor
 import time
 import os.path as osp
@@ -122,6 +123,7 @@ def main():
     cfg = Config.fromfile(args.config)
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
+    sync_occ_dt_loading_with_model_cfg(cfg)
     # import modules from string list.
     if cfg.get('custom_imports', None):
         from mmcv.utils import import_modules_from_strings

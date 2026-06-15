@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-06-15 15:15 KST
+
+### use_query_dt_loss=False 시 DT 데이터 로드 비활성화
+
+- `tools/config_pipeline_utils.py` 추가: `model.model_cfg.use_query_dt_loss=False`이면 data pipeline의 `LoadOccupancy.load_occ_dt`를 false로 바꾸고 `Collect3D.keys`에서 `occ_dt` 제거.
+- `tools/train.py`, `tools/test.py`에서 config 로드 직후 해당 동기화를 적용해 학습/평가 모두 불필요한 DT 파일 I/O를 생략.
+- 신규 tools 유틸 반영을 위해 `PROJECT_STRUCTURE.md` 업데이트.
+
+## 2026-06-15 15:08 KST
+
+### MPS 멀티잡 실행 자동화
+
+- `tools/dist_train.sh` 시작 시 CUDA MPS pipe/log 디렉터리를 준비하고 MPS 데몬을 자동 실행하도록 변경.
+- `USE_MPS=0`이면 기존 non-MPS 실행 경로를 유지하도록 opt-out 추가.
+- `stop_mps.sh` 추가: MPS 데몬 종료 후 pipe/log 디렉터리 정리.
+- 신규 root 스크립트 반영을 위해 `PROJECT_STRUCTURE.md` 업데이트.
+
+## 2026-06-15 15:01 KST
+
+### Query Transformer Pyramid Cross-Attention
+
+- `query_transformer_num_layers` 기본값을 3으로 변경하고 layer별 KV 해상도 기본값 `((14, 25), (28, 50), (56, 100))` 추가.
+- `TransformerModule`에서 cross-attention key/value만 layer별 평균 풀링 토큰을 사용하도록 변경.
+- 최종 layer는 full-res KV를 유지해 반환 attention map 및 downstream bbox/debug 경로의 `[T,Q,Ncam,H,W]` shape 호환성 유지.
+
 ## 2026-06-11 KST (9차)
 
 ### suppress weight 변경 (test_traj.py)

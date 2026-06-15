@@ -7,10 +7,12 @@
 ├── README.md  # 저장소 목적을 짧게 적은 루트 소개
 ├── PROJECT_STRUCTURE.md  # 이 문서
 ├── CHANGELOG.md  # 코드 수정/구현 기록
+├── MPS_MULTIJOB_RUNBOOK.md  # 8-GPU 2잡 동시 학습용 NVIDIA MPS 실행 절차
 ├── NOTES.md  # 구현 중 주의사항·경고·후속 작업 메모
 ├── run.sh  # 학습용 진입 스크립트; config 확인 후 tools/dist_train.sh 호출
 ├── run_eval.sh  # 평가용 진입 스크립트; config/checkpoint 확인 후 tools/dist_test.sh 호출
 ├── run_lss_pretrain.sh  # LSS view-transformer만 pretrain하도록 dist_train.sh를 감싼 래퍼
+├── stop_mps.sh  # CUDA MPS 데몬 종료 및 pipe/log 디렉터리 정리 스크립트
 ├── data/  # 외부 데이터와 전처리 캐시를 가리키는 심볼릭 링크 모음
 │   ├── efficientocf -> /home/user/jhh/Projects/EfficientOCF/data/efficientocf  # OCF instance/flow 전처리 캐시
 │   ├── efficientocf_bboxcls -> /home/user/jhh/Projects/EOCF_qg_distil_dev/data/efficientocf_bboxcls  # bbox/class 기반 segmentation 캐시
@@ -143,6 +145,7 @@
 │           ├── semkitti.py  # SemanticKITTI 계열 loss 유틸 모음
 │           └── voxel_to_points.py  # voxel 예측을 point prediction으로 근사 매핑하는 유틸
 └── tools/
+    ├── config_pipeline_utils.py  # model_cfg에 따라 data pipeline의 선택적 로드 항목을 동기화하는 유틸
     ├── dist_test.sh  # torch.distributed.run 기반 분산 평가 실행기
     ├── dist_train.sh  # torch.distributed.run 기반 분산 학습 실행기
     ├── test.py  # config/checkpoint 로드 후 custom test API를 호출하는 평가 엔트리포인트

@@ -10,7 +10,7 @@ MODEL_CFG_DEFAULTS = {
     "query_gmo_tversky_beta": 0.3,
     "use_query_gmo_dice_loss": True,
     "use_query_inst_center_match_loss": True,
-    "use_query_dt_loss": True,
+    "use_query_dt_loss": False,
     "use_query_gt2p_instance_labeled_loss": False,
     "query_gt2p_instance_labeled_loss_weight": 0.1,
     "query_gt2p_instance_labeled_balance_weight": 0.25,
@@ -101,7 +101,8 @@ MODEL_CFG_DEFAULTS = {
     "query_multi_gaussian_weight_reg_target_sum": 1.0,
     "query_embed_dim": 256,
     "query_num_queries": 100,
-    "query_transformer_num_layers": 1,
+    "query_transformer_num_layers": 3,
+    "query_transformer_kv_resolutions": ((14, 25), (28, 50), (56, 100)),
     "query_id_reinject_scale": 0.0,
     "query_ca_kv_identity_init": False,
     "query_ca_attn_tau": 1.0,
@@ -321,6 +322,9 @@ def apply_model_cfg(self, cfg):
     self.query_embed_dim = int(cfg["query_embed_dim"])
     self.query_num_queries = int(cfg["query_num_queries"])
     self.query_transformer_num_layers = int(cfg["query_transformer_num_layers"])
+    self.query_transformer_kv_resolutions = tuple(
+        tuple(int(v) for v in hw) for hw in cfg["query_transformer_kv_resolutions"]
+    )
     self.query_id_reinject_scale = float(cfg["query_id_reinject_scale"])
     self.query_ca_kv_identity_init = bool(cfg["query_ca_kv_identity_init"])
     self.query_ca_attn_tau = float(cfg["query_ca_attn_tau"])

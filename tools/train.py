@@ -22,6 +22,7 @@ from mmdet3d.utils import collect_env, get_root_logger
 from mmdet.apis import set_random_seed
 from mmcv.utils import TORCH_VERSION, digit_version
 from projects.occ_plugin.occupancy.apis.train import custom_train_model
+from config_pipeline_utils import sync_occ_dt_loading_with_model_cfg
 import warnings
 warnings.filterwarnings("ignore")
 warnings.simplefilter(action="ignore",category=FutureWarning)
@@ -96,6 +97,7 @@ def main():
     cfg = Config.fromfile(args.config)
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
+    sync_occ_dt_loading_with_model_cfg(cfg)
 
     if args.lr is not None:
         cfg.optimizer['lr'] = args.lr
