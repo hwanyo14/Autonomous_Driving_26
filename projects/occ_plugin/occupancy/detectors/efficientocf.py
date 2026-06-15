@@ -1919,6 +1919,7 @@ class EfficientOCF(
             loss_type=self.query_traj_loss_type,
             present_local_idx=int(traj_loss_present_local_idx),
             mode_cls_loss_weight=float(self.query_traj_mode_cls_loss_weight),
+            mode_cls_moving_class_weight=float(self.query_traj_mode_cls_moving_class_weight),
             static_gate_loss_weight=float(self.query_traj_static_gate_loss_weight),
             moving_reweight_enabled=bool(self.query_traj_moving_reweight_enabled),
             moving_threshold_m=float(self.query_traj_moving_threshold_m),

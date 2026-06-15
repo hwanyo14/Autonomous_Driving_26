@@ -77,6 +77,7 @@ MODEL_CFG_DEFAULTS = {
     "query_traj_static_threshold_m": 0.8,
     "query_traj_cv_error_threshold_m": 0.5,
     "query_traj_mode_cls_loss_weight": 0.0,
+    "query_traj_mode_cls_moving_class_weight": 1.0,
     "query_traj_mode_infer_policy": "argmax",
     "query_traj_moving_reweight_enabled": False,
     "query_traj_moving_threshold_m": 0.5,
@@ -296,6 +297,7 @@ def apply_model_cfg(self, cfg):
     self.query_traj_static_threshold_m = float(cfg["query_traj_static_threshold_m"])
     self.query_traj_cv_error_threshold_m = float(cfg["query_traj_cv_error_threshold_m"])
     self.query_traj_mode_cls_loss_weight = float(cfg["query_traj_mode_cls_loss_weight"])
+    self.query_traj_mode_cls_moving_class_weight = float(cfg["query_traj_mode_cls_moving_class_weight"])
     self.query_traj_mode_infer_policy = str(cfg["query_traj_mode_infer_policy"]).lower()
     self.query_traj_moving_reweight_enabled = bool(cfg["query_traj_moving_reweight_enabled"])
     self.query_traj_moving_threshold_m = float(cfg["query_traj_moving_threshold_m"])

@@ -1,5 +1,40 @@
 # Changelog
 
+## 2026-06-15 KST — MPS 멀티잡 실측 검증 + 런북 문서화
+
+### 한 노드 8장에서 학습 2개 동시 실행 (MPS) 실험
+- 실측(각 조건 40 iter 평균, test_traj + test_traj_mcls):
+  - 1잡 단독: 8.2s/iter
+  - 둘 다 non-MPS(겹침): 30s/iter (단독보다도 느림, 노드 처리량 0.066 iter/s)
+  - 한쪽만 MPS: ~32s/iter (효과 0, 제로섬)
+  - **둘 다 MPS: 9.0s/iter (3.3배 빠름, 노드 처리량 0.220 = 단독 1.79배)**
+- 결론: MPS는 **두 잡 모두 클라이언트일 때만** 효과. 단독 GPU util 24~60%(launch-bound)라 빈 SM을 MPS가 채워 큰 이득.
+- 신규 문서 `MPS_MULTIJOB_RUNBOOK.md` 추가 (복붙 절차 + 함정 정리). 이론은 기존 `GPU_MULTIJOB_NOTES.md`.
+
+### MPS 상시적용
+- `tools/dist_train.sh`: MPS 데몬 자동 시작 블록 추가(기본 ON, idempotent). 모든 학습 launch가 자동으로 MPS 클라이언트로 시작됨. `USE_MPS=0`으로 비활성 가능.
+- 종료용 `stop_mps.sh` 추가 (quit→정리 순서 안전 처리).
+- ⚠️ 트레이드오프: MPS는 컨텍스트 공유라 한 잡 치명오류 시 같은 GPU 다른 잡도 영향 가능(격리 약화). 단독 1잡은 이득 없음(무해).
+- PORT/--work-dir 잡마다 다르게 주는 건 여전히 사용자 책임 (MPS가 안 챙김).
+
+## 2026-06-15 KST — mode-cls moving 클래스 가중 (mcls A/B 실험)
+
+### 배경
+- epoch 14 분석: mode 분류기가 static으로 쏠려 moving을 11%만 예측 (GT 31%).
+- 보정용으로 mode 분류 CE에서 moving(비정지) 클래스에 가중을 주는 신규 인자 추가.
+
+### 신규 인자: `query_traj_mode_cls_moving_class_weight` (기본 1.0 = 무변화)
+- `efficientocf_config.py`: DEFAULTS 등록 + 파싱.
+- `efficientocf.py`: trajectory loss 호출에 전달.
+- `utils_loss.py`: `_compute_query_trajectory_loss_from_match` 시그니처에 추가.
+  static_gate **비활성** 경로(평범한 mode CE, L941 부근)에서 `F.cross_entropy(weight=...)`로 적용.
+  weight 텐서 = 전 클래스 가중값, stationary 인덱스만 1.0으로 되돌림 (비정지 전부 가중).
+  값이 1.0이거나 stationary_mode_idx가 없으면 weight=None(기존과 동일).
+
+### config
+- `test_traj_mcls.py`: `query_traj_mode_cls_moving_class_weight=4.0` 추가. 그 외 test_traj.py와 100% 동일 (A/B 비교).
+- baseline `EfficientOCF_V1.1_1gpu.py`: traj-mode 키를 선언하지 않는 기존 패턴 유지 → DEFAULTS 1.0으로 동작 변화 없음.
+
 ## 2026-06-11 KST (9차)
 
 ### suppress weight 변경 (test_traj.py)

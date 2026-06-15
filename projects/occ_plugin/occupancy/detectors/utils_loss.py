@@ -648,6 +648,7 @@ class EfficientOCFLossMixin:
         loss_type: str = "l1",
         present_local_idx: int = 0,
         mode_cls_loss_weight: float = 0.0,
+        mode_cls_moving_class_weight: float = 1.0,
         static_gate_loss_weight: float = 0.0,
         moving_reweight_enabled: bool = False,
         moving_threshold_m: float = 0.5,
@@ -938,7 +939,21 @@ class EfficientOCFLossMixin:
                 float(mode_cls_loss_weight) > 0.0
                 and pred_mode_k is not None
             ):
-                mode_cls_loss = F.cross_entropy(mode_logits_mk, routed_mode_k, reduction="mean")
+                ce_weight = None
+                if (
+                    float(mode_cls_moving_class_weight) != 1.0
+                    and stationary_mode_idx is not None
+                ):
+                    # Up-weight every non-stationary (moving) class to counter
+                    # the classifier's collapse toward static.
+                    ce_weight = mode_logits_mk.new_full(
+                        (int(mode_logits_mk.shape[1]),),
+                        float(mode_cls_moving_class_weight),
+                    )
+                    ce_weight[int(stationary_mode_idx)] = 1.0
+                mode_cls_loss = F.cross_entropy(
+                    mode_logits_mk, routed_mode_k, weight=ce_weight, reduction="mean"
+                )
 
         if float(endpoint_loss_weight) > 0.0:
             future_valid_kn = gt_valid_tn[(present_local_idx + 1):t_match].to(

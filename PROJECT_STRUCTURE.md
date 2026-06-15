@@ -8,9 +8,12 @@
 ├── PROJECT_STRUCTURE.md  # 이 문서
 ├── CHANGELOG.md  # 코드 수정/구현 기록
 ├── NOTES.md  # 구현 중 주의사항·경고·후속 작업 메모
+├── GPU_MULTIJOB_NOTES.md  # 한 노드 멀티잡 속도저하 원인/해결 이론 정리 (oversubscription, MPS, NUMA)
+├── MPS_MULTIJOB_RUNBOOK.md  # 두 학습을 8+8 MPS로 동시 실행하는 복붙 런북 (실측 검증: 잡당 30s→9s)
 ├── run.sh  # 학습용 진입 스크립트; config 확인 후 tools/dist_train.sh 호출
 ├── run_eval.sh  # 평가용 진입 스크립트; config/checkpoint 확인 후 tools/dist_test.sh 호출
 ├── run_lss_pretrain.sh  # LSS view-transformer만 pretrain하도록 dist_train.sh를 감싼 래퍼
+├── stop_mps.sh  # MPS 데몬 안전 종료/정리 (dist_train.sh가 MPS를 상시 자동 시작하므로 끌 때 사용)
 ├── data/  # 외부 데이터와 전처리 캐시를 가리키는 심볼릭 링크 모음
 │   ├── efficientocf -> /home/user/jhh/Projects/EfficientOCF/data/efficientocf  # OCF instance/flow 전처리 캐시
 │   ├── efficientocf_bboxcls -> /home/user/jhh/Projects/EOCF_qg_distil_dev/data/efficientocf_bboxcls  # bbox/class 기반 segmentation 캐시
