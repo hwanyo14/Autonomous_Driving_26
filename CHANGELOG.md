@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-06-16 13:05 KST
+
+### test_traj_large ResNet-50 전환
+
+- `projects/configs/baselines/test_traj_large.py`의 image backbone을 ResNet-18에서 ResNet-50으로 변경.
+- ResNet-50 stage 출력에 맞춰 `img_neck.in_channels`를 `[256, 512, 1024, 2048]`로 변경.
+
 ## 2026-06-15 15:15 KST
 
 ### use_query_dt_loss=False 시 DT 데이터 로드 비활성화

@@ -103,6 +103,8 @@ MODEL_CFG_DEFAULTS = {
     "query_num_queries": 100,
     "query_transformer_num_layers": 3,
     "query_transformer_kv_resolutions": ((14, 25), (28, 50), (56, 100)),
+    # "query_transformer_num_layers": 1,
+    # "query_transformer_kv_resolutions": ((56, 100)),
     "query_id_reinject_scale": 0.0,
     "query_ca_kv_identity_init": False,
     "query_ca_attn_tau": 1.0,
