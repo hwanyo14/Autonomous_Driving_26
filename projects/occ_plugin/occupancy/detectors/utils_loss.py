@@ -3075,12 +3075,6 @@ class EfficientOCFLossMixin:
             losses["loss_query_traj_refine_xy"] = z
 
         # ---- Hungarian matching cost diagnostics ----
-        losses["dbg_query_sim_match_cost_weight"] = centers_world.new_tensor(
-            float(self.query_sim_match_cost_weight)
-        )
-        losses["dbg_query_soft_assign_cost_weight"] = centers_world.new_tensor(
-            float(self.query_soft_assign_cost_weight)
-        )
         losses["dbg_query_cls_match_cost_weight"] = centers_world.new_tensor(
             float(self.query_cls_match_cost_weight)
         )
@@ -3090,8 +3084,8 @@ class EfficientOCFLossMixin:
         losses["dbg_query_temporal_offset_match_cost_weight"] = centers_world.new_tensor(
             float(getattr(self, "query_temporal_offset_match_cost_weight", 0.0))
         )
-        losses["dbg_query_bev_dice_match_cost_weight"] = centers_world.new_tensor(
-            float(self.query_bev_dice_match_cost_weight)
+        losses["dbg_query_bev_iou_match_cost_weight"] = centers_world.new_tensor(
+            float(self.query_bev_iou_match_cost_weight)
         )
         losses["dbg_query_attn_match_cost_weight"] = centers_world.new_tensor(
             float(getattr(self, "query_attn_match_cost_weight", 0.0))
@@ -3101,12 +3095,10 @@ class EfficientOCFLossMixin:
         losses["dbg_query_match_cost_total_pair_count"] = z
         losses["dbg_query_match_cost_matched_pair_count"] = z
         for name in (
-            "feat",
-            "soft",
             "cls",
             "center",
             "temporal_offset",
-            "bev_dice",
+            "bev_iou",
             "attn",
         ):
             losses[f"dbg_query_match_cost_{name}_total_mean"] = z
@@ -3166,12 +3158,10 @@ class EfficientOCFLossMixin:
                 matched_mean_safe = matched_mean.detach().abs().clamp_min(eps) if torch.is_tensor(matched_mean) else cost_qn_f32.new_tensor(eps)
 
                 contrib_map = {
-                    "feat": inst_match_result.get("cost_feat_contrib_qn", None),
-                    "soft": inst_match_result.get("cost_soft_contrib_qn", None),
                     "cls": inst_match_result.get("cost_cls_contrib_qn", None),
                     "center": inst_match_result.get("cost_center_contrib_qn", None),
                     "temporal_offset": inst_match_result.get("cost_temporal_offset_contrib_qn", None),
-                    "bev_dice": inst_match_result.get("cost_bev_dice_contrib_qn", None),
+                    "bev_iou": inst_match_result.get("cost_bev_iou_contrib_qn", None),
                     "attn": inst_match_result.get("cost_attn_iou_contrib_qn", None),
                 }
                 for name, contrib_qn in contrib_map.items():
@@ -3264,12 +3254,10 @@ class EfficientOCFLossMixin:
                 if loss_key.startswith('loss'):
                     losses[loss_key] = losses[loss_key] / (losses[loss_key].detach() + 1e-9)
         _keep_dbg = {
-            "dbg_query_sim_match_cost_weight",
-            "dbg_query_soft_assign_cost_weight",
             "dbg_query_cls_match_cost_weight",
             "dbg_query_center_match_cost_weight",
             "dbg_query_temporal_offset_match_cost_weight",
-            "dbg_query_bev_dice_match_cost_weight",
+            "dbg_query_bev_iou_match_cost_weight",
             "dbg_query_attn_match_cost_weight",
         }
         for k in [

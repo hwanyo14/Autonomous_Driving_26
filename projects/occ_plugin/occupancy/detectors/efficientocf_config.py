@@ -35,12 +35,8 @@ MODEL_CFG_DEFAULTS = {
     "query_num_classes": 3,
     "query_cls_loss_weight": 1.0,
     "query_cls_loss_class_weights": None,
-    "query_match_feature_source": "query_img_feat_pooled",
-    "query_soft_assign_temp": 0.10,
-    "query_soft_assign_cost_weight": 0.0,
-    "query_sim_match_cost_weight": 0.0,
     "query_cls_match_cost_weight": 0.0,
-    "query_bev_dice_match_cost_weight": 0.0,
+    "query_bev_iou_match_cost_weight": 0.0,
     "query_center_routed_loss_weight": 0.1,
     "query_traj_matched_only": True,
     "query_traj_loss_weight": 0.0,
@@ -253,12 +249,8 @@ def apply_model_cfg(self, cfg):
     self.strict_query_class_id_validation = bool(cfg["strict_query_class_id_validation"])
 
     self.query_cls_loss_weight = float(cfg["query_cls_loss_weight"])
-    self.query_match_feature_source = str(cfg["query_match_feature_source"])
-    self.query_soft_assign_temp = float(cfg["query_soft_assign_temp"])
-    self.query_soft_assign_cost_weight = float(cfg["query_soft_assign_cost_weight"])
-    self.query_sim_match_cost_weight = float(cfg["query_sim_match_cost_weight"])
     self.query_cls_match_cost_weight = float(cfg["query_cls_match_cost_weight"])
-    self.query_bev_dice_match_cost_weight = float(cfg["query_bev_dice_match_cost_weight"])
+    self.query_bev_iou_match_cost_weight = float(cfg["query_bev_iou_match_cost_weight"])
     self.query_center_routed_loss_weight = float(cfg["query_center_routed_loss_weight"])
     self.query_traj_matched_only = bool(cfg["query_traj_matched_only"])
     self.query_traj_loss_weight = float(cfg["query_traj_loss_weight"])

@@ -357,7 +357,7 @@ grid_config = {
     'dbound': [2.0, 58.0, 0.5],
 }
 
-bev_feat_dim = 64
+bev_feat_dim = 96
 numC_Trans = bev_feat_dim
 
 gn_cfg = dict(type='GN', num_groups=16, requires_grad=True)
@@ -383,11 +383,11 @@ model_cfg = dict(
     query_attn_bbox_unmatched_weight=0.0,
     query_require_history_all_valid=True,
     query_attn_cam_gaussian_truncate_sigma=1.777,
-    query_num_queries=200,
+    query_num_queries=100,
     query_cls_match_cost_weight=0.2,
     query_center_match_cost_weight=10.0,
-    query_temporal_offset_match_cost_weight=0.5,
-    query_bev_iou_match_cost_weight=1.0,
+    query_temporal_offset_match_cost_weight=0.0,
+    query_bev_iou_match_cost_weight=0.5,
     query_center_routed_loss_weight=0.3,
     # --- trajectory: 2-mode (TRAJECTORY_CONFIG.md / cen10_6) ---
     query_traj_num_modes=2,
@@ -430,6 +430,7 @@ model_cfg = dict(
     query_multi_gaussian_sigma_max_m=(1.0, 1.0, 1.0),
     query_multi_gaussian_sigma_reg_loss_weight=0.01,
     query_multi_gaussian_weight_mode='softplus',
+    query_inst_depth_num_bins=112,
 )
 
 debug_cfg = dict(
@@ -515,7 +516,7 @@ optimizer = dict(
     lr=3e-4,
     paramwise_cfg=dict(
         custom_keys={
-            'img_backbone': dict(lr_mult=0.1),
+            'img_backbone': dict(lr_mult=1.0),
         }
     ),
     weight_decay=0.01,

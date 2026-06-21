@@ -1702,40 +1702,7 @@ class EfficientOCF(
         num_matched_queries = 0
         num_total_queries = int(centers_world.shape[1]) if torch.is_tensor(centers_world) else 0
 
-        gt_inst_img_feat_tnd, gt_inst_img_feat_valid_tn, gt_inst_img_feat_ids_n = self.pool_gt_instance_context_features(
-            segmentation_instance3d_txyz=gt_instance_occ3d_txyz_primary,
-            future_egomotion=future_egomotion,
-            gt_inst_ids_n=gt_inst_ids_n,
-            query_match_inputs=query_match_inputs,
-            fallback_segmentation_instance3d_txyz=gt_segmentation_instance3d_txyz,
-        )
         self._last_gt_instance_bev_feat_cache = None
-        if torch.is_tensor(gt_inst_img_feat_tnd):
-            self._last_gt_instance_bev_feat_cache = {
-                "feat_tnd": gt_inst_img_feat_tnd.detach(),
-                "valid_tn": gt_inst_img_feat_valid_tn.detach() if torch.is_tensor(gt_inst_img_feat_valid_tn) else None,
-                "ids_n": gt_inst_img_feat_ids_n.detach() if torch.is_tensor(gt_inst_img_feat_ids_n) else None,
-            }
-        if (
-            torch.is_tensor(gt_inst_ids_full_n)
-            and torch.is_tensor(gt_inst_img_feat_ids_n)
-            and torch.is_tensor(gt_inst_img_feat_tnd)
-            and torch.is_tensor(gt_inst_img_feat_valid_tn)
-        ):
-            feat_full_tnd = self._reindex_temporal_tensor_by_instance_ids(
-                values_tn=gt_inst_img_feat_tnd,
-                instance_ids_n=gt_inst_img_feat_ids_n,
-                target_ids_n=gt_inst_ids_full_n,
-            )
-            feat_valid_full_tn = self._reindex_temporal_tensor_by_instance_ids(
-                values_tn=gt_inst_img_feat_valid_tn,
-                instance_ids_n=gt_inst_img_feat_ids_n,
-                target_ids_n=gt_inst_ids_full_n,
-            )
-            if torch.is_tensor(feat_full_tnd) and torch.is_tensor(feat_valid_full_tn):
-                gt_inst_img_feat_tnd = feat_full_tnd
-                gt_inst_img_feat_valid_tn = feat_valid_full_tn
-                gt_inst_img_feat_ids_n = gt_inst_ids_full_n
         self._last_query_inst_depth_target_pack = None
         if (
             isinstance(query_match_inputs, dict)
@@ -1755,15 +1722,6 @@ class EfficientOCF(
                     for k, v in query_inst_depth_target_pack.items()
                 }
 
-        match_query_feat_tqd = None
-        if self.query_match_feature_source == "query_img_feat_pooled":
-            match_query_feat_tqd = query_img_feat_pooled_tqd
-
-        q_sel_tqd, g_sel_tnd, g_sel_valid_tn = self._select_matching_feature_frames(
-            query_feat_tqd=match_query_feat_tqd,
-            gt_feat_tnd=gt_inst_img_feat_tnd,
-            gt_valid_tn=gt_inst_img_feat_valid_tn,
-        )
         inst_match_result = self._match_queries_to_gt_instances(
             centers_world=centers_world_match_tq3,
             query_sigmas_world_tq3=gaussian_sigmas_world_match_tq3,
@@ -1777,18 +1735,11 @@ class EfficientOCF(
             gt_inst_ids_n=match_gt_ids_n,
             gt_inst_cls_n=match_gt_cls_n,
             gt_inst_cls_valid_n=match_gt_cls_valid_n,
-            query_img_feat_tqd=q_sel_tqd,
             query_cls_logits_qc=query_cls_logits_qc,
-            gt_inst_bev_feat_tnd=g_sel_tnd,
-            gt_inst_bev_feat_valid_tn=g_sel_valid_tn,
-            gt_inst_bev_feat_ids_n=gt_inst_img_feat_ids_n,
             query_attn_weights_tqnhw=_query_attn_weights_tqnhw,
             gt_attn_targets=_query_attn_bbox_targets,
-            query_sim_cost_weight=self.query_sim_match_cost_weight,
             query_cls_cost_weight=self.query_cls_match_cost_weight,
-            query_soft_assign_temp=self.query_soft_assign_temp,
-            query_soft_assign_cost_weight=self.query_soft_assign_cost_weight,
-            query_bev_dice_cost_weight=self.query_bev_dice_match_cost_weight,
+            query_bev_iou_cost_weight=self.query_bev_iou_match_cost_weight,
             query_attn_match_cost_weight=self.query_attn_match_cost_weight,
             query_attn_match_metric=self.query_attn_match_metric,
             query_attn_match_pred_norm=self.query_attn_match_pred_norm,

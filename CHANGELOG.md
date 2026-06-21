@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-06-18 10:38 KST
+
+### Hungarian Matching Feature Cost 제거 및 BEV IoU Cost 도입
+
+- `utils_matcher.py`: query/GT feature matching 입력, cosine similarity cost, soft-assign diagnostic cost 제거. 매칭은 center/class/temporal/BEV IoU/attention cost만 사용.
+- `utils_matcher.py`: BEV Dice cost 경로를 low-res BEV IoU cost로 교체. `matched_gmo_voxelizer`의 low-res 3D grid를 BEV max projection한 뒤 `1 - IoU` 계산.
+- `efficientocf.py`: 매칭 전 GT instance context feature pooling 및 feature frame selection 제거.
+- `efficientocf_config.py`: `query_bev_iou_match_cost_weight` 추가, feature/soft-assign match cost config 제거.
+- `test_traj.py`, `test_traj_large_cost_iou.py`: `query_bev_iou_match_cost_weight=1.0`으로 IoU cost 활성화.
+- `EfficientOCF_V1.1_1gpu.py`: 신규 key를 보수적으로 `0.0`으로 명시.
+- `utils_loss.py`: `dbg_query_match_cost_bev_iou_*`, `dbg_query_bev_iou_match_cost_weight` 로깅으로 변경하고 feature/soft debug 항목 제거.
+- `PROJECT_STRUCTURE.md`: trajectory/IoU 실험 config 항목 추가.
+
+### BEV IoU Matching Cost 2D Rasterize 전환
+
+- `utils_matcher.py`: matching cost용 BEV IoU pred map을 `64x64x20` 3D voxelize 후 Z축 max projection하던 방식에서, XY `64x64` 2D Gaussian mixture rasterize로 전환.
+- GT instance map도 3D adaptive pooling 대신 Z축 occupancy union 후 `adaptive_max_pool2d`로 IoU grid에 맞추도록 변경.
+- GMO focal/BCE/dice loss 경로는 기존 3D `query_matched_gmo_bce_occ_size=(64,64,20)` voxelize 유지.
+- `conda run -n eo` one-off로 단일 Gaussian fallback 및 mixture 입력 모두 `matcher_bev_iou_2d` 검증 통과.
+
 ## 2026-06-16 13:05 KST
 
 ### test_traj_large ResNet-50 전환

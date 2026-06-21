@@ -38,6 +38,8 @@
 │   │   ├── baselines/
 │   │   │   ├── EfficientOCF_V1.1_1gpu.py  # 현재 nuScenes 단일 GPU baseline; query/GMO/DT/debug 설정 포함
 │   │   │   ├── EfficientOCF_V1.1_1gpu_traj_tf.py  # teacher forcing 변형; GT past delta prior로 초반 학습 안정화
+│   │   │   ├── test_traj.py  # trajectory/query matching 실험 baseline; BEV IoU matching cost 활성
+│   │   │   ├── test_traj_large_cost_iou.py  # train_total.sh용 large trajectory config; BEV IoU matching cost 활성
 │   │   │   └── EfficientOCF_V1.1_lyft.py  # Lyft용 EfficientOCF baseline 설정
 │   │   └── datasets/
 │   │       └── custom_nus-3d.py  # MMDet3D 기반 nuScenes 3D dataset/pipeline 기본 템플릿

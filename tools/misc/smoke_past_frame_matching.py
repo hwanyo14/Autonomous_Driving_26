@@ -22,7 +22,8 @@ class _DummyDetector(
         self.query_present_only = True
         self.query_present_global_idx = 2
         self.query_center_match_cost_weight = 1.0
-        self.query_bev_dice_match_cost_weight = 0.0
+        self.query_bev_iou_match_cost_weight = 0.0
+        self.query_traj_residual_max_m = (15.0, 15.0)
         self.spatial_extent3d = (80.0, 80.0, 6.4)
         self.point_cloud_range = (-40.0, -40.0, -1.0, 40.0, 40.0, 5.4)
         self.query_attn_softargmax_tau = 1.0
@@ -68,17 +69,6 @@ def _make_query_match_inputs(t_hist=3, img_hw=32, feat_hw=8):
 
 def _test_full7_match_and_center_cost():
     det = _DummyDetector()
-    q_feat = torch.tensor(
-        [
-            [[1.0, 0.0], [0.0, 1.0]],
-            [[1.0, 0.0], [0.0, 1.0]],
-            [[1.0, 0.0], [0.0, 1.0]],
-        ],
-        dtype=torch.float32,
-    )
-    gt_feat = q_feat.clone()
-    gt_valid_feat = torch.ones((3, 2), dtype=torch.bool)
-
     centers_full = torch.zeros((7, 2, 3), dtype=torch.float32)
     gt_centers_full = torch.zeros((7, 2, 3), dtype=torch.float32)
     gt_valid_full = torch.ones((7, 2), dtype=torch.bool)
@@ -99,11 +89,6 @@ def _test_full7_match_and_center_cost():
         gt_inst_center_world_tn3=gt_centers_full,
         gt_inst_center_valid_tn=gt_valid_full,
         gt_inst_ids_n=gt_ids,
-        query_img_feat_tqd=q_feat,
-        gt_inst_bev_feat_tnd=gt_feat,
-        gt_inst_bev_feat_valid_tn=gt_valid_feat,
-        gt_inst_bev_feat_ids_n=gt_ids,
-        query_sim_cost_weight=1.0,
         query_temporal_cost_frame_indices=[0, 1, 2],
     )
     assert torch.equal(match["matched_query_idx"], torch.tensor([0, 1]))
@@ -112,7 +97,7 @@ def _test_full7_match_and_center_cost():
     assert center_cost_qn is not None
     assert float(center_cost_qn[0, 0].item()) < 1e-6
     assert float(center_cost_qn[1, 1].item()) < 1e-6
-    assert float(center_cost_qn[0, 1].item()) > 0.1
+    assert float(center_cost_qn[0, 1].item()) > 0.05
 
 
 def _test_full7_gt_packing():

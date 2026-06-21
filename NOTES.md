@@ -1,5 +1,12 @@
 # NOTES
 
+## 2026-06-18 KST — Hungarian BEV IoU cost 변경
+- feature cosine/soft-assign matching cost는 제거됨. `_match_queries_to_gt_instances()`는 더 이상 query/GT feature tensor가 없어도 매칭 cost map을 생성함.
+- BEV IoU cost는 matching 전용 2D Gaussian rasterize로 계산됨. 현재 `test_traj.py`, `test_traj_large_cost_iou.py`는 `query_matched_gmo_bce_occ_size=(64,64,20)`의 XY와 동일한 BEV `64x64` 기준, weight `1.0`.
+- GMO focal/BCE/dice loss는 여전히 matched pair 대상 3D `64x64x20` voxelize를 사용함. IoU matching cost와 loss voxelize 결과는 캐싱 공유하지 않음.
+- `dbg_query_match_cost_*` 목록은 `feat`, `soft`, `bev_dice`가 사라지고 `bev_iou`로 변경됨. TensorBoard/로그 파서가 기존 key를 기대하면 같이 바꿔야 함.
+- `tools/misc/smoke_past_frame_matching.py` 전체 실행은 기존 QueryHead trajectory output 검증에서 `traj_offsets_fq2=None`으로 실패함. 이번 변경 검증은 matcher BEV IoU one-off와 compile/config load로 수행.
+
 ## 2026-06-11 KST — Trajectory 2-mode 이식 관련
 - ~~TF 스케줄 재스케일 주의~~ → **해결됨 (6/11)**: TF를 epoch 기준으로 전환. iter 스케줄은 빈 튜플로 비활성, `gt_ratio`를 TrajectoryWarmupHook stage(epoch 1=1.0, 2=0.5, 3+=0.0)가 제어. GPU 수 변경 시 재스케일 불필요.
 - TrajectoryWarmupHook은 **마지막 매칭 stage 하나만 통째로 적용** (누적 merge 아님). stage 추가 시 모든 키를 다 들고 있어야 함.
