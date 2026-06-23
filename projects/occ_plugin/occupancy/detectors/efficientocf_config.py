@@ -29,6 +29,7 @@ MODEL_CFG_DEFAULTS = {
     "query_feat_unmatched_neg_loss_weight": 0.0,
     "query_feat_unmatched_neg_margin": 0.2,
     "query_bev_pool_fixed_sigma_xyz": (4.0, 4.0, 1.5),
+    "use_separate_classes": True,
     "query_class_ids": None,
     "query_class_names": None,
     "strict_query_class_id_validation": False,
@@ -43,37 +44,6 @@ MODEL_CFG_DEFAULTS = {
     "query_traj_loss_type": "l1",
     "query_traj_residual_max_m": (8.0, 8.0),
     "query_traj_prior_detach": True,
-    "query_traj_num_modes": 1,
-    "query_traj_decoder_type": "offset",
-    "query_traj_bernstein_degree": 3,
-    "query_traj_use_stationary_mode": False,
-    "query_traj_use_cv_mode": False,
-    "query_traj_static_gate_enabled": False,
-    "query_traj_static_gate_loss_weight": 0.0,
-    "query_traj_static_gate_threshold": 0.5,
-    "query_traj_derivative_routing_enabled": False,
-    "query_traj_derivative_routing_hidden_dim": 0,
-    "query_traj_teacher_forcing_enabled": False,
-    "query_traj_teacher_forcing_mix_enabled": False,
-    "query_traj_teacher_forcing_gt_ratio": 1.0,
-    "query_traj_teacher_forcing_schedule_iters": (),
-    "query_traj_teacher_forcing_schedule_gt_ratios": (),
-    "query_traj_pred_target_enabled": False,
-    "query_traj_anchor_refine_enabled": False,
-    "query_traj_xy_refine_enabled": False,
-    "query_traj_xy_refine_loss_weight": 0.0,
-    "query_traj_xy_refine_num_layers": 2,
-    "query_traj_xy_refine_hidden_dim": 0,
-    "query_traj_endpoint_conditioning": False,
-    "query_endpoint_loss_weight": 0.0,
-    "query_traj_semantic_routing_enabled": False,
-    "query_traj_rule_turn_family_enabled": False,
-    "query_traj_rule_based_mode_enabled": False,
-    "query_traj_rule_turn_threshold_deg": 10.0,
-    "query_traj_static_threshold_m": 0.8,
-    "query_traj_cv_error_threshold_m": 0.5,
-    "query_traj_mode_cls_loss_weight": 0.0,
-    "query_traj_mode_infer_policy": "argmax",
     "query_traj_moving_reweight_enabled": False,
     "query_traj_moving_threshold_m": 0.5,
     "query_traj_moving_weight": 5.0,
@@ -228,6 +198,9 @@ def apply_model_cfg(self, cfg):
     self.query_bev_pool_fixed_sigma_xyz = tuple(float(v) for v in cfg["query_bev_pool_fixed_sigma_xyz"])
     self.query_num_classes = int(cfg["query_num_classes"])
     self.query_bg_class = 0
+    # Binary (background vs foreground) query classification when classes are not
+    # kept separate; reuses the existing use_separate_classes switch.
+    self.query_binary_cls = not bool(cfg["use_separate_classes"])
 
     query_class_ids = cfg["query_class_ids"]
     if query_class_ids is None:
@@ -257,41 +230,6 @@ def apply_model_cfg(self, cfg):
     self.query_traj_loss_type = str(cfg["query_traj_loss_type"]).lower()
     self.query_traj_residual_max_m = tuple(float(v) for v in cfg["query_traj_residual_max_m"])
     self.query_traj_prior_detach = bool(cfg["query_traj_prior_detach"])
-    self.query_traj_num_modes = int(cfg["query_traj_num_modes"])
-    self.query_traj_decoder_type = str(cfg["query_traj_decoder_type"]).lower()
-    self.query_traj_bernstein_degree = int(cfg["query_traj_bernstein_degree"])
-    self.query_traj_use_stationary_mode = bool(cfg["query_traj_use_stationary_mode"])
-    self.query_traj_use_cv_mode = bool(cfg["query_traj_use_cv_mode"])
-    self.query_traj_static_gate_enabled = bool(cfg["query_traj_static_gate_enabled"])
-    self.query_traj_static_gate_loss_weight = float(cfg["query_traj_static_gate_loss_weight"])
-    self.query_traj_static_gate_threshold = float(cfg["query_traj_static_gate_threshold"])
-    self.query_traj_derivative_routing_enabled = bool(cfg["query_traj_derivative_routing_enabled"])
-    self.query_traj_derivative_routing_hidden_dim = int(cfg["query_traj_derivative_routing_hidden_dim"])
-    self.query_traj_teacher_forcing_enabled = bool(cfg["query_traj_teacher_forcing_enabled"])
-    self.query_traj_teacher_forcing_mix_enabled = bool(cfg["query_traj_teacher_forcing_mix_enabled"])
-    self.query_traj_teacher_forcing_gt_ratio = float(cfg["query_traj_teacher_forcing_gt_ratio"])
-    self.query_traj_teacher_forcing_schedule_iters = tuple(
-        int(v) for v in cfg["query_traj_teacher_forcing_schedule_iters"]
-    )
-    self.query_traj_teacher_forcing_schedule_gt_ratios = tuple(
-        float(v) for v in cfg["query_traj_teacher_forcing_schedule_gt_ratios"]
-    )
-    self.query_traj_pred_target_enabled = bool(cfg["query_traj_pred_target_enabled"])
-    self.query_traj_anchor_refine_enabled = bool(cfg["query_traj_anchor_refine_enabled"])
-    self.query_traj_xy_refine_enabled = bool(cfg["query_traj_xy_refine_enabled"])
-    self.query_traj_xy_refine_loss_weight = float(cfg["query_traj_xy_refine_loss_weight"])
-    self.query_traj_xy_refine_num_layers = int(cfg["query_traj_xy_refine_num_layers"])
-    self.query_traj_xy_refine_hidden_dim = int(cfg["query_traj_xy_refine_hidden_dim"])
-    self.query_traj_endpoint_conditioning = bool(cfg["query_traj_endpoint_conditioning"])
-    self.query_endpoint_loss_weight = float(cfg["query_endpoint_loss_weight"])
-    self.query_traj_semantic_routing_enabled = bool(cfg["query_traj_semantic_routing_enabled"])
-    self.query_traj_rule_turn_family_enabled = bool(cfg["query_traj_rule_turn_family_enabled"])
-    self.query_traj_rule_based_mode_enabled = bool(cfg["query_traj_rule_based_mode_enabled"])
-    self.query_traj_rule_turn_threshold_deg = float(cfg["query_traj_rule_turn_threshold_deg"])
-    self.query_traj_static_threshold_m = float(cfg["query_traj_static_threshold_m"])
-    self.query_traj_cv_error_threshold_m = float(cfg["query_traj_cv_error_threshold_m"])
-    self.query_traj_mode_cls_loss_weight = float(cfg["query_traj_mode_cls_loss_weight"])
-    self.query_traj_mode_infer_policy = str(cfg["query_traj_mode_infer_policy"]).lower()
     self.query_traj_moving_reweight_enabled = bool(cfg["query_traj_moving_reweight_enabled"])
     self.query_traj_moving_threshold_m = float(cfg["query_traj_moving_threshold_m"])
     self.query_traj_moving_weight = float(cfg["query_traj_moving_weight"])

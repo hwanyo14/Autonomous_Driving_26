@@ -1,5 +1,60 @@
 # Changelog
 
+## 2026-06-21 21:33 KST
+
+### Binary query foreground 시각화 색상 변경 (녹색 → 노란색)
+
+- `query_head.py` `_get_query_pred_palette`: binary foreground 색을 `[80,255,120]`(녹색)에서 `[255,255,0]`(노란색)으로 변경. GT semantic의 trailer 녹색(`[140,255,100]`)과 혼동되던 문제 해결. marker와 legend가 동일 색을 공유함.
+
+## 2026-06-21 21:17 KST
+
+### Query 분류를 multi-class → background/foreground 이진 분류로 전환
+
+- 기존 `use_separate_classes` switch를 query branch에도 연결: `False`면 query가 binary(bg/fg) 분류, `True`면 종전 8-class 경로 유지. matcher/loss/scoring은 logit shape에서 class 수를 읽어 자동 적응함.
+- `efficientocf_config.py`: `MODEL_CFG_DEFAULTS`에 `use_separate_classes`(기본 True) 추가, `apply_model_cfg`에서 `self.query_binary_cls = not use_separate_classes` 파생.
+- `efficientocf.py`: binary일 때 `query_raw_to_compact_class_map`을 enumerate가 아니라 collapse로 구성(background raw id→0, 모든 foreground raw id→1). `query_binary_cls`를 `QueryHead`로 전달.
+- `query_head.py`: `query_binary_cls` 인자 추가. binary에서는 `query_class_ids`가 라벨 공간이 아닌 foreground-id registry이므로 `len(query_class_ids)==num_query_classes` 검증을 건너뜀. 예측 marker/legend 색을 `_get_query_pred_palette()`(binary: [background, foreground])로 통일. GT semantic overlay는 per-class 색 유지.
+- `test_traj_large_tf_simple.py`: `use_separate_classes` 분기에 `query_num_classes`/`query_cls_names`/`query_cls_loss_class_weights`(binary: `[0.1, 1.0]`, reference 구현과 동일) 추가, model_cfg가 분기 값과 `use_separate_classes`를 사용하도록 정리. `query_class_ids`는 foreground registry로 그대로 유지.
+- 검증: 4개 파일 `py_compile` 통과, config exec 시 `query_num_classes=2`/`query_class_names=['background','foreground']`/weights 길이 2 확인, collapse map이 foreground ids→1·background→0·미등록 id→-1(필터) 매핑 확인. `efficientocf_bboxcls/GMO/segmentation` 캐시의 class 채널이 raw nuScenes id(`{2,3,4,7,9,10}`)를 보존함을 실데이터로 확인 → `use_separate_classes` 재사용이 query foreground GT를 손상시키지 않음(reference의 별도 `query_cls_mode` 키와 현재 config에서 기능적 동등).
+
+## 2026-06-21 19:31 KST
+
+### Trajectory debug DDP log key 불일치 수정
+
+- `utils_loss.py`: trajectory loss 유효 여부와 무관하게 `loss_query_traj`와 6개 `dbg_query_traj_*` key를 0으로 선생성하고, 유효 loss가 있으면 실제 값으로 덮어쓰도록 수정.
+- rank별 matched future pair 유무에 따라 `log_vars` 길이가 달라져 발생하던 `loss log variables are different across GPUs!` assert 방지.
+- 검증: trajectory loss가 `None`인 경우와 유효 dict인 경우 aggregate 결과 key 집합이 동일함을 확인하고 config model build, `py_compile`, `git diff --check` 통과.
+
+## 2026-06-21 19:28 KST
+
+### Teacher forcing epoch 기준 전환
+
+- `test_traj_large_cost_iou_resnet_lr_depthbin.py`: iter cutoff을 비활성화하고 `TrajectoryWarmupHook`으로 epoch 1~8 teacher forcing 활성, epoch 9부터 비활성화.
+- `efficientocf.py`: `query_traj_teacher_forcing_until_iter=0`이면 iter 제한 없이 hook의 boolean 상태만 따르도록 변경. 양수인 기존 config는 종전 iter cutoff 유지.
+- `efficiency_hooks.py`: 현재 단일 trajectory 경로의 `query_traj_teacher_forcing` 상태를 schedule debug 값에 반영하고 구형 key fallback 유지.
+- post-match GMO loss 및 학습용 geometry 경로는 이미 `experiment/tf-traj-cost`와 동일하여 추가 변경하지 않음.
+- 검증: 지정 config model/hook build 및 epoch 1·8 활성, epoch 9 비활성 전환 확인.
+
+## 2026-06-21 19:23 KST
+
+### Main trajectory config 단일 head 경로 정합
+
+- `test_traj_large_cost_iou_resnet_lr_depthbin.py`: 제거된 multi-mode/routing/xy-refine/ratio teacher-forcing 인자와 `TrajectoryWarmupHook` 제거.
+- matched query에 대해서만 trajectory head를 실행하도록 `query_traj_matched_only=True`를 명시.
+- `experiment/tf-traj-cost`의 hard teacher forcing 설정인 `query_traj_teacher_forcing=True`, `query_traj_teacher_forcing_until_iter=30000` 적용.
+- 검증: 지정 config model build, deferred 단계 head 미호출, GT prior 치환 후 matched-query head 1회 호출, center/GMM delta 누적 이동 smoke test 통과.
+
+## 2026-06-21 19:15 KST
+
+### Trajectory 경로를 experiment/tf-traj-cost 방식으로 복원
+
+- `query_head.py`: multi-mode/Bernstein/refinement trajectory head를 제거하고, 과거 center delta와 미래 zero prior를 입력으로 받는 단일 MLP trajectory head 및 `[F,Q,2]` 출력 계약으로 복원.
+- `efficientocf.py`: matching 이후 matched query만 trajectory를 예측하고, 유효한 과거 GT delta를 사용하는 hard teacher forcing 및 예측 delta 누적 기반 미래 center/Gaussian mixture 이동 경로로 복원.
+- `utils_loss.py`: matched query의 미래 step delta에 대한 L1/L2 trajectory loss와 moving/static reweight만 유지.
+- `efficientocf_config.py`: 단순 trajectory 경로에서 사용하는 설정만 유지하고 multi-mode/refinement/endpoint 관련 설정 제거.
+- Pyramid query transformer CA, class/depth head, attention matching, Gaussian mixture head, voxelizer, dataset pipeline은 변경하지 않음.
+- 검증: `py_compile`, `git diff --check`, 핵심 함수 AST 기준 브랜치 대조, `eo` 환경 trajectory head shape smoke test 및 baseline model build 통과.
+
 ## 2026-06-18 10:38 KST
 
 ### Hungarian Matching Feature Cost 제거 및 BEV IoU Cost 도입

@@ -74,10 +74,19 @@ voxel_x = (point_cloud_range[3] - point_cloud_range[0]) / occ_size[0]
 voxel_y = (point_cloud_range[4] - point_cloud_range[1]) / occ_size[1]
 voxel_z = (point_cloud_range[5] - point_cloud_range[2]) / occ_size[2]
 empty_idx = 0
+# use_separate_classes drives both the dense occ branch and the query branch:
+#   True  -> multi-class query classification (background + per-class)
+#   False -> binary query classification (background vs foreground)
 if use_separate_classes:
     num_cls = len(class_names) + 1
+    query_num_classes = len(query_class_ids)
+    query_cls_names = query_class_names
+    query_cls_loss_class_weights = [0.02, 1.4, 1.3, 0.30, 1.4, 1.4, 1.2, 0.9]
 else:
     num_cls = 2
+    query_num_classes = 2
+    query_cls_names = ['background', 'foreground']
+    query_cls_loss_class_weights = [0.2, 1.0]
 
 img_norm_cfg = None
 
@@ -367,11 +376,12 @@ model_cfg = dict(
     query_gmo_loss_type='focal',
     query_gt2p_instance_labeled_tau=0.3,
     query_gt2p_cooldown_iters=4000,
+    use_separate_classes=use_separate_classes,
     query_class_ids=query_class_ids,
-    query_class_names=query_class_names,
+    query_class_names=query_cls_names,
     strict_query_class_id_validation=strict_query_class_id_validation,
-    query_num_classes=len(query_class_ids),
-    query_cls_loss_class_weights=[0.02, 1.4, 1.3, 0.30, 1.4, 1.4, 1.2, 0.9],
+    query_num_classes=query_num_classes,
+    query_cls_loss_class_weights=query_cls_loss_class_weights,
     query_attn_match_metric='inside_log',
     query_attn_match_cost_weight=0.3,
     query_embed_dim=bev_feat_dim,
@@ -387,7 +397,7 @@ model_cfg = dict(
     query_cls_match_cost_weight=0.2,
     query_center_match_cost_weight=10.0,
     query_temporal_offset_match_cost_weight=0.0,
-    query_bev_iou_match_cost_weight=0.5,
+    query_bev_iou_match_cost_weight=0.3,
     query_center_routed_loss_weight=0.3,
     # --- trajectory: matched-query single-head path ---
     query_traj_matched_only=True,

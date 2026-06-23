@@ -1,5 +1,26 @@
 # NOTES
 
+## 2026-06-21 KST — Query 이진 분류(bg/fg) 전환 주의사항
+
+- query 분류의 binary/multi-class 전환은 **`use_separate_classes` 하나로** 제어함(`False`=binary, `True`=8-class). 별도 query 전용 flag 없음. 내부적으로 `self.query_binary_cls = not use_separate_classes`.
+- `query_class_ids`(`[0,2,3,4,5,6,9,10]`)는 binary에서도 **foreground-id registry**로 유지됨(`utils_gt_prep`의 instance 필터 `allowed_raw_ids` 및 collapse map 입력). 라벨 공간(`query_num_classes`)과 분리되므로 `query_class_ids`를 줄이지 말 것.
+- `query_cls_loss_class_weights` 길이는 반드시 `query_num_classes`와 일치해야 함(binary=2, multi=8). config 분기에서 함께 관리.
+- binary collapse map은 background raw id→0, foreground raw id→1, registry 밖 id→-1(필터). GT instance는 foreground이므로 매칭 target은 1, 미매칭 query는 0(background).
+- 시각화: 예측 marker/legend는 binary 색(background/foreground)으로 통일했으나, **GT semantic overlay(`gt_cls_rgb`)는 per-class 색을 유지**함(GT 참조용). GT도 단일 fg 색으로 합치려면 `query_head.py`의 GT semantic 블록(`class_palette` 사용부)을 별도 수정해야 함.
+- matcher/loss/scoring은 logit shape에서 class 수를 읽어 자동 적응함(코드 수정 불필요). `query_cls_match_cost_weight`는 binary log-softmax 기준으로 그대로 동작.
+- `utils_loss.py`의 per-class debug stats(`dbg_query_cls_*_score_c{i}`/`_pred_count_c{i}`/`_target_count_c{i}`)는 binary에서 `c0`,`c1`만 생성됨(기존 `c0`~`c7`). 모든 rank가 동일 C=2라 DDP 문제는 없으나, 8-class key를 기대하는 TensorBoard/로그 파서는 조정 필요.
+
+## 2026-06-21 KST — Trajectory DDP log key 안정성
+
+- rank별 유효 trajectory pair 유무가 달라도 `_aggregate_training_losses()`가 `loss_query_traj`와 6개 `dbg_query_traj_*` key를 항상 반환해야 함. 새 trajectory diagnostic key를 추가할 때도 zero prefill 목록을 함께 갱신할 것.
+
+## 2026-06-21 KST — tf-traj-cost 단일 trajectory 경로 적용 범위
+
+- `query_traj_matched_only=True`이면 trajectory input만 matching 전에 만들고, head forward는 Hungarian matching 후 matched query에 대해 1회 실행함.
+- teacher forcing은 matched GT의 유효한 과거 step delta를 head prior에 넣는 hard forcing임. `query_traj_teacher_forcing_until_iter>0`인 config는 해당 iter 이후 전환하고, 값이 `0`이면 epoch hook이 boolean 상태를 단독 제어함.
+- teacher-forced head 출력은 미래 query center와 Gaussian mixture center의 누적 이동에 사용되지만, `experiment/tf-traj-cost` 원본과 동일하게 현재 post-match 재생성 결과는 `*_vis_full` 시각화 geometry에만 반영됨. matched GMO loss 등 학습용 geometry에도 반영하려면 별도 변경이 필요함.
+- `test_traj_large_cost_iou_resnet_lr_depthbin.py`는 epoch 1~8 teacher forcing 활성, epoch 9부터 비활성으로 GPU 수와 무관하게 동작함.
+
 ## 2026-06-18 KST — Hungarian BEV IoU cost 변경
 - feature cosine/soft-assign matching cost는 제거됨. `_match_queries_to_gt_instances()`는 더 이상 query/GT feature tensor가 없어도 매칭 cost map을 생성함.
 - BEV IoU cost는 matching 전용 2D Gaussian rasterize로 계산됨. 현재 `test_traj.py`, `test_traj_large_cost_iou.py`는 `query_matched_gmo_bce_occ_size=(64,64,20)`의 XY와 동일한 BEV `64x64` 기준, weight `1.0`.

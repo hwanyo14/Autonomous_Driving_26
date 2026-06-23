@@ -55,7 +55,13 @@ class TrajectoryWarmupHook(Hook):
         model._query_traj_sched_refine_loss_weight = float(getattr(model, "query_traj_xy_refine_loss_weight", 0.0))
         model._query_traj_sched_mode_cls_loss_weight = float(getattr(model, "query_traj_mode_cls_loss_weight", 0.0))
         model._query_traj_sched_teacher_forcing_enabled = float(
-            bool(getattr(model, "query_traj_teacher_forcing_enabled", False))
+            bool(
+                getattr(
+                    model,
+                    "query_traj_teacher_forcing",
+                    getattr(model, "query_traj_teacher_forcing_enabled", False),
+                )
+            )
         )
 
     def before_run(self, runner):
