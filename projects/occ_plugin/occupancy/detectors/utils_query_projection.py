@@ -401,6 +401,9 @@ class EfficientOCFQueryProjectionMixin:
             "dbg_query_depth_multi_cam_candidate_count": z,
             "dbg_query_depth_loss_weight": z.new_tensor(float(loss_weight)),
             "dbg_query_depth_label_smoothing": z.new_tensor(float(label_smoothing)),
+            "dbg_query_depth_soft_sigma_bins": z.new_tensor(
+                float(getattr(self, "query_depth_soft_label_sigma_bins", 1.0))
+            ),
         }
         if (
             (not torch.is_tensor(query_depth_logits_tqd))
@@ -415,6 +418,7 @@ class EfficientOCFQueryProjectionMixin:
         match_gt_ids_n = inst_match_result.get("gt_ids_n", None)
         depth_bin_tcn = query_inst_depth_target_pack.get("gt_inst_depth_bin_tcn", None)
         depth_valid_tcn = query_inst_depth_target_pack.get("gt_inst_depth_valid_tcn", None)
+        depth_value_tcn = query_inst_depth_target_pack.get("gt_inst_depth_value_tcn", None)
         depth_target_ids_n = query_inst_depth_target_pack.get("gt_inst_ids_n", None)
         depth_target_global_idx_t = query_inst_depth_target_pack.get(
             "query_output_global_frame_indices", None
@@ -425,11 +429,14 @@ class EfficientOCFQueryProjectionMixin:
             or (not torch.is_tensor(match_gt_ids_n))
             or (not torch.is_tensor(depth_bin_tcn))
             or (not torch.is_tensor(depth_valid_tcn))
+            or (not torch.is_tensor(depth_value_tcn))
             or (not torch.is_tensor(depth_target_ids_n))
             or (not torch.is_tensor(depth_target_global_idx_t))
             or depth_bin_tcn.dim() != 3
             or depth_valid_tcn.dim() != 3
+            or depth_value_tcn.dim() != 3
             or tuple(depth_bin_tcn.shape) != tuple(depth_valid_tcn.shape)
+            or tuple(depth_value_tcn.shape) != tuple(depth_valid_tcn.shape)
             or matched_query_idx.numel() <= 0
             or matched_query_idx.numel() != matched_inst_idx.numel()
         ):
@@ -438,6 +445,20 @@ class EfficientOCFQueryProjectionMixin:
         t_query, q_total, d_bins = [int(v) for v in query_depth_logits_tqd.shape]
         t_tgt, n_cam, n_tgt_inst = [int(v) for v in depth_bin_tcn.shape]
         if d_bins <= 0 or t_query <= 0 or q_total <= 0 or t_tgt <= 0 or n_cam <= 0 or n_tgt_inst <= 0:
+            return out
+        depth_min = float(getattr(self, "query_inst_depth_min", 0.0))
+        depth_max = float(getattr(self, "query_inst_depth_max", 0.0))
+        if str(getattr(self, "query_inst_depth_range_mode", "dbound")).lower() == "dbound":
+            dbound = None
+            if hasattr(self, "img_view_transformer") and hasattr(self.img_view_transformer, "grid_config"):
+                dbound = self.img_view_transformer.grid_config.get("dbound", None)
+            if isinstance(dbound, (list, tuple)) and len(dbound) >= 2:
+                depth_min = float(dbound[0])
+                depth_max = float(dbound[1])
+        if not (depth_max > depth_min):
+            return out
+        bin_size = (depth_max - depth_min) / float(d_bins)
+        if not (bin_size > 0.0):
             return out
 
         mq = matched_query_idx.to(device=query_depth_logits_tqd.device, dtype=torch.long).reshape(-1)
@@ -536,7 +557,17 @@ class EfficientOCFQueryProjectionMixin:
         tgt_valid_tck = depth_valid_tcn.to(
             device=query_depth_logits_tqd.device, dtype=torch.bool
         ).index_select(0, tgt_row_idx_t).index_select(2, tgt_cols_t)
-        tgt_valid_tck = tgt_valid_tck & (tgt_bin_tck >= 0) & (tgt_bin_tck < d_bins)
+        tgt_depth_tck = depth_value_tcn.to(
+            device=query_depth_logits_tqd.device, dtype=torch.float32
+        ).index_select(0, tgt_row_idx_t).index_select(2, tgt_cols_t)
+        tgt_valid_tck = (
+            tgt_valid_tck
+            & (tgt_bin_tck >= 0)
+            & (tgt_bin_tck < d_bins)
+            & torch.isfinite(tgt_depth_tck)
+            & (tgt_depth_tck >= float(depth_min))
+            & (tgt_depth_tck < float(depth_max))
+        )
 
         valid_all_count = tgt_valid_tck.to(torch.float32).sum()
         out["dbg_query_depth_valid_count"] = valid_all_count
@@ -569,6 +600,7 @@ class EfficientOCFQueryProjectionMixin:
 
         tgt_valid_tkc = tgt_valid_tck.permute(0, 2, 1).contiguous()
         tgt_bin_tkc = tgt_bin_tck.permute(0, 2, 1).contiguous()
+        tgt_depth_tkc = tgt_depth_tck.permute(0, 2, 1).contiguous()
         selected_cam_pack = self._select_top1_camera_by_mass(
             cam_mass_tqn=cam_mass_tkc,
             valid_mask_tqn=tgt_valid_tkc,
@@ -580,20 +612,29 @@ class EfficientOCFQueryProjectionMixin:
         out["dbg_query_depth_selected_count"] = selected_cam_pack["selected_count"]
         out["dbg_query_depth_multi_cam_candidate_count"] = selected_cam_pack["multi_cam_candidate_count"]
 
-        selected_tgt_bin_tk = tgt_bin_tkc.gather(2, selected_cam_idx_tk.unsqueeze(-1)).squeeze(-1)
+        selected_tgt_depth_tk = tgt_depth_tkc.gather(2, selected_cam_idx_tk.unsqueeze(-1)).squeeze(-1)
         logits_flat = logits_tkd.reshape(-1, d_bins)
-        tgt_bin_flat = selected_tgt_bin_tk.reshape(-1)
+        tgt_depth_flat = selected_tgt_depth_tk.reshape(-1)
         valid_flat = selected_valid_tk.reshape(-1)
         valid_count = valid_flat.to(torch.float32).sum()
         if not bool((valid_count > 0).item()):
             return out
 
-        ce = F.cross_entropy(
-            logits_flat[valid_flat],
-            tgt_bin_flat[valid_flat],
-            reduction="mean",
-            label_smoothing=float(max(0.0, min(0.999, label_smoothing))),
+        logits_valid = logits_flat[valid_flat]
+        depth_valid = tgt_depth_flat[valid_flat]
+        target_bin = ((depth_valid - float(depth_min)) / float(bin_size) - 0.5).clamp(
+            min=0.0,
+            max=float(d_bins - 1),
         )
+        bin_idx = torch.arange(d_bins, device=logits_valid.device, dtype=torch.float32)
+        sigma = float(max(1e-6, float(getattr(self, "query_depth_soft_label_sigma_bins", 1.0))))
+        soft_target = torch.exp(-0.5 * ((bin_idx.view(1, -1) - target_bin.view(-1, 1)) / sigma) ** 2)
+        soft_target = soft_target / soft_target.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        smooth = float(max(0.0, min(0.999, label_smoothing)))
+        if smooth > 0.0:
+            soft_target = soft_target * (1.0 - smooth) + smooth / float(d_bins)
+
+        ce = -(soft_target * F.log_softmax(logits_valid, dim=-1)).sum(dim=-1).mean()
         out["loss_query_depth"] = ce * float(max(0.0, loss_weight))
         return out
 

@@ -100,6 +100,7 @@ MODEL_CFG_DEFAULTS = {
     "query_attn_softargmax_tau": 1.0,
     "query_depth_loss_weight": 1.0,
     "query_depth_label_smoothing": 0.0,
+    "query_depth_soft_label_sigma_bins": 1.0,
     "query_inst_depth_num_bins": 64,
     "query_inst_depth_range_mode": "dbound",
     "query_inst_depth_min": 0.0,
@@ -286,6 +287,7 @@ def apply_model_cfg(self, cfg):
     self.query_attn_softargmax_tau = float(cfg["query_attn_softargmax_tau"])
     self.query_depth_loss_weight = float(cfg["query_depth_loss_weight"])
     self.query_depth_label_smoothing = float(cfg["query_depth_label_smoothing"])
+    self.query_depth_soft_label_sigma_bins = float(cfg["query_depth_soft_label_sigma_bins"])
     self.query_inst_depth_num_bins = int(cfg["query_inst_depth_num_bins"])
     self.query_inst_depth_range_mode = str(cfg["query_inst_depth_range_mode"]).lower()
     self.query_inst_depth_min = float(cfg["query_inst_depth_min"])

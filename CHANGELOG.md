@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-06-23 13:51 KST
+
+### QueryDepthHead depth supervision soft label CE 전환
+
+- `utils_query_projection.py`: QueryDepthHead depth loss를 hard depth bin `F.cross_entropy`에서 Gaussian soft label CE로 변경. GT depth value 기준으로 bin-center 좌표 target을 만들고 `sigma=1.0 bin` 기본값을 사용함.
+- `efficientocf_config.py`, `EfficientOCF_V1.1_1gpu.py`: `query_depth_soft_label_sigma_bins=1.0` 설정 추가.
+- `test_traj_large_adj_lr.py`: 실제 사용 config에도 `query_depth_soft_label_sigma_bins=1.0` 추가.
+
 ## 2026-06-21 21:33 KST
 
 ### Binary query foreground 시각화 색상 변경 (녹색 → 노란색)

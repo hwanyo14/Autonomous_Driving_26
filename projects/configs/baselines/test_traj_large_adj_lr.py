@@ -74,10 +74,19 @@ voxel_x = (point_cloud_range[3] - point_cloud_range[0]) / occ_size[0]
 voxel_y = (point_cloud_range[4] - point_cloud_range[1]) / occ_size[1]
 voxel_z = (point_cloud_range[5] - point_cloud_range[2]) / occ_size[2]
 empty_idx = 0
+# use_separate_classes drives both the dense occ branch and the query branch:
+#   True  -> multi-class query classification (background + per-class)
+#   False -> binary query classification (background vs foreground)
 if use_separate_classes:
     num_cls = len(class_names) + 1
+    query_num_classes = len(query_class_ids)
+    query_cls_names = query_class_names
+    query_cls_loss_class_weights = [0.02, 1.4, 1.3, 0.30, 1.4, 1.4, 1.2, 0.9]
 else:
     num_cls = 2
+    query_num_classes = 2
+    query_cls_names = ['background', 'foreground']
+    query_cls_loss_class_weights = [0.2, 1.0]
 
 img_norm_cfg = None
 
@@ -367,11 +376,12 @@ model_cfg = dict(
     query_gmo_loss_type='focal',
     query_gt2p_instance_labeled_tau=0.3,
     query_gt2p_cooldown_iters=4000,
+    use_separate_classes=use_separate_classes,
     query_class_ids=query_class_ids,
-    query_class_names=query_class_names,
+    query_class_names=query_cls_names,
     strict_query_class_id_validation=strict_query_class_id_validation,
-    query_num_classes=len(query_class_ids),
-    query_cls_loss_class_weights=[0.02, 1.4, 1.3, 0.30, 1.4, 1.4, 1.2, 0.9],
+    query_num_classes=query_num_classes,
+    query_cls_loss_class_weights=query_cls_loss_class_weights,
     query_attn_match_metric='inside_log',
     query_attn_match_cost_weight=0.3,
     query_embed_dim=bev_feat_dim,
@@ -384,44 +394,22 @@ model_cfg = dict(
     query_require_history_all_valid=True,
     query_attn_cam_gaussian_truncate_sigma=1.777,
     query_num_queries=100,
-    query_cls_match_cost_weight=0.2,
+    query_cls_match_cost_weight=0.3,
     query_center_match_cost_weight=10.0,
-    query_temporal_offset_match_cost_weight=0.5,
+    query_temporal_offset_match_cost_weight=0.0,
+    query_bev_iou_match_cost_weight=0.3,
     query_center_routed_loss_weight=0.3,
-    # --- trajectory: 2-mode (TRAJECTORY_CONFIG.md / cen10_6) ---
-    query_traj_num_modes=2,
-    query_traj_use_stationary_mode=True,
-    query_traj_use_cv_mode=False,
-    query_traj_decoder_type='offset',
+    query_depth_soft_label_sigma_bins=1.0,
+    # --- trajectory: matched-query single-head path ---
+    query_traj_matched_only=True,
     query_traj_residual_max_m=(15.0, 15.0),
-    # 라우팅 (정답 라벨 생성)
-    query_traj_semantic_routing_enabled=True,
-    query_traj_rule_turn_family_enabled=False,
-    query_traj_static_threshold_m=0.8,
-    # 추론
-    query_traj_mode_infer_policy='argmax',
-    # loss 가중 (warmup이 epoch별로 덮어씀)
     query_traj_loss_weight=0.5,
-    query_traj_mode_cls_loss_weight=0.1,
     query_traj_static_weight=1.0,
     query_traj_moving_weight=5.0,
     query_traj_moving_reweight_enabled=True,
     query_traj_moving_threshold_m=0.8,
-    # xy refine
-    query_traj_xy_refine_enabled=True,
-    query_traj_xy_refine_loss_weight=0.1,
-    query_traj_xy_refine_num_layers=2,
-    query_traj_xy_refine_hidden_dim=64,
-    # 비활성
-    query_traj_static_gate_enabled=False,
-    query_traj_derivative_routing_enabled=False,
-    # teacher forcing: iter 스케줄 비활성 → warmup hook이 gt_ratio를 epoch 단위로 제어
-    # (GPU 수와 무관; 원본 1-GPU 기준 epoch 0.75~2.0 전환을 epoch 계단으로 근사)
-    query_traj_teacher_forcing_enabled=True,
-    query_traj_teacher_forcing_mix_enabled=True,
-    query_traj_teacher_forcing_gt_ratio=1.0,
-    query_traj_teacher_forcing_schedule_iters=(),
-    query_traj_teacher_forcing_schedule_gt_ratios=(),
+    query_traj_teacher_forcing=True,
+    query_traj_teacher_forcing_until_iter=0,
     query_matched_gmo_bce_occ_size=(64, 64, 20),
     query_num_gaussians=16,
     query_multi_gaussian_offset_max_m=(3.0, 3.0, 0.7),
@@ -429,6 +417,7 @@ model_cfg = dict(
     query_multi_gaussian_sigma_max_m=(1.0, 1.0, 1.0),
     query_multi_gaussian_sigma_reg_loss_weight=0.01,
     query_multi_gaussian_weight_mode='softplus',
+    query_inst_depth_num_bins=112,
 )
 
 debug_cfg = dict(
@@ -511,7 +500,7 @@ model = dict(
 # Learning policy params ******************************************
 optimizer = dict(
     type='AdamW',
-    lr=3e-4,
+    lr=5e-4,
     paramwise_cfg=dict(
         custom_keys={
             'img_backbone': dict(lr_mult=0.1),
@@ -546,29 +535,9 @@ evaluation = dict(
     rule='greater',
 )
 
-# 주의: hook은 매 epoch 시작 시 begin_epoch ≤ 현재 epoch인 "마지막 stage 하나"만 적용함.
-# 따라서 각 stage는 전체 키를 다 들고 있어야 함 (누적 merge 아님).
-# teacher forcing gt_ratio도 여기서 epoch 단위로 제어 (iter 스케줄은 비활성).
-# mode_cls는 0.1 고정. TF는 epoch 1~4 풀 유지 → 5~7 ramp(0.9/0.7/0.5) → 8부터 0.
 traj_warmup_schedule = [
-    dict(begin_epoch=1, query_traj_loss_weight=0.05, query_traj_xy_refine_loss_weight=0.00,
-         query_traj_mode_cls_loss_weight=0.10, query_traj_teacher_forcing_enabled=True,
-         query_traj_teacher_forcing_gt_ratio=1.0),
-    dict(begin_epoch=5, query_traj_loss_weight=0.15, query_traj_xy_refine_loss_weight=0.02,
-         query_traj_mode_cls_loss_weight=0.10, query_traj_teacher_forcing_enabled=True,
-         query_traj_teacher_forcing_gt_ratio=0.9),
-    dict(begin_epoch=6, query_traj_loss_weight=0.15, query_traj_xy_refine_loss_weight=0.02,
-         query_traj_mode_cls_loss_weight=0.10, query_traj_teacher_forcing_enabled=True,
-         query_traj_teacher_forcing_gt_ratio=0.7),
-    dict(begin_epoch=7, query_traj_loss_weight=0.15, query_traj_xy_refine_loss_weight=0.02,
-         query_traj_mode_cls_loss_weight=0.10, query_traj_teacher_forcing_enabled=True,
-         query_traj_teacher_forcing_gt_ratio=0.5),
-    dict(begin_epoch=8, query_traj_loss_weight=0.25, query_traj_xy_refine_loss_weight=0.05,
-         query_traj_mode_cls_loss_weight=0.10, query_traj_teacher_forcing_enabled=True,
-         query_traj_teacher_forcing_gt_ratio=0.0),
-    dict(begin_epoch=11, query_traj_loss_weight=0.50, query_traj_xy_refine_loss_weight=0.10,
-         query_traj_mode_cls_loss_weight=0.10, query_traj_teacher_forcing_enabled=True,
-         query_traj_teacher_forcing_gt_ratio=0.0),
+    dict(begin_epoch=1, query_traj_teacher_forcing=True),
+    dict(begin_epoch=9, query_traj_teacher_forcing=False),
 ]
 
 custom_hooks = [

@@ -1,5 +1,9 @@
 # NOTES
 
+## 2026-06-23 KST — QueryDepthHead soft depth CE 검증 메모
+
+- `tools/misc/smoke_past_frame_matching.py` 실행은 현재 shell Python에 `torch`가 없어 `ModuleNotFoundError: No module named 'torch'`로 중단됨. 변경 파일 `py_compile`과 `git diff --check`는 통과.
+
 ## 2026-06-21 KST — Query 이진 분류(bg/fg) 전환 주의사항
 
 - query 분류의 binary/multi-class 전환은 **`use_separate_classes` 하나로** 제어함(`False`=binary, `True`=8-class). 별도 query 전용 flag 없음. 내부적으로 `self.query_binary_cls = not use_separate_classes`.
