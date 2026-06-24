@@ -36,6 +36,46 @@ class EfficientOCFLossMixin:
         straightness_k = endpoint_disp_k / path_length_k.clamp_min(1e-6)
         return mean_speed_k, endpoint_disp_k, path_length_k, straightness_k.clamp(0.0, 1.0)
 
+    def _maybe_apply_query_gmo_soft_gt(self, gt_occ: torch.Tensor) -> torch.Tensor:
+        if (
+            (not bool(getattr(self, "query_gmo_soft_gt_enabled", False)))
+            or (not torch.is_tensor(gt_occ))
+            or gt_occ.dim() < 5
+        ):
+            return gt_occ
+
+        sigma = float(getattr(self, "query_gmo_soft_gt_sigma_vox", 2.5))
+        truncate = float(getattr(self, "query_gmo_soft_gt_truncate_sigma", 3.0))
+        if sigma <= 0.0 or truncate <= 0.0:
+            return gt_occ
+
+        max_radius = max(1, int(round(sigma * truncate)))
+        orig_shape = tuple(gt_occ.shape)
+        spatial = orig_shape[-3:]
+        flat = gt_occ.to(torch.float32).reshape(-1, 1, *spatial)
+        inside = flat > 0.5
+        if not bool(inside.any().item()):
+            return gt_occ
+
+        soft = inside.to(torch.float32)
+        seen = inside
+        frontier = inside
+        for dist in range(1, max_radius + 1):
+            dilated = F.max_pool3d(frontier.to(torch.float32), kernel_size=3, stride=1, padding=1) > 0.0
+            shell = dilated & (~seen)
+            if not bool(shell.any().item()):
+                frontier = dilated
+                seen = seen | dilated
+                continue
+            val = torch.exp(
+                flat.new_tensor(-float(dist * dist) / (2.0 * sigma * sigma))
+            )
+            soft = torch.where(shell, torch.maximum(soft, val), soft)
+            seen = seen | dilated
+            frontier = dilated
+
+        return soft.reshape(orig_shape).to(dtype=gt_occ.dtype)
+
     def _apply_query_turn_family_routing(
         self,
         best_mode_k: torch.Tensor,
@@ -423,6 +463,28 @@ class EfficientOCFLossMixin:
         _add_group("dbg_query_cls_matched", matched_mask_q)
         _add_group("dbg_query_cls_unmatched", unmatched_mask_q)
 
+        # ---- Separation: how well fg_prob splits matched(on-object) from
+        # unmatched(off-object) queries. AUROC + per-iter TPR/FPR are
+        # sample-size-fair (matched~9.5 vs unmatched~190), unlike _max which is
+        # an order statistic inflated by the larger group. Always emitted (zero
+        # fallback) so every DDP rank logs the same keys. Works for binary fg
+        # too: fg_prob_q = max over non-bg classes. ----
+        fm = fg_prob_q[matched_mask_q]
+        fu = fg_prob_q[unmatched_mask_q]
+        out["dbg_query_cls_sep_auroc"] = z + 0.5
+        for _t in (30, 50, 70):
+            out[f"dbg_query_cls_sep_tpr{_t}"] = z
+            out[f"dbg_query_cls_sep_fpr{_t}"] = z
+        if int(fm.numel()) > 0 and int(fu.numel()) > 0:
+            nm = int(fm.numel())
+            # AUROC = P(matched > unmatched) via Mann-Whitney rank sum.
+            ranks = torch.cat([fm, fu]).argsort().argsort().to(torch.float32) + 1.0
+            auroc = (ranks[:nm].sum() - nm * (nm + 1) / 2.0) / float(nm * int(fu.numel()))
+            out["dbg_query_cls_sep_auroc"] = auroc.clamp(0.0, 1.0)
+            for _t in (30, 50, 70):
+                out[f"dbg_query_cls_sep_tpr{_t}"] = (fm >= _t / 100.0).to(torch.float32).mean()
+                out[f"dbg_query_cls_sep_fpr{_t}"] = (fu >= _t / 100.0).to(torch.float32).mean()
+
         nms_mask_q = torch.zeros((Q,), device=query_cls_logits_qc.device, dtype=torch.bool)
         nms_radius = max(0.0, float(nms_radius_m))
         if (
@@ -563,6 +625,11 @@ class EfficientOCFLossMixin:
             "dbg_query_matched_center_abs_y_mean": z,
             "dbg_query_matched_center_abs_z_mean": z,
             "dbg_query_matched_center_l2_max": z,
+            "dbg_query_matched_center_tie_d1_mean": z,
+            "dbg_query_matched_center_tie_margin_mean": z,
+            "dbg_query_matched_center_tie_margin_ratio_mean": z,
+            "dbg_query_matched_center_is_closest_ratio": z,
+            "dbg_query_matched_center_rank_mean": z,
         }
         if not isinstance(inst_match_result, dict):
             return zero_dbg
@@ -621,6 +688,46 @@ class EfficientOCFLossMixin:
         def _masked_mean(x):
             return (x * valid_vals).sum() / valid_cnt
 
+        # ---- Matching tie diagnostic (tests the "근처면 다 비슷" hypothesis):
+        # per valid GT, gap between closest and 2nd-closest query by center xy
+        # dist (avg over valid frames). Small margin => queries geometrically
+        # tied near the GT => matched winner is fragile. matched_rank/is_closest
+        # ask whether matching actually picks the closest query. Zero-fallback
+        # so all DDP ranks log the same keys. ----
+        tie_d1_mean = z
+        tie_margin_mean = z
+        tie_margin_ratio_mean = z
+        matched_is_closest_ratio = z
+        matched_rank_mean = z
+        if Q >= 2 and N >= 1:
+            gc_tn2 = gt_centers_tn3[:t_match].to(
+                device=centers_world_tq3.device, dtype=torch.float32
+            )[..., :2]
+            gv_tn = gt_valid_tn[:t_match].to(
+                device=centers_world_tq3.device, dtype=torch.float32
+            )
+            pc_tq2 = centers_world_tq3[:t_match, :, :2].to(torch.float32)
+            d_tqn = torch.cdist(pc_tq2, gc_tn2)
+            w_t1n = gv_tn[:, None, :]
+            dist_qn = (d_tqn * w_t1n).sum(dim=0) / w_t1n.sum(dim=0).clamp_min(1.0)
+            gt_ok_n = gv_tn.sum(dim=0) > 0.0
+            if bool(gt_ok_n.any().item()):
+                top = torch.topk(dist_qn, k=min(2, int(Q)), dim=0, largest=False).values
+                d1_n = top[0]
+                d2_n = top[1] if int(top.shape[0]) >= 2 else top[0]
+                d1_sel = d1_n[gt_ok_n]
+                margin_sel = (d2_n - d1_n)[gt_ok_n]
+                tie_d1_mean = d1_sel.mean()
+                tie_margin_mean = margin_sel.mean()
+                tie_margin_ratio_mean = (margin_sel / d1_sel.clamp_min(1e-3)).mean()
+                md_k = dist_qn[mq, mi]
+                closer_k = (dist_qn[:, mi] < md_k[None, :]).to(torch.float32).sum(dim=0)
+                rank_k = closer_k + 1.0
+                pair_ok = gt_ok_n[mi]
+                if bool(pair_ok.any().item()):
+                    matched_rank_mean = rank_k[pair_ok].mean()
+                    matched_is_closest_ratio = (rank_k[pair_ok] <= 1.0).to(torch.float32).mean()
+
         return {
             "dbg_query_matched_center_pair_count": matched_pair_count,
             "dbg_query_matched_center_valid_frame_count": valid_vals.sum(),
@@ -631,7 +738,94 @@ class EfficientOCFLossMixin:
             "dbg_query_matched_center_abs_y_mean": _masked_mean(abs_diff_tk3[..., 1]),
             "dbg_query_matched_center_abs_z_mean": _masked_mean(abs_diff_tk3[..., 2]),
             "dbg_query_matched_center_l2_max": l2_tk[valid_tk].max() if bool(valid_tk.any().item()) else z,
+            "dbg_query_matched_center_tie_d1_mean": tie_d1_mean,
+            "dbg_query_matched_center_tie_margin_mean": tie_margin_mean,
+            "dbg_query_matched_center_tie_margin_ratio_mean": tie_margin_ratio_mean,
+            "dbg_query_matched_center_is_closest_ratio": matched_is_closest_ratio,
+            "dbg_query_matched_center_rank_mean": matched_rank_mean,
         }
+
+    def _compute_query_recruit_center_loss(
+        self,
+        centers_world_tq3: torch.Tensor,
+        inst_match_result: dict = None,
+        loss_weight: float = 0.0,
+    ):
+        if (not torch.is_tensor(centers_world_tq3)) or centers_world_tq3.dim() != 3:
+            return None
+        z = centers_world_tq3.sum() * 0.0
+        out = {
+            "loss_query_recruit": z,
+            "dbg_query_recruit_count": z,
+            "dbg_query_recruit_l1_mean": z,
+        }
+        if float(loss_weight) <= 0.0 or not isinstance(inst_match_result, dict):
+            return out
+
+        recruit_query_idx = inst_match_result.get("recruit_query_idx", None)
+        recruit_inst_idx = inst_match_result.get("recruit_inst_idx", None)
+        frame_indices = inst_match_result.get("recruit_frame_indices", None)
+        gt_centers_tn3 = inst_match_result.get("gt_centers_tn3", None)
+        gt_valid_tn = inst_match_result.get("gt_valid_tn", None)
+        if (
+            (not torch.is_tensor(recruit_query_idx))
+            or (not torch.is_tensor(recruit_inst_idx))
+            or recruit_query_idx.numel() <= 0
+            or recruit_query_idx.numel() != recruit_inst_idx.numel()
+            or (not torch.is_tensor(gt_centers_tn3))
+            or (not torch.is_tensor(gt_valid_tn))
+            or gt_centers_tn3.dim() != 3
+            or gt_valid_tn.dim() != 2
+        ):
+            return out
+
+        t_match = min(
+            int(centers_world_tq3.shape[0]),
+            int(gt_centers_tn3.shape[0]),
+            int(gt_valid_tn.shape[0]),
+        )
+        if t_match <= 0:
+            return out
+        if torch.is_tensor(frame_indices) and frame_indices.numel() > 0:
+            frame_indices = frame_indices.to(device=centers_world_tq3.device, dtype=torch.long)
+            frame_indices = frame_indices[(frame_indices >= 0) & (frame_indices < t_match)]
+        else:
+            frame_indices = torch.arange(t_match, device=centers_world_tq3.device)
+        if frame_indices.numel() <= 0:
+            return out
+
+        recruit_query_idx = recruit_query_idx.to(
+            device=centers_world_tq3.device,
+            dtype=torch.long,
+        )
+        recruit_inst_idx = recruit_inst_idx.to(
+            device=centers_world_tq3.device,
+            dtype=torch.long,
+        )
+        pred_tk3 = centers_world_tq3.index_select(0, frame_indices).index_select(
+            1,
+            recruit_query_idx,
+        ).to(torch.float32)
+        gt_tk3 = gt_centers_tn3.to(
+            device=centers_world_tq3.device,
+            dtype=torch.float32,
+        ).index_select(0, frame_indices).index_select(1, recruit_inst_idx)
+        valid_tk = gt_valid_tn.to(
+            device=centers_world_tq3.device,
+            dtype=torch.bool,
+        ).index_select(0, frame_indices).index_select(1, recruit_inst_idx)
+        finite_tk = torch.isfinite(pred_tk3).all(dim=-1) & torch.isfinite(gt_tk3).all(dim=-1)
+        valid_tk = valid_tk & finite_tk
+        if not bool(valid_tk.any().item()):
+            return out
+
+        valid_f_tk = valid_tk.to(torch.float32)
+        l1_tk = torch.abs(pred_tk3 - gt_tk3).sum(dim=-1)
+        l1_mean = (l1_tk * valid_f_tk).sum() / valid_f_tk.sum().clamp_min(1.0)
+        out["loss_query_recruit"] = l1_mean * float(loss_weight)
+        out["dbg_query_recruit_count"] = z + float(recruit_query_idx.numel())
+        out["dbg_query_recruit_l1_mean"] = l1_mean.detach()
+        return out
 
     def _compute_query_trajectory_loss_from_match(
         self,
@@ -2195,6 +2389,7 @@ class EfficientOCFLossMixin:
         gt_k_t1zyx = (gt_occ_txyz[:t_count] == int(inst_id)).permute(0, 3, 2, 1).unsqueeze(1).to(torch.float32)
         if tuple(gt_k_t1zyx.shape[-3:]) != tuple(pred_k_t1zyx.shape[-3:]):
             gt_k_t1zyx = F.adaptive_max_pool3d(gt_k_t1zyx, output_size=pred_k_t1zyx.shape[-3:])
+        gt_k_t1zyx = self._maybe_apply_query_gmo_soft_gt(gt_k_t1zyx)
         return pred_k_t1zyx, gt_k_t1zyx, valid_frame_t
 
     def _prepare_grouped_matched_pair_lowres_occ(
@@ -2296,6 +2491,7 @@ class EfficientOCFLossMixin:
         if len(gt_chunks) != int((K + gt_chunk_size - 1) // gt_chunk_size):
             return None, None, None
         gt_tk1zyx = torch.cat(gt_chunks, dim=1) if len(gt_chunks) > 1 else gt_chunks[0]
+        gt_tk1zyx = self._maybe_apply_query_gmo_soft_gt(gt_tk1zyx)
         return pred_tk1zyx, gt_tk1zyx, valid_tk
 
     def _compute_matched_query_sequence_iou_scores(
@@ -2978,6 +3174,20 @@ class EfficientOCFLossMixin:
         if isinstance(center_match_dbg, dict):
             losses.update(center_match_dbg)
 
+        recruit_loss = self._compute_query_recruit_center_loss(
+            centers_world_tq3=centers_world_match_tq3,
+            inst_match_result=inst_match_result,
+            loss_weight=float(getattr(self, "query_recruit_loss_weight", 0.0)),
+        )
+        if isinstance(recruit_loss, dict):
+            losses.update(recruit_loss)
+        else:
+            losses.update({
+                "loss_query_recruit": z,
+                "dbg_query_recruit_count": z,
+                "dbg_query_recruit_l1_mean": z,
+            })
+
         # ---- Trajectory loss ----
         losses["loss_query_traj_static"] = z
         losses["loss_query_traj_moving_cls"] = z
@@ -3128,6 +3338,21 @@ class EfficientOCFLossMixin:
             losses[f"dbg_query_match_cost_{name}_matched_mean"] = z
             losses[f"dbg_query_match_cost_{name}_ratio_total"] = z
             losses[f"dbg_query_match_cost_{name}_ratio_matched"] = z
+            # discrimination diagnostics (prefill kept in sync w/ record points for multi-GPU log_vars)
+            losses[f"dbg_query_match_cost_{name}_colstd_mean"] = z
+            losses[f"dbg_query_match_cost_{name}_margin_mean"] = z
+            losses[f"dbg_query_match_cost_{name}_topk_colstd_mean"] = z
+            losses[f"dbg_query_match_cost_{name}_fliprate"] = z
+            losses[f"dbg_query_match_cost_{name}_decisiveness_rate"] = z
+        # coverage / spatial diagnostics (term-independent) -- prefill for multi-GPU log_vars sync
+        for _bk in ("near", "mid", "far"):
+            losses[f"dbg_query_match_center_err_{_bk}_mean"] = z
+            losses[f"dbg_query_match_center_err_{_bk}_count"] = z
+        losses["dbg_query_match_far_gt_frac"] = z
+        losses["dbg_query_match_spread_q"] = z
+        losses["dbg_query_match_spread_g"] = z
+        losses["dbg_query_match_spread_ratio"] = z
+        losses["dbg_query_match_cost_center_temporal_offset_corr"] = z
 
         if isinstance(inst_match_result, dict):
             cost_qn = inst_match_result.get("cost_qn", None)
@@ -3176,6 +3401,47 @@ class EfficientOCFLossMixin:
                     float(0 if matched_vals is None else int(matched_vals.numel()))
                 )
 
+                # Per matched GT column, find the runner-up query (2nd-lowest TOTAL cost,
+                # excluding the chosen query). Term-independent, so computed once here and
+                # reused for every term's margin = contrib[runner] - contrib[chosen]:
+                #   margin > 0  -> this term made the chosen query cheaper than its closest
+                #                  competitor (this term helped DECIDE the assignment)
+                #   margin ~ 0  -> this term was indifferent at the decision point (e.g. flat cls)
+                #   margin < 0  -> this term preferred the runner-up (other terms won)
+                margin_chosen_row = None
+                margin_runner_row = None
+                margin_col = None
+                if (
+                    torch.is_tensor(matched_query_idx)
+                    and torch.is_tensor(matched_inst_idx)
+                    and int(matched_query_idx.numel()) > 0
+                    and int(matched_query_idx.numel()) == int(matched_inst_idx.numel())
+                ):
+                    mqr = matched_query_idx.to(device=cost_qn_f32.device, dtype=torch.long).reshape(-1)
+                    mir = matched_inst_idx.to(device=cost_qn_f32.device, dtype=torch.long).reshape(-1)
+                    keepr = (
+                        (mqr >= 0)
+                        & (mir >= 0)
+                        & (mqr < int(cost_qn_f32.shape[0]))
+                        & (mir < int(cost_qn_f32.shape[1]))
+                    )
+                    if bool(keepr.any().item()):
+                        mqr = mqr[keepr]
+                        mir = mir[keepr]
+                        sub_total_qm = cost_qn_f32.index_select(1, mir)  # [Q, M]
+                        row_ar = torch.arange(int(cost_qn_f32.shape[0]), device=cost_qn_f32.device)
+                        chosen_mask_qm = row_ar[:, None] == mqr[None, :]
+                        inf_t = cost_qn_f32.new_tensor(float("inf"))
+                        sub_masked_qm = torch.where(
+                            chosen_mask_qm | ~torch.isfinite(sub_total_qm), inf_t, sub_total_qm
+                        )
+                        col_min = sub_masked_qm.min(dim=0)
+                        has_runner = torch.isfinite(col_min.values)
+                        if bool(has_runner.any().item()):
+                            margin_chosen_row = mqr[has_runner]
+                            margin_runner_row = col_min.indices[has_runner]
+                            margin_col = mir[has_runner]
+
                 eps = float(1e-9)
                 total_mean_safe = total_mean.detach().abs().clamp_min(eps) if torch.is_tensor(total_mean) else cost_qn_f32.new_tensor(eps)
                 matched_mean_safe = matched_mean.detach().abs().clamp_min(eps) if torch.is_tensor(matched_mean) else cost_qn_f32.new_tensor(eps)
@@ -3189,6 +3455,19 @@ class EfficientOCFLossMixin:
                     "bev_dice": inst_match_result.get("cost_bev_dice_contrib_qn", None),
                     "attn": inst_match_result.get("cost_attn_iou_contrib_qn", None),
                 }
+
+                # term-independent precompute for fliprate / topk_colstd:
+                #   tot_masked: total cost with invalid pairs -> +inf (so argmin/topk ignore them)
+                #   win_full_n: per-column argmin winner WITH all terms (the actual local winner)
+                #   topk_idx_kn: the K lowest-total-cost contenders per column (decision region)
+                inf_cost = cost_qn_f32.new_tensor(float("inf"))
+                tot_masked_qn = torch.where(finite_mask_qn, cost_qn_f32, inf_cost)
+                flip_cols_ok_n = finite_mask_qn.sum(dim=0) >= 2
+                win_full_n = tot_masked_qn.argmin(dim=0)
+                topk_k_eff = min(5, int(cost_qn_f32.shape[0]))
+                topk_idx_kn = tot_masked_qn.topk(topk_k_eff, dim=0, largest=False).indices
+                margin_vec_by_name = {}
+
                 for name, contrib_qn in contrib_map.items():
                     if torch.is_tensor(contrib_qn) and tuple(contrib_qn.shape) == tuple(cost_qn_f32.shape):
                         contrib_f32 = contrib_qn.to(torch.float32)
@@ -3216,10 +3495,157 @@ class EfficientOCFLossMixin:
                                 if int(comp_matched.numel()) > 0:
                                     comp_matched_mean = comp_matched.mean()
 
+                        # colstd: per GT column, std of this term's contrib ACROSS the
+                        # candidate queries (over finite pairs), averaged over columns with
+                        # >=2 candidates. This is the discrimination power -- a term large in
+                        # mean but flat across queries (small colstd) does NOT drive matching.
+                        comp_colstd_mean = z
+                        valid_qn = finite_mask_qn & torch.isfinite(contrib_f32)
+                        col_cnt_n = valid_qn.sum(dim=0).to(torch.float32)
+                        contrib_masked_qn = torch.where(
+                            valid_qn, contrib_f32, torch.zeros_like(contrib_f32)
+                        )
+                        col_mean_n = contrib_masked_qn.sum(dim=0) / col_cnt_n.clamp_min(1.0)
+                        col_sq_qn = torch.where(
+                            valid_qn,
+                            (contrib_f32 - col_mean_n[None, :]) ** 2,
+                            torch.zeros_like(contrib_f32),
+                        )
+                        col_std_n = (col_sq_qn.sum(dim=0) / col_cnt_n.clamp_min(1.0)).clamp_min(0.0).sqrt()
+                        cols_ok_n = col_cnt_n >= 2.0
+                        if bool(cols_ok_n.any().item()):
+                            comp_colstd_mean = col_std_n[cols_ok_n].mean()
+
+                        # margin: at each matched column, this term's value at the runner-up
+                        # minus at the chosen query (see runner-up block above).
+                        comp_margin_mean = z
+                        if margin_col is not None:
+                            chosen_c = contrib_f32[margin_chosen_row, margin_col]
+                            runner_c = contrib_f32[margin_runner_row, margin_col]
+                            mg_vec = runner_c - chosen_c  # length C (= #matched cols w/ runner), finite
+                            margin_vec_by_name[name] = mg_vec  # stashed for cross-term decisiveness
+                            mg = mg_vec[torch.isfinite(mg_vec)]
+                            if int(mg.numel()) > 0:
+                                comp_margin_mean = mg.mean()
+
+                        # fliprate: counterfactual real influence -- does the per-column argmin
+                        # winner CHANGE when this term is removed from the total cost?
+                        # (a large-mean but flat term => fliprate ~ 0). cost_qn = sum of contribs,
+                        # so cost - contrib is the exact leave-one-out total.
+                        comp_fliprate = z
+                        alt_masked_qn = torch.where(finite_mask_qn, cost_qn_f32 - contrib_f32, inf_cost)
+                        win_alt_n = alt_masked_qn.argmin(dim=0)
+                        if bool(flip_cols_ok_n.any().item()):
+                            comp_fliprate = (
+                                win_full_n[flip_cols_ok_n] != win_alt_n[flip_cols_ok_n]
+                            ).to(torch.float32).mean()
+
+                        # topk_colstd: discrimination among only the top-K lowest-total-cost
+                        # contenders per column (the decision region), not diluted by far queries.
+                        comp_topk_colstd = z
+                        c_kn = contrib_f32.gather(0, topk_idx_kn)
+                        m_kn = valid_qn.gather(0, topk_idx_kn)
+                        tk_cnt_n = m_kn.sum(dim=0).to(torch.float32)
+                        tk_mean_n = torch.where(m_kn, c_kn, torch.zeros_like(c_kn)).sum(dim=0) / tk_cnt_n.clamp_min(1.0)
+                        tk_sq_kn = torch.where(m_kn, (c_kn - tk_mean_n[None, :]) ** 2, torch.zeros_like(c_kn))
+                        tk_std_n = (tk_sq_kn.sum(dim=0) / tk_cnt_n.clamp_min(1.0)).clamp_min(0.0).sqrt()
+                        tk_ok_n = tk_cnt_n >= 2.0
+                        if bool(tk_ok_n.any().item()):
+                            comp_topk_colstd = tk_std_n[tk_ok_n].mean()
+
                         losses[f"dbg_query_match_cost_{name}_total_mean"] = comp_total_mean
                         losses[f"dbg_query_match_cost_{name}_matched_mean"] = comp_matched_mean
                         losses[f"dbg_query_match_cost_{name}_ratio_total"] = comp_total_mean / total_mean_safe
                         losses[f"dbg_query_match_cost_{name}_ratio_matched"] = comp_matched_mean / matched_mean_safe
+                        losses[f"dbg_query_match_cost_{name}_colstd_mean"] = comp_colstd_mean
+                        losses[f"dbg_query_match_cost_{name}_margin_mean"] = comp_margin_mean
+                        losses[f"dbg_query_match_cost_{name}_topk_colstd_mean"] = comp_topk_colstd
+                        losses[f"dbg_query_match_cost_{name}_fliprate"] = comp_fliprate
+
+                # decisiveness_rate: across the matched columns, which term most often had the
+                # largest chosen-vs-runner-up margin (= dominant tie-breaker). Per-term win-share.
+                if len(margin_vec_by_name) > 0:
+                    names_d = list(margin_vec_by_name.keys())
+                    mg_stack = torch.stack([margin_vec_by_name[n] for n in names_d], dim=0)  # [Tn, C]
+                    if int(mg_stack.shape[1]) > 0:
+                        winner_c = mg_stack.argmax(dim=0)  # [C]
+                        for di, dn in enumerate(names_d):
+                            losses[f"dbg_query_match_cost_{dn}_decisiveness_rate"] = (
+                                (winner_c == di).to(torch.float32).mean()
+                            )
+
+                # coverage: matched query->GT center error stratified by ego-range (periphery).
+                # Present-frame (idx 0) lidar coords, ego origin = (0,0). Answers "does matching
+                # accuracy degrade toward the outskirts?" + a central-collapse spread ratio.
+                gt_centers_tn3 = inst_match_result.get("gt_centers_tn3", None)
+                gt_valid_tn = inst_match_result.get("gt_valid_tn", None)
+                if (
+                    torch.is_tensor(gt_centers_tn3) and gt_centers_tn3.dim() == 3 and int(gt_centers_tn3.shape[0]) >= 1
+                    and torch.is_tensor(centers_world_match_tq3) and centers_world_match_tq3.dim() == 3
+                    and int(centers_world_match_tq3.shape[0]) >= 1
+                    and torch.is_tensor(matched_query_idx) and torch.is_tensor(matched_inst_idx)
+                    and int(matched_query_idx.numel()) > 0
+                    and int(matched_query_idx.numel()) == int(matched_inst_idx.numel())
+                ):
+                    devc = centers_world_match_tq3.device
+                    q_xy0 = centers_world_match_tq3[0, :, :2].to(torch.float32)
+                    g_xy0 = gt_centers_tn3[0, :, :2].to(device=devc, dtype=torch.float32)
+                    mqc = matched_query_idx.to(device=devc, dtype=torch.long).reshape(-1)
+                    mic = matched_inst_idx.to(device=devc, dtype=torch.long).reshape(-1)
+                    keepc = (mqc >= 0) & (mic >= 0) & (mqc < int(q_xy0.shape[0])) & (mic < int(g_xy0.shape[0]))
+                    if bool(keepc.any().item()):
+                        mqc = mqc[keepc]
+                        mic = mic[keepc]
+                        if torch.is_tensor(gt_valid_tn) and gt_valid_tn.dim() == 2 and int(gt_valid_tn.shape[0]) >= 1:
+                            gv0 = gt_valid_tn[0].to(device=devc, dtype=torch.bool).index_select(0, mic)
+                            mqc = mqc[gv0]
+                            mic = mic[gv0]
+                        if int(mqc.numel()) > 0:
+                            qsel = q_xy0.index_select(0, mqc)
+                            gsel = g_xy0.index_select(0, mic)
+                            err_m = ((qsel - gsel) ** 2).sum(dim=-1).clamp_min(0.0).sqrt()
+                            r_gt = (gsel ** 2).sum(dim=-1).clamp_min(0.0).sqrt()
+                            pc = self.point_cloud_range
+                            r_max = (max(abs(float(pc[0])), abs(float(pc[3]))) ** 2
+                                     + max(abs(float(pc[1])), abs(float(pc[4]))) ** 2) ** 0.5
+                            r_max = max(r_max, 1e-6)
+                            near_m = r_gt < (r_max / 3.0)
+                            far_m = r_gt >= (2.0 * r_max / 3.0)
+                            mid_m = (~near_m) & (~far_m)
+                            for bname, bmask in (("near", near_m), ("mid", mid_m), ("far", far_m)):
+                                bcnt = bmask.sum()
+                                losses[f"dbg_query_match_center_err_{bname}_count"] = bcnt.to(torch.float32)
+                                if bool((bcnt > 0).item()):
+                                    losses[f"dbg_query_match_center_err_{bname}_mean"] = err_m[bmask].mean()
+                            losses["dbg_query_match_far_gt_frac"] = far_m.to(torch.float32).mean()
+                            if int(mqc.numel()) >= 2:
+                                qc = qsel - qsel.mean(dim=0, keepdim=True)
+                                gc = gsel - gsel.mean(dim=0, keepdim=True)
+                                spread_q = qc.pow(2).mean(dim=0).sum().clamp_min(0.0).sqrt()
+                                spread_g = gc.pow(2).mean(dim=0).sum().clamp_min(0.0).sqrt()
+                                losses["dbg_query_match_spread_q"] = spread_q
+                                losses["dbg_query_match_spread_g"] = spread_g
+                                losses["dbg_query_match_spread_ratio"] = spread_q / spread_g.clamp_min(eps)
+
+                # corr: redundancy between the two distance-like terms (center vs temporal_offset).
+                # high |corr| => they carry overlapping geometric info (one could be down-weighted).
+                c_cen = contrib_map.get("center", None)
+                c_tmp = contrib_map.get("temporal_offset", None)
+                if (
+                    torch.is_tensor(c_cen) and torch.is_tensor(c_tmp)
+                    and tuple(c_cen.shape) == tuple(cost_qn_f32.shape)
+                    and tuple(c_tmp.shape) == tuple(cost_qn_f32.shape)
+                ):
+                    a_c = c_cen.to(torch.float32)
+                    b_c = c_tmp.to(torch.float32)
+                    m_corr = finite_mask_qn & torch.isfinite(a_c) & torch.isfinite(b_c)
+                    if int(m_corr.sum().item()) >= 2:
+                        av = a_c[m_corr]
+                        bv = b_c[m_corr]
+                        ac = av - av.mean()
+                        bc = bv - bv.mean()
+                        denom = (ac.pow(2).sum().clamp_min(0.0).sqrt() * bc.pow(2).sum().clamp_min(0.0).sqrt()).clamp_min(eps)
+                        losses["dbg_query_match_cost_center_temporal_offset_corr"] = (ac * bc).sum() / denom
 
         if isinstance(query_attn_cam_score_pack, dict):
             losses.update(
@@ -3293,8 +3719,9 @@ class EfficientOCFLossMixin:
             and (k not in _keep_dbg)
             and (not k.startswith("dbg_query_cls_"))
             and (not k.startswith("dbg_query_traj_"))
-            and (not k.startswith("dbg_query_match_cost_"))
+            and (not k.startswith("dbg_query_match_"))  # match_cost_* + coverage (center_err/far_gt/spread)
             and (not k.startswith("dbg_query_matched_center_"))
+            and (not k.startswith("dbg_query_depth_"))  # depth-head perf (acc/err/entropy)
         ]:
             del losses[k]
         self._namespace_dbg_logs(losses)

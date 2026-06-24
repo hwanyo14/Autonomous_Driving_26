@@ -118,17 +118,19 @@ class ClassificationHead(nn.Module):
 
 
 class QueryDepthHead(nn.Module):
-    def __init__(self, embed_dim=128, out_dim=64):
+    def __init__(self, embed_dim=128, out_dim=64, num_layers=2, hidden_mult=1):
         super(QueryDepthHead, self).__init__()
         self.embed_dim = embed_dim
         self.out_dim = int(out_dim)
         if self.out_dim <= 0:
             raise ValueError(f"out_dim must be positive, got {self.out_dim}")
+        self.num_layers = max(1, int(num_layers))
+        self.hidden_dim = max(1, int(hidden_mult)) * int(self.embed_dim)
         self.mlp = MLP(
             in_dim=self.embed_dim,
-            hidden_dim=self.embed_dim,
+            hidden_dim=self.hidden_dim,
             out_dim=self.out_dim,
-            num_layers=2,
+            num_layers=self.num_layers,
             dropout=0.0,
             use_ln=True,
         )
@@ -399,6 +401,8 @@ class QueryHead(nn.Module):
                  point_cloud_range=None,
                  spatial_extent3d=None,
                  query_depth_num_bins=64,
+                 query_depth_head_num_layers=2,
+                 query_depth_head_hidden_mult=1,
                  query_feat_cosine_threshold=0.30,
                  query_center_distance_threshold_m=1.50,
                  detach_query_for_center_default=False,
@@ -406,8 +410,6 @@ class QueryHead(nn.Module):
                  debug_vis_dir="./work_dirs/query_debug_vis",
                  center_only_mode=False,
                  debug_query_center_marker_radius=3,
-                 debug_query_confidence_vis_threshold=0.5,
-                 debug_query_objectness_vis_threshold=None,
                  debug_query_gaussian_vis_mode="ellipse",
                  debug_query_gaussian_prob_threshold=0.5,
                  debug_query_gaussian_prob_alpha_scale=4.0):
@@ -566,6 +568,8 @@ class QueryHead(nn.Module):
         self.point_cloud_range = point_cloud_range
         self.spatial_extent3d = spatial_extent3d
         self.query_depth_num_bins = int(query_depth_num_bins)
+        self.query_depth_head_num_layers = int(query_depth_head_num_layers)
+        self.query_depth_head_hidden_mult = int(query_depth_head_hidden_mult)
         if self.query_depth_num_bins <= 0:
             raise ValueError(
                 f"query_depth_num_bins must be positive, got {self.query_depth_num_bins}"
@@ -602,9 +606,9 @@ class QueryHead(nn.Module):
                 f"got {self.query_multi_gaussian_sigma_reg_log_eps}"
             )
         self.query_multi_gaussian_weight_mode = str(query_multi_gaussian_weight_mode).lower()
-        if self.query_multi_gaussian_weight_mode not in ("softmax", "softplus"):
+        if self.query_multi_gaussian_weight_mode not in ("softmax", "softplus", "sigmoid", "ones"):
             raise ValueError(
-                "query_multi_gaussian_weight_mode must be one of {'softmax','softplus'}, "
+                "query_multi_gaussian_weight_mode must be one of {'softmax','softplus','sigmoid','ones'}, "
                 f"got {self.query_multi_gaussian_weight_mode!r}"
             )
         self.query_multi_gaussian_softplus_bias_init = float(query_multi_gaussian_softplus_bias_init)
@@ -631,14 +635,6 @@ class QueryHead(nn.Module):
         self.debug_vis_dir = str(debug_vis_dir)
         self.center_only_mode = bool(center_only_mode)
         self.debug_query_center_marker_radius = max(0, int(debug_query_center_marker_radius))
-        if debug_query_objectness_vis_threshold is not None:
-            debug_query_confidence_vis_threshold = debug_query_objectness_vis_threshold
-        self.debug_query_confidence_vis_threshold = float(debug_query_confidence_vis_threshold)
-        if not (0.0 <= self.debug_query_confidence_vis_threshold <= 1.0):
-            raise ValueError(
-                "debug_query_confidence_vis_threshold must be in [0,1], "
-                f"got {self.debug_query_confidence_vis_threshold}"
-            )
         self.debug_query_gaussian_vis_mode = str(debug_query_gaussian_vis_mode).lower()
         if self.debug_query_gaussian_vis_mode not in ("ellipse", "prob", "threshold"):
             raise ValueError(
@@ -687,7 +683,7 @@ class QueryHead(nn.Module):
             self.gaussian_sigma_head = GaussianHead(embed_dim=self.embed_dim, out_dim=g * 3)
             self.gaussian_yaw_head = GaussianHead(embed_dim=self.embed_dim, out_dim=g * 2)
             self.gaussian_weight_head = GaussianHead(embed_dim=self.embed_dim, out_dim=g)
-            if self.query_multi_gaussian_weight_mode == "softplus":
+            if self.query_multi_gaussian_weight_mode in ("softplus", "sigmoid"):
                 last_layer = self.gaussian_weight_head.mlp.net[-1]
                 if isinstance(last_layer, nn.Linear) and last_layer.bias is not None:
                     nn.init.constant_(last_layer.bias, self.query_multi_gaussian_softplus_bias_init)
@@ -697,6 +693,8 @@ class QueryHead(nn.Module):
         self.query_depth_head = QueryDepthHead(
             embed_dim=self.embed_dim,
             out_dim=self.query_depth_num_bins,
+            num_layers=self.query_depth_head_num_layers,
+            hidden_mult=self.query_depth_head_hidden_mult,
         )
         self.query_traj_head = None
         self.query_traj_endpoint_head = None
@@ -1801,6 +1799,22 @@ class QueryHead(nn.Module):
             weights_surrogate_qg = weights_qg / weights_qg.sum(
                 dim=-1, keepdim=True
             ).clamp_min(1e-6)
+        elif self.query_multi_gaussian_weight_mode == "sigmoid":
+            # GUIDE-style opacity: per-gaussian alpha in [0,1], no sum-to-1 mixture coupling.
+            # Pairs with voxelizer combine_mode='union' (p = 1 - prod(1 - alpha*G)).
+            # Surrogate is L1-normalized only for the 2nd-moment sigma aggregation below.
+            weights_qg = torch.sigmoid(weight_logits_qg)
+            weights_surrogate_qg = weights_qg / weights_qg.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-6)
+        elif self.query_multi_gaussian_weight_mode == "ones":
+            # GUIDE-faithful: no learnable opacity. Each gaussian fully occupies its core
+            # (union p = 1 - prod(1 - G), peak=1). The weight head output is ignored.
+            # Removes the (sigma <-> weight) degeneracy, so sigma_reg becomes unnecessary.
+            weights_qg = torch.ones_like(weight_logits_qg)
+            weights_surrogate_qg = weights_qg / weights_qg.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-6)
         else:
             raise RuntimeError(
                 f"Unsupported query_multi_gaussian_weight_mode={self.query_multi_gaussian_weight_mode!r}"
@@ -2898,6 +2912,11 @@ class QueryHead(nn.Module):
         return cls_t, inst_t
 
     @torch.no_grad()
+    def _eval_vis_enabled_this_rank(self) -> bool:
+        # Training saves vis only from rank0; eval may opt into all-rank saving
+        # (so the whole sharded dataset is covered) via self._eval_vis_all_ranks.
+        return self._is_main_process() or bool(getattr(self, "_eval_vis_all_ranks", False))
+
     def _maybe_save_prob_grid_vis(
         self,
         pred_occ_prob: torch.Tensor,
@@ -2931,7 +2950,7 @@ class QueryHead(nn.Module):
             return
         if (step % vis_every) != 0:
             return
-        if not self._is_main_process():
+        if not self._eval_vis_enabled_this_rank():
             return
         if pred_occ_prob is None or points_world is None:
             return
@@ -3120,8 +3139,9 @@ class QueryHead(nn.Module):
             return ix_i, iy_i, sx_np, sy_np, yaw_np, weight_np, valid_np
 
         use_score_bundle = isinstance(query_vis_bundle, dict)
+        skip_traj_rows = bool(query_vis_bundle.get("_skip_traj_rows", False)) if use_score_bundle else False
         bundle_top_k = 0
-        bundle_score_thr = float(getattr(self, "debug_query_confidence_vis_threshold", 0.5))
+        bundle_score_thr = float(getattr(self, "debug_query_score_threshold", 0.5))
         bundle_w_iou = 0.5
         bundle_w_cls = 0.5
         bundle_w_cam = 0.0
@@ -3217,6 +3237,37 @@ class QueryHead(nn.Module):
         )
 
         gt_np = gt.cpu().numpy()
+        # [예측 오버레이] gaussian footprint가 미래 프레임에선 잘 안 보여, 예측 occ(dense)를 행에
+        # 직접 그린다. EOCF_VIS_PRED_STYLE 설정 시에만 동작(미설정 시 기존과 동일).
+        #   fill/overlap: pred-only=색, GT와 겹침=흰색(둘 다 보임) / outline: 경계만 / blend: 반투명
+        import os as _os
+        _pred_style = _os.environ.get("EOCF_VIS_PRED_STYLE", "").lower()
+        pred_occ_np = None
+        if _pred_style:
+            _pxy = pred[:T]
+            if layout == "zyx":
+                _pxy = _pxy.permute(0, 1, 3, 2).contiguous()      # [T,Z,Y,X]->[T,Z,X,Y]
+            pred_occ_np = (_pxy >= float(prob_threshold)).to(torch.bool).cpu().numpy()  # [T,Z,X,Y]
+        # 기본(blend): 각 행의 원래 예측색(all=lo_color, hi=hi_color)으로 반투명 → 기존 footprint와
+        # 같은 색·느낌. EOCF_VIS_PRED_COLOR 지정 시 그 색으로 override(변형 비교용).
+        _PCMAP = {"red": (255, 40, 40), "magenta": (255, 0, 255), "yellow": (255, 235, 0),
+                  "cyan": (0, 255, 255), "orange": (255, 140, 0)}
+        _env_col = _os.environ.get("EOCF_VIS_PRED_COLOR", "")
+        _pred_col_override = (np.array(_PCMAP.get(_env_col, (255, 40, 40)), dtype=np.uint8)
+                              if _env_col else None)
+
+        def _overlay_pred_bev(canvas, pred_bev, gt_bev_mask, base_color):
+            col = _pred_col_override if _pred_col_override is not None else np.asarray(base_color, dtype=np.uint8)
+            if _pred_style == "outline":
+                inner = (pred_bev & np.roll(pred_bev, 1, 0) & np.roll(pred_bev, -1, 0)
+                         & np.roll(pred_bev, 1, 1) & np.roll(pred_bev, -1, 1))
+                canvas[pred_bev & (~inner)] = col
+            elif _pred_style == "fill":   # pred-only=색, GT 겹침=흰색(둘 다 표시)
+                canvas[pred_bev & (~gt_bev_mask)] = col
+                canvas[pred_bev & gt_bev_mask] = np.array([255, 255, 255], dtype=np.uint8)
+            else:                          # blend(기본): 해당 행 색으로 반투명 덧칠
+                m = pred_bev
+                canvas[m] = (0.4 * canvas[m] + 0.6 * col).astype(np.uint8)
         gt_sem_np = None
         if torch.is_tensor(gt_occ_semantic):
             gt_sem = gt_occ_semantic
@@ -3247,7 +3298,9 @@ class QueryHead(nn.Module):
         stats_lo = []
         stats_matched = []
 
-        conf_thr = float(getattr(self, "debug_query_confidence_vis_threshold", 0.5))
+        # 센터 점 마커 색칠도 단일 score 임계값으로 통일 (config debug_query_score_threshold + EOCF_EVAL_FG_THR).
+        import os as _os
+        conf_thr = float(_os.environ.get("EOCF_EVAL_FG_THR", getattr(self, "debug_query_score_threshold", 0.5)))
         marker_radius = int(getattr(self, "debug_query_center_marker_radius", 3))
         gt_color = np.array([40, 180, 40], dtype=np.uint8)
         hi_color = np.array([30, 255, 255], dtype=np.uint8)
@@ -3626,6 +3679,14 @@ class QueryHead(nn.Module):
                         )
                 matched_count = 0
 
+            # 예측 occ 오버레이 (footprint 위에 그려 미래 프레임에서도 확실히 보이게).
+            # 행별 원래 색: all=lo_color, hi=hi_color (기존 footprint와 동일 색감).
+            if pred_occ_np is not None:
+                pred_bev = pred_occ_np[t].any(axis=0).T.astype(np.bool_)  # [Y,X]
+                _overlay_pred_bev(all_ov, pred_bev, gt_bev, lo_color)
+                _overlay_pred_bev(hi_ov, pred_bev, gt_bev, hi_color)
+                _overlay_pred_bev(hi_cls_ov, pred_bev, gt_bev, hi_color)
+
             if ego_visible:
                 for row_canvas in (gt_rgb, gt_cls_rgb, all_ov, hi_ov, hi_cls_ov, matched_ov, traj_ov):
                     self._draw_cross_marker(
@@ -3657,11 +3718,12 @@ class QueryHead(nn.Module):
         row_h = Y
         canvas_w = T * X + (T - 1) * gap
         has_base_traj_row = (
+            (not skip_traj_rows) and
             base_traj_x_i is not None
             and base_traj_y_i is not None
             and base_traj_valid_np is not None
         )
-        num_rows = 6 if has_base_traj_row else 5
+        num_rows = 4 if skip_traj_rows else (6 if has_base_traj_row else 5)
         legend_h = 120
         canvas_h = text_h + num_rows * row_h + (num_rows - 1) * gap + legend_h
         canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
@@ -3678,8 +3740,9 @@ class QueryHead(nn.Module):
             canvas[y1:y1 + row_h, x0:x0 + X] = row_all[t]
             canvas[y2:y2 + row_h, x0:x0 + X] = row_hi_cls[t]
             canvas[y3:y3 + row_h, x0:x0 + X] = row_matched[t]
-            canvas[y4:y4 + row_h, x0:x0 + X] = row_traj[t]
-            if has_base_traj_row:
+            if not skip_traj_rows:
+                canvas[y4:y4 + row_h, x0:x0 + X] = row_traj[t]
+            if (not skip_traj_rows) and has_base_traj_row:
                 canvas[y5:y5 + row_h, x0:x0 + X] = row_base_traj[t]
 
         img = Image.fromarray(canvas, mode="RGB")
@@ -3724,8 +3787,8 @@ class QueryHead(nn.Module):
                 f"row2: candidates(all queries, bg+fg)  "
                 f"row3: selected(class-colored)  "
                 f"row4: Hungarian-matched query centers only  "
-                f"row5: refined traj(prev->cur; pred=red, all GT=cyan)  "
-                f"{'row6: base traj(prev->cur; pred=red, all GT=cyan)  ' if has_base_traj_row else ''}"
+                f"{'row5: refined traj(prev->cur; pred=red, all GT=cyan)  ' if not skip_traj_rows else ''}"
+                f"{'row6: base traj(prev->cur; pred=red, all GT=cyan)  ' if (not skip_traj_rows) and has_base_traj_row else ''}"
                 f"| topk={bundle_top_k} thr={bundle_score_thr:.2f} "
                 f"w_iou={bundle_w_iou:.2f} w_cls={bundle_w_cls:.2f} w_cam={bundle_w_cam:.2f} "
                 f"mean(iou/cls/cam/score)=({iou_mean:.3f}/{cls_mean:.3f}/{cam_mean:.3f}/{score_mean:.3f})"
@@ -3738,8 +3801,8 @@ class QueryHead(nn.Module):
                 f"row2: all query centers (green=gt, cyan=conf>={conf_thr:.2f}, red=conf<{conf_thr:.2f})  "
                 f"row3: query centers with conf>={conf_thr:.2f} only, class-colored  "
                 f"row4: Hungarian-matched query centers only  "
-                f"row5: refined traj(prev->cur; pred=red, all GT=cyan)  "
-                f"{'row6: base traj(prev->cur; pred=red, all GT=cyan)' if has_base_traj_row else ''}"
+                f"{'row5: refined traj(prev->cur; pred=red, all GT=cyan)  ' if not skip_traj_rows else ''}"
+                f"{'row6: base traj(prev->cur; pred=red, all GT=cyan)' if (not skip_traj_rows) and has_base_traj_row else ''}"
             )
         if ego_visible:
             header += f" | ego(+)=xy(0,0)->pix({ego_ix},{ego_iy})"
@@ -3762,12 +3825,16 @@ class QueryHead(nn.Module):
                 draw.text((x0 + 2, y1 + 2), f"t={t} all={stats_valid[t]} hi={stats_hi[t]} lo={stats_lo[t]}", fill=(255, 255, 255))
             draw.text((x0 + 2, y2 + 2), f"hi(class)={stats_hi[t]}", fill=(255, 255, 255))
             draw.text((x0 + 2, y3 + 2), f"matched={stats_matched[t]}", fill=(255, 255, 255))
-            draw.text((x0 + 2, y4 + 2), "refined traj", fill=(255, 255, 255))
-            if has_base_traj_row:
+            if not skip_traj_rows:
+                draw.text((x0 + 2, y4 + 2), "refined traj", fill=(255, 255, 255))
+            if (not skip_traj_rows) and has_base_traj_row:
                 draw.text((x0 + 2, y5 + 2), "base traj", fill=(255, 255, 255))
 
             # Thin white border for readability across every grid tile.
-            border_rows = (y0, y1, y2, y3, y4, y5) if has_base_traj_row else (y0, y1, y2, y3, y4)
+            if skip_traj_rows:
+                border_rows = (y0, y1, y2, y3)
+            else:
+                border_rows = (y0, y1, y2, y3, y4, y5) if has_base_traj_row else (y0, y1, y2, y3, y4)
             for yy in border_rows:
                 draw.rectangle(
                     [x0, yy, x0 + X - 1, yy + row_h - 1],
@@ -3775,7 +3842,7 @@ class QueryHead(nn.Module):
                     width=1,
                 )
 
-            if t > 0:
+            if (not skip_traj_rows) and t > 0:
                 if (
                     traj_x_i is not None
                     and traj_y_i is not None
@@ -3910,7 +3977,10 @@ class QueryHead(nn.Module):
 
         vis_dir = str(getattr(self, "debug_vis_dir", "./work_dirs/query_debug_vis"))
         os.makedirs(vis_dir, exist_ok=True)
-        out_path = os.path.join(vis_dir, f"iter_{int(step):06d}_prob.png")
+        filename_prefix = "iter"
+        if isinstance(query_vis_bundle, dict):
+            filename_prefix = str(query_vis_bundle.get("_filename_prefix", filename_prefix))
+        out_path = os.path.join(vis_dir, f"{filename_prefix}_{int(step):06d}_prob.png")
         img.save(out_path)
     
     def gt_occ_to_gmo_binary(self, gt_occ: torch.Tensor,
@@ -4273,7 +4343,8 @@ class QueryHead(nn.Module):
                 import os
                 vis_dir = str(getattr(self, "debug_vis_dir", "./work_dirs/query_debug_vis"))
                 os.makedirs(vis_dir, exist_ok=True)
-                out_path = os.path.join(vis_dir, f"iter_{int(step):06d}_query_vis.pt")
+                filename_prefix = str(query_vis_bundle.get("_filename_prefix", "iter"))
+                out_path = os.path.join(vis_dir, f"{filename_prefix}_{int(step):06d}_query_vis.pt")
                 sidecar = {}
                 for key in (
                     "score_q",

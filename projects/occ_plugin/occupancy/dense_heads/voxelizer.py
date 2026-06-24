@@ -134,6 +134,7 @@ class SoftVoxelizerOneAdd(nn.Module):
         force_fp32=True,
         gaussian_truncate_sigma=3.0,
         gaussian_sigma_floor_vox=0.35,
+        gaussian_combine_mode="poisson",
     ):
         super().__init__()
         self.point_cloud_range = point_cloud_range
@@ -152,6 +153,12 @@ class SoftVoxelizerOneAdd(nn.Module):
         self.force_fp32 = force_fp32
         self.gaussian_truncate_sigma = float(gaussian_truncate_sigma)
         self.gaussian_sigma_floor_vox = float(gaussian_sigma_floor_vox)
+        self.gaussian_combine_mode = str(gaussian_combine_mode).lower()
+        if self.gaussian_combine_mode not in ("poisson", "union"):
+            raise ValueError(
+                "gaussian_combine_mode must be one of {'poisson','union'}, "
+                f"got {self.gaussian_combine_mode!r}"
+            )
 
         # buffers
         x_min, y_min, z_min, x_max, y_max, z_max = point_cloud_range
@@ -424,7 +431,8 @@ class SoftVoxelizerOneAdd(nn.Module):
             pair_weights_tk: optional [T,K] scalar weight per pair
             pair_chunk_size: chunk size over K for memory control
         Returns:
-            occ_tk1zyx: [T,K,1,D,H,W], with p = 1 - exp(-sum_g w_g * G_g(x))
+            occ_tk1zyx: [T,K,1,D,H,W]. combine_mode='poisson': p = 1 - exp(-sum_g w_g*G_g(x));
+                'union' (GUIDE): p = 1 - prod_g (1 - w_g*G_g(x)), w_g an opacity in [0,1].
         """
         if mixture_centers_world_tkg3.dim() != 4:
             raise ValueError(
@@ -558,8 +566,18 @@ class SoftVoxelizerOneAdd(nn.Module):
                 )
                 gauss = torch.exp(-0.5 * md2)
                 gauss = gauss * (md2 <= trunc2).to(gauss.dtype)
-                lam_pair = (wtc[..., None, None, None] * gauss).sum(dim=1)
-                p_pair = (-torch.expm1(-lam_pair)).clamp(0.0, 1.0)
+                wg = wtc[..., None, None, None] * gauss
+                if self.gaussian_combine_mode == "union":
+                    # GUIDE-style independent-occupancy union: p = 1 - prod_g (1 - w_g*G_g).
+                    # w_g is an opacity in [0,1] (pair with weight_mode='sigmoid'). The factor
+                    # clamp keeps p in [0,1] and is numerically safe even if w_g*G_g hits 0/1
+                    # (or exceeds 1 under a non-sigmoid weight, which then caps as fully occupied).
+                    factor = (1.0 - wg).clamp(1e-6, 1.0)
+                    p_pair = (1.0 - factor.prod(dim=1)).clamp(0.0, 1.0)
+                else:
+                    # Poisson/additive-intensity union: p = 1 - exp(-sum_g w_g*G_g).
+                    lam_pair = wg.sum(dim=1)
+                    p_pair = (-torch.expm1(-lam_pair)).clamp(0.0, 1.0)
 
                 in_pair = (
                     (xx[None] >= x0_pair[:, None, None, None].to(xx.dtype))
@@ -576,6 +594,119 @@ class SoftVoxelizerOneAdd(nn.Module):
                 occ_tkzyx[t, k0:k1, z0:z1 + 1, y0:y1 + 1, x0:x1 + 1] = p_pair.permute(0, 3, 2, 1)
 
         return occ_tkzyx.unsqueeze(2).to(out_dtype)
+
+    def forward_gaussian_mixture_scene(
+        self,
+        mixture_centers_world_tqg3: torch.Tensor,
+        mixture_sigmas_world_tqg3: torch.Tensor,
+        mixture_weights_tqg: torch.Tensor,
+        mixture_yaw_tqg: torch.Tensor,
+        pair_weights_tq: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """Accumulate a per-query rotated Gaussian MIXTURE into ONE scene volume.
+
+        Unlike forward_gaussian_mixture_grouped (which materializes a per-query
+        [T,K,1,D,H,W] tensor and is only memory-feasible at low training resolution),
+        this keeps a single [T,D,H,W] volume so it is usable at full eval resolution.
+        Within each query the G components combine by self.gaussian_combine_mode
+        ('poisson'/'union'); across queries the scene takes the max (occupancy union).
+
+        Args:
+            mixture_centers_world_tqg3: [T,Q,G,3]
+            mixture_sigmas_world_tqg3:  [T,Q,G,3]
+            mixture_weights_tqg:        [T,Q,G]
+            mixture_yaw_tqg:            [T,Q,G] (z-axis yaw, radians)
+            pair_weights_tq:            optional [T,Q] scalar per query (e.g. score)
+        Returns:
+            occ_t1zyx: [T,1,D,H,W]
+        """
+        if mixture_centers_world_tqg3.dim() != 4 or int(mixture_centers_world_tqg3.shape[-1]) != 3:
+            raise ValueError(
+                f"mixture_centers_world_tqg3 must be [T,Q,G,3], got {tuple(mixture_centers_world_tqg3.shape)}"
+            )
+        T, Q, G, _ = [int(v) for v in mixture_centers_world_tqg3.shape]
+        if T <= 0 or Q <= 0 or G <= 0:
+            return mixture_centers_world_tqg3.new_zeros((max(T, 0), 1, self.D, self.H, self.W))
+
+        device = mixture_centers_world_tqg3.device
+        out_dtype = mixture_centers_world_tqg3.dtype
+        if self.force_fp32:
+            centers = mixture_centers_world_tqg3.float()
+            sigmas = mixture_sigmas_world_tqg3.float()
+            comp_weights = mixture_weights_tqg.float()
+            yaws = mixture_yaw_tqg.float()
+            pair_w = pair_weights_tq.float() if pair_weights_tq is not None else None
+        else:
+            centers = mixture_centers_world_tqg3
+            sigmas = mixture_sigmas_world_tqg3
+            comp_weights = mixture_weights_tqg
+            yaws = mixture_yaw_tqg
+            pair_w = pair_weights_tq
+
+        pc_min = self.pc_min.to(device=device, dtype=centers.dtype)
+        vs = self.vs.to(device=device, dtype=centers.dtype)
+        trunc = max(1.0, float(self.gaussian_truncate_sigma))
+        trunc2 = trunc * trunc
+
+        cx = (centers[..., 0] - pc_min[0]) / vs[0] - 0.5
+        cy = (centers[..., 1] - pc_min[1]) / vs[1] - 0.5
+        cz = (centers[..., 2] - pc_min[2]) / vs[2] - 0.5
+        sx = (sigmas[..., 0] / vs[0]).clamp(min=self.gaussian_sigma_floor_vox)
+        sy = (sigmas[..., 1] / vs[1]).clamp(min=self.gaussian_sigma_floor_vox)
+        sz = (sigmas[..., 2] / vs[2]).clamp(min=self.gaussian_sigma_floor_vox)
+        wt = comp_weights.clamp(min=0.0)
+        cos_y = torch.cos(yaws)
+        sin_y = torch.sin(yaws)
+        sx_rot = torch.sqrt((cos_y.pow(2) * sx.pow(2)) + (sin_y.pow(2) * sy.pow(2)))
+        sy_rot = torch.sqrt((sin_y.pow(2) * sx.pow(2)) + (cos_y.pow(2) * sy.pow(2)))
+        rx = torch.ceil(trunc * sx_rot).to(torch.long).clamp(min=1)
+        ry = torch.ceil(trunc * sy_rot).to(torch.long).clamp(min=1)
+        rz = torch.ceil(trunc * sz).to(torch.long).clamp(min=1)
+        union = self.gaussian_combine_mode == "union"
+
+        scene = centers.new_zeros((T, self.D, self.H, self.W))
+        for t in range(T):
+            for q in range(Q):
+                cxg, cyg, czg = cx[t, q], cy[t, q], cz[t, q]          # [G]
+                sxg, syg, szg = sx[t, q], sy[t, q], sz[t, q]
+                cosg, sing = cos_y[t, q], sin_y[t, q]
+                floor_cx = torch.floor(cxg).to(torch.long)
+                floor_cy = torch.floor(cyg).to(torch.long)
+                floor_cz = torch.floor(czg).to(torch.long)
+                x0 = int((floor_cx - rx[t, q]).amin().clamp(min=0, max=self.W - 1).item())
+                x1 = int((floor_cx + rx[t, q]).amax().clamp(min=0, max=self.W - 1).item())
+                y0 = int((floor_cy - ry[t, q]).amin().clamp(min=0, max=self.H - 1).item())
+                y1 = int((floor_cy + ry[t, q]).amax().clamp(min=0, max=self.H - 1).item())
+                z0 = int((floor_cz - rz[t, q]).amin().clamp(min=0, max=self.D - 1).item())
+                z1 = int((floor_cz + rz[t, q]).amax().clamp(min=0, max=self.D - 1).item())
+                if (x1 < x0) or (y1 < y0) or (z1 < z0):
+                    continue
+                xs = torch.arange(x0, x1 + 1, device=device, dtype=centers.dtype)
+                ys = torch.arange(y0, y1 + 1, device=device, dtype=centers.dtype)
+                zs = torch.arange(z0, z1 + 1, device=device, dtype=centers.dtype)
+                xx, yy, zz = torch.meshgrid(xs, ys, zs, indexing="ij")    # each [nx,ny,nz]
+                dx = xx[None] - cxg[:, None, None, None]
+                dy = yy[None] - cyg[:, None, None, None]
+                dz = zz[None] - czg[:, None, None, None]
+                xr = cosg[:, None, None, None] * dx + sing[:, None, None, None] * dy
+                yr = -sing[:, None, None, None] * dx + cosg[:, None, None, None] * dy
+                md2 = (
+                    (xr / sxg[:, None, None, None]).pow(2)
+                    + (yr / syg[:, None, None, None]).pow(2)
+                    + (dz / szg[:, None, None, None]).pow(2)
+                )
+                gauss = torch.exp(-0.5 * md2) * (md2 <= trunc2).to(centers.dtype)   # [G,nx,ny,nz]
+                wg = wt[t, q][:, None, None, None] * gauss
+                if union:
+                    p = (1.0 - (1.0 - wg).clamp(1e-6, 1.0).prod(dim=0)).clamp(0.0, 1.0)
+                else:
+                    p = (-torch.expm1(-wg.sum(dim=0))).clamp(0.0, 1.0)               # [nx,ny,nz]
+                if pair_w is not None:
+                    p = p * pair_w[t, q].clamp(min=0.0)
+                sl = scene[t, z0:z1 + 1, y0:y1 + 1, x0:x1 + 1]
+                scene[t, z0:z1 + 1, y0:y1 + 1, x0:x1 + 1] = torch.maximum(sl, p.permute(2, 1, 0))
+
+        return scene.unsqueeze(1).to(out_dtype)
 
 
 if __name__ == "__main__":

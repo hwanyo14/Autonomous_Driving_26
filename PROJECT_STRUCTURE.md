@@ -4,16 +4,16 @@
 .
 ├── .gitignore  # 외부 저장소, 데이터셋, 체크포인트, work_dirs, 캐시 산출물 무시 규칙
 ├── AGENTS.md  # 이 repo에서 작업할 때 따라야 할 에이전트 지침
+├── CLAUDE.md  # Claude Code용 작업 지침 (수정 원칙, 기록 규칙)
 ├── README.md  # 저장소 목적을 짧게 적은 루트 소개
 ├── PROJECT_STRUCTURE.md  # 이 문서
 ├── CHANGELOG.md  # 코드 수정/구현 기록
 ├── NOTES.md  # 구현 중 주의사항·경고·후속 작업 메모
-├── GPU_MULTIJOB_NOTES.md  # 한 노드 멀티잡 속도저하 원인/해결 이론 정리 (oversubscription, MPS, NUMA)
-├── MPS_MULTIJOB_RUNBOOK.md  # 두 학습을 8+8 MPS로 동시 실행하는 복붙 런북 (실측 검증: 잡당 30s→9s)
+├── GUIDE.pdf  # 실험/사용 가이드 문서
 ├── run.sh  # 학습용 진입 스크립트; config 확인 후 tools/dist_train.sh 호출
 ├── run_eval.sh  # 평가용 진입 스크립트; config/checkpoint 확인 후 tools/dist_test.sh 호출
-├── run_lss_pretrain.sh  # LSS view-transformer만 pretrain하도록 dist_train.sh를 감싼 래퍼
-├── stop_mps.sh  # MPS 데몬 안전 종료/정리 (dist_train.sh가 MPS를 상시 자동 시작하므로 끌 때 사용)
+├── train_total.sh  # 8GPU 학습 원클릭 래퍼; CUDA_VISIBLE_DEVICES 지정 후 dist_train.sh 호출
+├── eval_total.sh  # 단일 eval 원클릭 래퍼; CONFIG/checkpoint/GPU 값만 수정 후 dist_test.sh 호출
 ├── data/  # 외부 데이터와 전처리 캐시를 가리키는 심볼릭 링크 모음
 │   ├── efficientocf -> /home/user/jhh/Projects/EfficientOCF/data/efficientocf  # OCF instance/flow 전처리 캐시
 │   ├── efficientocf_bboxcls -> /home/user/jhh/Projects/EOCF_qg_distil_dev/data/efficientocf_bboxcls  # bbox/class 기반 segmentation 캐시
@@ -37,9 +37,8 @@
 │   │   │       ├── seg_cosine_200e.py  # segmentation용 cosine 200epoch 템플릿
 │   │   │       └── seg_cosine_50e.py  # segmentation용 cosine 50epoch 템플릿
 │   │   ├── baselines/
-│   │   │   ├── EfficientOCF_V1.1_1gpu.py  # 현재 nuScenes 단일 GPU baseline; query/GMO/DT/debug 설정 포함
-│   │   │   ├── EfficientOCF_V1.1_1gpu_traj_tf.py  # teacher forcing 변형; GT past delta prior로 초반 학습 안정화
-│   │   │   └── EfficientOCF_V1.1_lyft.py  # Lyft용 EfficientOCF baseline 설정
+│   │   │   ├── shape_guide.py  # 현재 주력 config; semantic cls를 binary {0=bg,1=fg}로 통합한 shape-guide 실험 설정
+│   │   │   └── test.py  # 평가용 config (test pipeline/dataset 설정)
 │   │   └── datasets/
 │   │       └── custom_nus-3d.py  # MMDet3D 기반 nuScenes 3D dataset/pipeline 기본 템플릿
 │   └── occ_plugin/  # mmdetection3d plugin 진입점; datasets/models/hooks/ops 등록

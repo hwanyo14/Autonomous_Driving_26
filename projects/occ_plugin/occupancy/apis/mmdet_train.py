@@ -13,15 +13,10 @@ from mmcv.runner import (HOOKS, Hook, DistSamplerSeedHook, EpochBasedRunner,
                          Fp16OptimizerHook, OptimizerHook, build_optimizer,
                          build_runner, get_dist_info)
 from mmcv.utils import build_from_cfg
-from mmdet.core import EvalHook
-from mmdet.datasets import (build_dataset,
-                            replace_ImageToTensor)
 from mmdet.utils import get_root_logger
 import time
 import os.path as osp
 from projects.occ_plugin.datasets.builder import build_dataloader
-from projects.occ_plugin.core.evaluation.eval_hooks import OccDistEvalHook, OccEvalHook
-from projects.occ_plugin.datasets import custom_build_dataset
 
 
 class VisualizationIterSyncHook(Hook):
@@ -53,6 +48,7 @@ def _configure_visualization_dirs(model, work_dir, timestamp):
         "debug_query_inst_depth_lift_vis_dir": "query_inst_depth_lift_vis",
         "debug_query_attn_softargmax_vis_dir": "query_attn_softargmax_vis",
         "query_attn_vis_dir": "query_attn_vis",
+        "debug_query_mixture3d_vis_dir": "query_mixture3d_vis",
     }
 
     root_model = model.module if hasattr(model, "module") else model
@@ -148,24 +144,6 @@ def custom_train_detector(model,
     #     ),
     #     priority='NORMAL'
     # )
-
-    # if validate and cfg.data.get('val') is not None:
-    #     val_dataset = custom_build_dataset(cfg.data.val, dict(test_mode=True))
-    #     val_dataloader = build_dataloader(
-    #         val_dataset,
-    #         cfg.data.samples_per_gpu,
-    #         cfg.data.workers_per_gpu,
-    #         len(cfg.gpu_ids),
-    #         dist=distributed,
-    #         shuffle=False,
-    #         seed=cfg.seed,
-    #         shuffler_sampler=cfg.data.shuffler_sampler,
-    #         nonshuffler_sampler=cfg.data.nonshuffler_sampler,
-    #     )
-    #     eval_cfg = cfg.get('evaluation', {}).copy()
-    #     eval_cfg.setdefault('interval', 1)
-    #     eval_hook = OccDistEvalHook if distributed else OccEvalHook
-    #     runner.register_hook(eval_hook(val_dataloader, **eval_cfg), priority='LOW')
 
     runner.register_hook(VisualizationIterSyncHook(), priority='VERY_HIGH')
 

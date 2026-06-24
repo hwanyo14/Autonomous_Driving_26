@@ -1529,7 +1529,7 @@ class EfficientOCFInstanceImgDebugMixin:
             return
         if (int(step) % vis_every) != 0:
             return
-        if not self._is_main_process():
+        if (not self._is_main_process()) and (not getattr(self, "_eval_vis_all_ranks", False)):
             return
         if (not isinstance(debug_bundle, dict)) or (not isinstance(query_vis_bundle, dict)):
             return

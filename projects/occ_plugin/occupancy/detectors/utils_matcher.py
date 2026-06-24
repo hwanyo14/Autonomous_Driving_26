@@ -43,6 +43,9 @@ class EfficientOCFMatcherMixin:
         return {
             "matched_query_idx": empty_idx,
             "matched_inst_idx": empty_idx,
+            "recruit_query_idx": empty_idx,
+            "recruit_inst_idx": empty_idx,
+            "recruit_frame_indices": empty_idx,
             "sim_qn": None,
             "soft_assign_qn": None,
             "center_frame_idx": None,
@@ -890,6 +893,42 @@ class EfficientOCFMatcherMixin:
         match_result["gt_bev_feat_valid_tn"] = match_gt_feat_valid_tn
         match_result["gt_bev_feat_ids_n"] = match_gt_feat_ids_n
 
+        gate_radius_m = float(getattr(self, "query_match_center_gate_radius_m", 0.0))
+        recruit_radius_m = float(getattr(self, "query_recruit_max_radius_m", 0.0))
+        gate_blocked_qn = None
+        min_dist_qn = None
+        if gate_radius_m > 0.0 or recruit_radius_m > 0.0:
+            if temporal_cost_idx is not None:
+                distance_frame_indices = temporal_cost_idx
+            elif center_frame_idx is not None:
+                distance_frame_indices = [center_frame_idx]
+            else:
+                distance_frame_indices = list(range(t_center))
+            frame_idx_t = torch.as_tensor(
+                distance_frame_indices,
+                device=centers_world.device,
+                dtype=torch.long,
+            )
+            match_result["recruit_frame_indices"] = frame_idx_t
+            if frame_idx_t.numel() > 0:
+                query_xy_tq2 = centers_world.index_select(0, frame_idx_t)[..., :2].to(torch.float32)
+                gt_xy_tn2 = match_gt_center_tn3.index_select(0, frame_idx_t)[..., :2].to(torch.float32)
+                gt_valid_tn = match_valid_tn.index_select(0, frame_idx_t).to(torch.bool)
+                dist_tqn = torch.linalg.vector_norm(
+                    query_xy_tq2[:, :, None, :] - gt_xy_tn2[:, None, :, :],
+                    dim=-1,
+                )
+                dist_tqn = torch.where(
+                    gt_valid_tn[:, None, :],
+                    dist_tqn,
+                    torch.full_like(dist_tqn, float("inf")),
+                )
+                min_dist_qn = dist_tqn.min(dim=0).values
+                if gate_radius_m > 0.0:
+                    gate_blocked_qn = min_dist_qn > gate_radius_m
+                    cost_qn = cost_qn + gate_blocked_qn.to(cost_qn.dtype) * 1e4
+                    match_result["cost_qn"] = cost_qn
+
         row_ind, col_ind = _solve_unique_assignment(cost_qn.detach().cpu().numpy())
         if row_ind.size == 0:
             return match_result
@@ -899,8 +938,49 @@ class EfficientOCFMatcherMixin:
         inst_order = torch.argsort(match_inst_idx)
         match_query_idx = match_query_idx[inst_order]
         match_inst_idx = match_inst_idx[inst_order]
+        if gate_blocked_qn is not None:
+            keep = ~gate_blocked_qn[match_query_idx, match_inst_idx]
+            match_query_idx = match_query_idx[keep]
+            match_inst_idx = match_inst_idx[keep]
+
+        if recruit_radius_m > 0.0 and torch.is_tensor(min_dist_qn):
+            free_dist_qn = min_dist_qn.clone()
+            if match_query_idx.numel() > 0:
+                free_dist_qn[match_query_idx, :] = float("inf")
+                free_dist_qn[:, match_inst_idx] = float("inf")
+            free_dist_qn = torch.where(
+                free_dist_qn <= recruit_radius_m,
+                free_dist_qn,
+                torch.full_like(free_dist_qn, float("inf")),
+            )
+            recruit_query_idx = []
+            recruit_inst_idx = []
+            n_inst_final = int(free_dist_qn.shape[1])
+            while free_dist_qn.numel() > 0:
+                flat_idx = int(torch.argmin(free_dist_qn).item())
+                query_idx, inst_idx = divmod(flat_idx, n_inst_final)
+                if not bool(torch.isfinite(free_dist_qn[query_idx, inst_idx]).item()):
+                    break
+                recruit_query_idx.append(query_idx)
+                recruit_inst_idx.append(inst_idx)
+                free_dist_qn[query_idx, :] = float("inf")
+                free_dist_qn[:, inst_idx] = float("inf")
+            if recruit_query_idx:
+                match_result["recruit_query_idx"] = torch.as_tensor(
+                    recruit_query_idx,
+                    device=centers_world.device,
+                    dtype=torch.long,
+                )
+                match_result["recruit_inst_idx"] = torch.as_tensor(
+                    recruit_inst_idx,
+                    device=centers_world.device,
+                    dtype=torch.long,
+                )
+
         match_result["matched_query_idx"] = match_query_idx
         match_result["matched_inst_idx"] = match_inst_idx
+        if match_query_idx.numel() <= 0:
+            return match_result
         if bool(getattr(self, "query_present_only", False)):
             query_feat_for_match = match_query_img_feat_tqd[:t_match]
         else:

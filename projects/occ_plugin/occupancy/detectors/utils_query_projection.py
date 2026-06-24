@@ -401,6 +401,13 @@ class EfficientOCFQueryProjectionMixin:
             "dbg_query_depth_multi_cam_candidate_count": z,
             "dbg_query_depth_loss_weight": z.new_tensor(float(loss_weight)),
             "dbg_query_depth_label_smoothing": z.new_tensor(float(label_smoothing)),
+            # depth-head performance diagnostics (prefill kept in sync w/ record below
+            # for multi-GPU log_vars; computed on matched+valid pairs at the CE site)
+            "dbg_query_depth_top1_acc": z,
+            "dbg_query_depth_within1_acc": z,
+            "dbg_query_depth_bin_abs_err": z,
+            "dbg_query_depth_soft_bin_abs_err": z,
+            "dbg_query_depth_entropy": z,
         }
         if (
             (not torch.is_tensor(query_depth_logits_tqd))
@@ -595,6 +602,24 @@ class EfficientOCFQueryProjectionMixin:
             label_smoothing=float(max(0.0, min(0.999, label_smoothing))),
         )
         out["loss_query_depth"] = ce * float(max(0.0, loss_weight))
+
+        # depth-head performance diagnostics (does the head predict the GT depth bin
+        # accurately/sharply?). argmax = hard pick; soft = expectation the lift uses.
+        with torch.no_grad():
+            v_logits = logits_flat[valid_flat]            # [M, d_bins]
+            v_tgt = tgt_bin_flat[valid_flat]              # [M]
+            v_probs = torch.softmax(v_logits, dim=-1)
+            pred_bin = v_logits.argmax(dim=-1)
+            bin_idx = torch.arange(d_bins, device=v_logits.device, dtype=torch.float32)
+            exp_bin = (v_probs * bin_idx[None, :]).sum(dim=-1)  # soft-argmax bin
+            tgt_f = v_tgt.to(torch.float32)
+            out["dbg_query_depth_top1_acc"] = (pred_bin == v_tgt).to(torch.float32).mean()
+            out["dbg_query_depth_within1_acc"] = ((pred_bin - v_tgt).abs() <= 1).to(torch.float32).mean()
+            out["dbg_query_depth_bin_abs_err"] = (pred_bin.to(torch.float32) - tgt_f).abs().mean()
+            out["dbg_query_depth_soft_bin_abs_err"] = (exp_bin - tgt_f).abs().mean()
+            out["dbg_query_depth_entropy"] = (
+                -(v_probs * torch.log(v_probs.clamp_min(1e-9))).sum(dim=-1)
+            ).mean()
         return out
 
     def _select_query_tokens_for_query_head(self, query_inst: torch.Tensor) -> torch.Tensor:

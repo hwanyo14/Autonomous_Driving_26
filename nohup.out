@@ -1,0 +1,6 @@
+-------------
+load config from local path: ./projects/configs/baselines/shape_guide.py
+[dist_train] console logging -> logs/shape_guide/20260624_163130.log  (실시간 보기: tail -f logs/shape_guide/20260624_163130.log)
+-------------
+load config from local path: ./projects/configs/baselines/shape_guide.py
+[dist_train] console logging -> logs/shape_guide/20260624_163304.log  (실시간 보기: tail -f logs/shape_guide/20260624_163304.log)

@@ -3,6 +3,7 @@
 # ---------------------------------------------
 #  Modified by Jingyi Xu, following Zhiqi Li and Junyi Ma
 # ---------------------------------------------
+import os
 import os.path as osp
 import pickle
 import shutil
@@ -39,32 +40,106 @@ def custom_encode_mask_results(mask_results):
                         dtype='uint8'))[0])  # encoded with RLE
     return [encoded_mask_results]
 
+def _running_eval_msg(n, iou_cm, bbox_cm, iou3d, recall3d):
+    """One-line running eval summary (movable IoU2d, bbox-AABB IoU2d, IoU3d,
+    Recall3d) computed from metrics accumulated so far."""
+    from projects.occ_plugin.utils.formating import cm_to_ious
+    def _mov(cm_list):
+        return float(cm_to_ious(sum(cm_list))[1]) if cm_list else float('nan')
+    def _mean(xs):
+        return float(np.mean(xs)) if len(xs) else float('nan')
+    return ("[eval][{}] IoU2d(nusocc)={:.4f} IoU2d(bbox_aabb)={:.4f} "
+            "IoU3d={:.4f} Recall3d={:.4f}").format(
+                n, _mov(iou_cm), _mov(bbox_cm), _mean(iou3d), _mean(recall3d))
+
+
+def _append_live_eval_log(msg):
+    vis_dir = os.environ.get("EOCF_EVAL_VIS_DIR", "")
+    if not vis_dir:
+        return
+    try:
+        os.makedirs(vis_dir, exist_ok=True)
+        with open(osp.join(vis_dir, "eval_metrics_live.log"), "a") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
+
+
+def _distributed_running_eval_msg(n, dataset_size, iou_cm, bbox_cm, iou3d, recall3d):
+    from projects.occ_plugin.utils.formating import cm_to_ious
+
+    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+
+    def _cm_tensor(cm_list):
+        arr = sum(cm_list) if cm_list else np.zeros((2, 2), dtype=np.int64)
+        return torch.as_tensor(arr, dtype=torch.float64, device=device)
+
+    cm_iou = _cm_tensor(iou_cm)
+    cm_bbox = _cm_tensor(bbox_cm)
+    scalars = torch.tensor(
+        [
+            float(np.sum(iou3d)) if len(iou3d) else 0.0,
+            float(len(iou3d)),
+            float(np.sum(recall3d)) if len(recall3d) else 0.0,
+            float(len(recall3d)),
+        ],
+        dtype=torch.float64,
+        device=device,
+    )
+
+    dist.all_reduce(cm_iou, op=dist.ReduceOp.SUM)
+    dist.all_reduce(cm_bbox, op=dist.ReduceOp.SUM)
+    dist.all_reduce(scalars, op=dist.ReduceOp.SUM)
+
+    cm_iou_np = cm_iou.cpu().numpy().astype(np.int64)
+    cm_bbox_np = cm_bbox.cpu().numpy().astype(np.int64)
+    iou3d_mean = float(scalars[0].item() / scalars[1].item()) if scalars[1].item() > 0 else float("nan")
+    recall3d_mean = float(scalars[2].item() / scalars[3].item()) if scalars[3].item() > 0 else float("nan")
+    n = min(int(n), int(dataset_size))
+    return ("[eval][{}] IoU2d(nusocc)={:.4f} IoU2d(bbox_aabb)={:.4f} "
+            "IoU3d={:.4f} Recall3d={:.4f} (all ranks)").format(
+                n,
+                float(cm_to_ious(cm_iou_np)[1]),
+                float(cm_to_ious(cm_bbox_np)[1]),
+                iou3d_mean,
+                recall3d_mean,
+            )
+
+
 def custom_single_gpu_test(model, data_loader, show=False, out_dir=None, show_score_thr=0.3):
     model.eval()
-    
-    iou_metric = 0
-    vpq_metric = 0
     dataset = data_loader.dataset
     prog_bar = mmcv.ProgressBar(len(dataset))
     logger = get_root_logger()
     logger.info(parameter_count_table(model))
-    
+
+    iou_metric, iou_bbox_metric = [], []
+    iou_3d_metric, recall_3d_metric = [], []
+
     for i, data in enumerate(data_loader):
         with torch.no_grad():
             result = model(return_loss=False, rescale=True, **data)
-            
-            if 'hist_for_iou' in result.keys():
-                iou_metric += result['hist_for_iou']
-                vpq_metric += result['vpq']
+
+        if 'hist_for_iou' in result.keys():
+            iou_metric.append(result['hist_for_iou'])
+        if 'hist_for_iou_bbox' in result.keys():
+            iou_bbox_metric.append(result['hist_for_iou_bbox'])
+        if 'iou_3d' in result.keys() and not np.isnan(result['iou_3d']):
+            iou_3d_metric.append(result['iou_3d'])
+        if 'recall_3d' in result.keys() and not np.isnan(result['recall_3d']):
+            recall_3d_metric.append(result['recall_3d'])
 
         prog_bar.update()
+        if (i + 1) % 50 == 0:
+            print("\n" + _running_eval_msg(i + 1, iou_metric, iou_bbox_metric,
+                                           iou_3d_metric, recall_3d_metric), flush=True)
 
     res = {
-        'hist_for_iou': iou_metric,
-        'vpq_len': len(dataset),
-        'vpq_metric': vpq_metric,
+        'hist_for_iou': [sum(iou_metric)] if iou_metric else [],
+        'hist_for_iou_bbox': [sum(iou_bbox_metric)] if iou_bbox_metric else [],
+        'iou_3d': iou_3d_metric,
+        'recall_3d': recall_3d_metric,
     }
-
     return res
 
 def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, show=False, out_dir=None):
@@ -88,6 +163,7 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
     
     # init predictions
     iou_metric = []
+    iou_bbox_metric = []
     height_l1_metric = []
     vpq_metric = []
     iou_3d_metric = []
@@ -97,6 +173,7 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
     rank, world_size = get_dist_info()
     if rank == 0:
         prog_bar = mmcv.ProgressBar(len(dataset))
+    metric_every = int(os.environ.get("EOCF_EVAL_METRIC_EVERY", os.environ.get("EOCF_EVAL_VIS_EVERY", "50")))
     
     time.sleep(2)  # This line can prevent deadlock problem in some cases.
     
@@ -111,7 +188,10 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
             
             if 'hist_for_iou' in result.keys():
                 iou_metric.append(result['hist_for_iou'])
-            
+
+            if 'hist_for_iou_bbox' in result.keys():
+                iou_bbox_metric.append(result['hist_for_iou_bbox'])
+
             if 'height_l1' in result.keys():
                 if not torch.isnan(result['height_l1']):
                     height_l1_metric.append(result['height_l1'])
@@ -131,6 +211,18 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
         if rank == 0:
             for _ in range(batch_size * world_size):
                 prog_bar.update()
+        if metric_every > 0 and (i + 1) % metric_every == 0:
+            msg = _distributed_running_eval_msg(
+                (i + 1) * world_size,
+                len(dataset),
+                iou_metric,
+                iou_bbox_metric,
+                iou_3d_metric,
+                recall_3d_metric,
+            )
+            if rank == 0:
+                print("\n" + msg, flush=True)
+                _append_live_eval_log(msg)
 
     # collect lists from multi-GPUs
     res = {}
@@ -139,7 +231,12 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
         iou_metric = [sum(iou_metric)]
         iou_metric = collect_results_cpu(iou_metric, len(dataset), tmpdir)
         res['hist_for_iou'] = iou_metric
-    
+
+    if 'hist_for_iou_bbox' in result.keys():
+        iou_bbox_metric = [sum(iou_bbox_metric)]
+        iou_bbox_metric = collect_results_cpu(iou_bbox_metric, len(dataset), tmpdir)
+        res['hist_for_iou_bbox'] = iou_bbox_metric
+
     if 'height_l1' in result.keys():
         height_l1_metric = collect_results_cpu(height_l1_metric, len(dataset), tmpdir)
         res['height_l1'] = height_l1_metric

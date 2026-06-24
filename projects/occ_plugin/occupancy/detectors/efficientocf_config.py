@@ -8,8 +8,14 @@ MODEL_CFG_DEFAULTS = {
     "query_gmo_dice_loss_weight": 0.5,
     "query_gmo_tversky_alpha": 0.7,
     "query_gmo_tversky_beta": 0.3,
+    "query_gmo_soft_gt_enabled": False,
+    "query_gmo_soft_gt_sigma_vox": 2.5,
+    "query_gmo_soft_gt_truncate_sigma": 3.0,
     "use_query_gmo_dice_loss": True,
     "use_query_inst_center_match_loss": True,
+    # Restrict matched-pair GMO(occupancy) + center losses to the receptive-field
+    # (past+present) frames; leave the future horizon to the trajectory loss only.
+    "query_matched_loss_history_only": False,
     "use_query_dt_loss": True,
     "use_query_gt2p_instance_labeled_loss": False,
     "query_gt2p_instance_labeled_loss_weight": 0.1,
@@ -35,6 +41,11 @@ MODEL_CFG_DEFAULTS = {
     "query_num_classes": 3,
     "query_cls_loss_weight": 1.0,
     "query_cls_loss_class_weights": None,
+    # When True the semantic cls head is collapsed to binary {0=bg, 1=fg}:
+    # every movable raw id is mapped to compact id 1 (see efficientocf.py raw->compact map),
+    # and the head is built with num_query_classes=2. Keep query_class_ids as the full raw
+    # id list (GT loading/validation still needs them). Default False = original N-way cls.
+    "query_cls_binary_fg": False,
     "query_match_feature_source": "query_img_feat_pooled",
     "query_soft_assign_temp": 0.10,
     "query_soft_assign_cost_weight": 0.0,
@@ -87,6 +98,9 @@ MODEL_CFG_DEFAULTS = {
     "query_traj_teacher_forcing_until_iter": 0,
     "query_center_match_cost_weight": 0.0,
     "query_temporal_offset_match_cost_weight": 0.0,
+    "query_match_center_gate_radius_m": 0.0,
+    "query_recruit_max_radius_m": 0.0,
+    "query_recruit_loss_weight": 0.0,
     "query_center_match_loss_type": "l1",
     "query_matched_gmo_bce_occ_size": (128, 128, 10),
     "query_num_gaussians": 1,
@@ -100,6 +114,19 @@ MODEL_CFG_DEFAULTS = {
     "query_multi_gaussian_softplus_bias_init": -2.0,
     "query_multi_gaussian_weight_reg_loss_weight": 1e-3,
     "query_multi_gaussian_weight_reg_target_sum": 1.0,
+    # occupancy 합성 방식: 'poisson'(기존) p=1-exp(-Σ w·G) / 'union'(GUIDE) p=1-Π(1-w·G).
+    # 'union'은 weight_mode='sigmoid'(α∈[0,1] opacity)와 함께 써야 함.
+    "query_multi_gaussian_occ_combine_mode": "poisson",
+    # eval occupancy를 학습과 정렬: True(기본)면 16개 mixture를 그대로 splat(union over queries,
+    # occ_combine_mode 적용, yaw 살림). False면 16개를 평균낸 단일 ellipsoid로 찍음.
+    # mixture 텐서가 없는 모델은 simple_test의 use_mix 가드가 자동으로 단일 ellipsoid로 fallback.
+    "query_eval_occ_use_mixture": True,
+    # occupancy 확률을 점유/비점유로 가르는 단일 threshold (= 평가 metric 기준).
+    # 이 값 하나가 (1)평가 metric 이진화, (2)2D query_debug_vis occ-grid, (3)3D mixture3d occ를
+    # 모두 결정한다. 런타임 override: 환경변수 EOCF_EVAL_OCC_THR (eval 시에만).
+    # 주의: 가우시안 footprint 색칠(debug_query_gaussian_prob_threshold)은 개별 G density 기준이라
+    # 의미가 달라 별도 노브로 유지한다.
+    "eval_occ_threshold": 0.5,
     "query_embed_dim": 256,
     "query_num_queries": 100,
     "query_transformer_num_layers": 1,
@@ -132,6 +159,10 @@ MODEL_CFG_DEFAULTS = {
     "query_attn_softargmax_tau": 1.0,
     "query_depth_loss_weight": 1.0,
     "query_depth_label_smoothing": 0.0,
+    # QueryDepthHead capacity (depth bin classifier MLP). Defaults reproduce the
+    # original 2-layer, hidden=embed_dim head. hidden_mult widens hidden=embed_dim*mult.
+    "query_depth_head_num_layers": 2,
+    "query_depth_head_hidden_mult": 1,
     "query_inst_depth_num_bins": 64,
     "query_inst_depth_range_mode": "dbound",
     "query_inst_depth_min": 0.0,
@@ -146,17 +177,25 @@ DEBUG_CFG_DEFAULTS = {
     "debug_gt_alignment_vis_every": 0,
     "debug_query_inst_depth_lift_vis_every": 0,
     "debug_query_attn_softargmax_vis_every": 0,
+    "debug_query_mixture3d_vis_every": 0,
 }
 
 VISUALIZATION_CFG_DEFAULTS = {
     "debug_query_vis_dir": "./work_dirs/query_debug_vis",
     "debug_query_center_marker_radius": 3,
-    "debug_query_confidence_vis_threshold": 0.5,
-    "debug_query_objectness_vis_threshold": 0.5,
+    # ============================================================================
+    # [임계값 한눈에] 학습/추론 viz·metric에 공통 적용되는 임계값 (config가 학습·추론 모두 좌우,
+    #                env가 있으면 추론에서만 override). occ는 MODEL_CFG_DEFAULTS의 eval_occ_threshold.
+    #   occ 점유 :  eval_occ_threshold (model cfg, 기본 0.5)        env override: EOCF_EVAL_OCC_THR
+    #   query score(선택/표시/3D) :  debug_query_score_threshold (아래, 기본 0.5)  env override: EOCF_EVAL_FG_THR
+    # → config 값 = 학습·추론 공통. 추론에서만 바꾸려면 env. 둘 다 같게 하려면 config만 쓰고 env 빼면 됨.
+    # ============================================================================
     "debug_query_gaussian_vis_mode": "ellipse",
     "debug_query_gaussian_prob_threshold": 0.5,
     "debug_query_gaussian_prob_alpha_scale": 4.0,
     "debug_query_score_topk": 50,
+    # ★ query score 단일 임계값: 2D 선택(3행 hi) + 2D footprint 표시 + 3D mixture3d 필터 모두 이 값 사용.
+    #   학습·추론 공통. 추론 override: 환경변수 EOCF_EVAL_FG_THR.
     "debug_query_score_threshold": 0.5,
     "debug_query_score_iou_weight": 0.5,
     "debug_query_score_cls_weight": 0.5,
@@ -181,6 +220,13 @@ VISUALIZATION_CFG_DEFAULTS = {
     "debug_query_attn_softargmax_vis_max_cams": 3,
     "debug_query_attn_softargmax_vis_max_queries": 16,
     "query_attn_vis_dir": "./work_dirs/query_attn_vis",
+    "debug_query_mixture3d_vis_dir": "./work_dirs/query_mixture3d_vis",
+    "debug_query_mixture3d_vis_max_queries": 50,
+    "debug_query_mixture3d_vis_max_gt_points": 40000,
+    # (deprecated) 3D score는 이제 debug_query_score_threshold(+EOCF_EVAL_FG_THR)로 통일 → 이 키는 무시됨.
+    "debug_query_mixture3d_vis_score_threshold": 0.75,
+    # (deprecated) mixture3d occ threshold는 이제 eval_occ_threshold로 통일됨 → 키 제거.
+    "debug_query_mixture3d_vis_occ_max_voxels_per_query": 4000,
 }
 
 
@@ -203,8 +249,12 @@ def apply_model_cfg(self, cfg):
     self.query_gmo_dice_loss_weight = float(cfg["query_gmo_dice_loss_weight"])
     self.query_gmo_tversky_alpha = float(cfg["query_gmo_tversky_alpha"])
     self.query_gmo_tversky_beta = float(cfg["query_gmo_tversky_beta"])
+    self.query_gmo_soft_gt_enabled = bool(cfg["query_gmo_soft_gt_enabled"])
+    self.query_gmo_soft_gt_sigma_vox = float(cfg["query_gmo_soft_gt_sigma_vox"])
+    self.query_gmo_soft_gt_truncate_sigma = float(cfg["query_gmo_soft_gt_truncate_sigma"])
     self.use_query_gmo_dice_loss = bool(cfg["use_query_gmo_dice_loss"])
     self.use_query_inst_center_match_loss = bool(cfg["use_query_inst_center_match_loss"])
+    self.query_matched_loss_history_only = bool(cfg["query_matched_loss_history_only"])
     self.use_query_dt_loss = bool(cfg["use_query_dt_loss"])
     self.use_query_gt2p_instance_labeled_loss = bool(cfg["use_query_gt2p_instance_labeled_loss"])
     self.query_gt2p_instance_labeled_loss_weight = float(cfg["query_gt2p_instance_labeled_loss_weight"])
@@ -230,6 +280,7 @@ def apply_model_cfg(self, cfg):
     self.query_bev_pool_fixed_sigma_xyz = tuple(float(v) for v in cfg["query_bev_pool_fixed_sigma_xyz"])
     self.query_num_classes = int(cfg["query_num_classes"])
     self.query_bg_class = 0
+    self.query_cls_binary_fg = bool(cfg["query_cls_binary_fg"])
 
     query_class_ids = cfg["query_class_ids"]
     if query_class_ids is None:
@@ -307,6 +358,9 @@ def apply_model_cfg(self, cfg):
     self.query_traj_teacher_forcing_until_iter = int(cfg["query_traj_teacher_forcing_until_iter"])
     self.query_center_match_cost_weight = float(cfg["query_center_match_cost_weight"])
     self.query_temporal_offset_match_cost_weight = float(cfg["query_temporal_offset_match_cost_weight"])
+    self.query_match_center_gate_radius_m = float(cfg["query_match_center_gate_radius_m"])
+    self.query_recruit_max_radius_m = float(cfg["query_recruit_max_radius_m"])
+    self.query_recruit_loss_weight = float(cfg["query_recruit_loss_weight"])
     self.query_center_match_loss_type = str(cfg["query_center_match_loss_type"]).lower()
     self.query_matched_gmo_bce_occ_size = tuple(int(v) for v in cfg["query_matched_gmo_bce_occ_size"])
     self.query_num_gaussians = int(cfg["query_num_gaussians"])
@@ -320,6 +374,9 @@ def apply_model_cfg(self, cfg):
     self.query_multi_gaussian_softplus_bias_init = float(cfg["query_multi_gaussian_softplus_bias_init"])
     self.query_multi_gaussian_weight_reg_loss_weight = float(cfg["query_multi_gaussian_weight_reg_loss_weight"])
     self.query_multi_gaussian_weight_reg_target_sum = float(cfg["query_multi_gaussian_weight_reg_target_sum"])
+    self.query_multi_gaussian_occ_combine_mode = str(cfg["query_multi_gaussian_occ_combine_mode"]).lower()
+    self.query_eval_occ_use_mixture = bool(cfg["query_eval_occ_use_mixture"])
+    self.eval_occ_threshold = float(cfg["eval_occ_threshold"])
     self.query_embed_dim = int(cfg["query_embed_dim"])
     self.query_num_queries = int(cfg["query_num_queries"])
     self.query_transformer_num_layers = int(cfg["query_transformer_num_layers"])
@@ -352,6 +409,8 @@ def apply_model_cfg(self, cfg):
     self.query_attn_softargmax_tau = float(cfg["query_attn_softargmax_tau"])
     self.query_depth_loss_weight = float(cfg["query_depth_loss_weight"])
     self.query_depth_label_smoothing = float(cfg["query_depth_label_smoothing"])
+    self.query_depth_head_num_layers = int(cfg["query_depth_head_num_layers"])
+    self.query_depth_head_hidden_mult = int(cfg["query_depth_head_hidden_mult"])
     self.query_inst_depth_num_bins = int(cfg["query_inst_depth_num_bins"])
     self.query_inst_depth_range_mode = str(cfg["query_inst_depth_range_mode"]).lower()
     self.query_inst_depth_min = float(cfg["query_inst_depth_min"])
@@ -378,6 +437,7 @@ def apply_debug_cfg(self, cfg):
     self.debug_gt_alignment_vis_every = int(cfg["debug_gt_alignment_vis_every"])
     self.debug_query_inst_depth_lift_vis_every = int(cfg["debug_query_inst_depth_lift_vis_every"])
     self.debug_query_attn_softargmax_vis_every = int(cfg["debug_query_attn_softargmax_vis_every"])
+    self.debug_query_mixture3d_vis_every = int(cfg["debug_query_mixture3d_vis_every"])
 
     return cfg
 
@@ -387,8 +447,6 @@ def apply_visualization_cfg(self, cfg):
 
     self.debug_query_vis_dir = str(cfg["debug_query_vis_dir"])
     self.debug_query_center_marker_radius = max(0, int(cfg["debug_query_center_marker_radius"]))
-    self.debug_query_confidence_vis_threshold = float(cfg["debug_query_confidence_vis_threshold"])
-    self.debug_query_objectness_vis_threshold = float(cfg["debug_query_objectness_vis_threshold"])
     self.debug_query_gaussian_vis_mode = str(cfg["debug_query_gaussian_vis_mode"]).lower()
     self.debug_query_gaussian_prob_threshold = float(cfg["debug_query_gaussian_prob_threshold"])
     self.debug_query_gaussian_prob_alpha_scale = float(cfg["debug_query_gaussian_prob_alpha_scale"])
@@ -419,5 +477,12 @@ def apply_visualization_cfg(self, cfg):
     self.debug_query_attn_softargmax_vis_max_cams = max(1, int(cfg["debug_query_attn_softargmax_vis_max_cams"]))
     self.debug_query_attn_softargmax_vis_max_queries = max(1, int(cfg["debug_query_attn_softargmax_vis_max_queries"]))
     self.query_attn_vis_dir = str(cfg["query_attn_vis_dir"])
+    self.debug_query_mixture3d_vis_dir = str(cfg["debug_query_mixture3d_vis_dir"])
+    self.debug_query_mixture3d_vis_max_queries = max(1, int(cfg["debug_query_mixture3d_vis_max_queries"]))
+    self.debug_query_mixture3d_vis_max_gt_points = max(1000, int(cfg["debug_query_mixture3d_vis_max_gt_points"]))
+    self.debug_query_mixture3d_vis_score_threshold = float(cfg["debug_query_mixture3d_vis_score_threshold"])
+    self.debug_query_mixture3d_vis_occ_max_voxels_per_query = max(
+        100, int(cfg["debug_query_mixture3d_vis_occ_max_voxels_per_query"])
+    )
 
     return cfg

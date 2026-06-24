@@ -1,7 +1,10 @@
-# Developed by Jingyi Xu based on the codebase of Cam4DOcc and PowerBEV 
+# Developed by Jingyi Xu based on the codebase of Cam4DOcc and PowerBEV
 # Spatiotemporal Decoupling for Efficient Vision-Based Occupancy Forecasting
 # https://github.com/BIT-XJY/EfficientOCF
-import copy
+#
+# [occ 실험] semantic cls를 binary {0=bg, 1=fg}로 통합한 config (car/truck/... 구분 제거).
+# 변경 방법/디버깅 가이드: 레포 루트의 BINARY_FG_CLS_CHANGES.md 참고.
+# 스위치는 model_cfg의 query_cls_binary_fg=True (+ num_classes=2, weights 2개). moving/static과 무관.
 
 # Basic params ******************************************
 _base_ = ['../datasets/custom_nus-3d.py', '../_base_/default_runtime.py']
@@ -333,17 +336,11 @@ test_config = dict(
     test_capacity=test_capacity,
 )
 
-# Copy and construct val config from test config.
-val_config = copy.deepcopy(test_config)
-val_config['test_capacity'] = 100
-
 # In our work we use 8 NVIDIA A100 GPUs.
 data = dict(
     samples_per_gpu=1,
     workers_per_gpu=1,
     train=train_config,
-    # val=test_config,
-    val=val_config,
     test=test_config,
     shuffler_sampler=dict(type='DistributedGroupSampler'),
     nonshuffler_sampler=dict(type='DistributedSampler'),
@@ -357,7 +354,7 @@ grid_config = {
     'dbound': [2.0, 58.0, 0.5],
 }
 
-bev_feat_dim = 64
+bev_feat_dim = 96
 numC_Trans = bev_feat_dim
 
 gn_cfg = dict(type='GN', num_groups=16, requires_grad=True)
@@ -365,16 +362,22 @@ model_cfg = dict(
     use_segmentation_as_query_gt=True,
     use_gmo_bce_loss=True,
     query_gmo_loss_type='focal',
+    # [GUIDE-real] dice off → GUIDE 논문처럼 occupancy 손실은 focal only.
+    use_query_gmo_dice_loss=False,
     query_gt2p_instance_labeled_tau=0.3,
     query_gt2p_cooldown_iters=4000,
-    query_class_ids=query_class_ids,
-    query_class_names=query_class_names,
+    query_class_ids=query_class_ids,           # full raw ids kept for GT loading/validation
+    query_class_names=['background', 'foreground'],
     strict_query_class_id_validation=strict_query_class_id_validation,
-    query_num_classes=len(query_class_ids),
-    query_cls_loss_class_weights=[0.02, 1.4, 1.3, 0.30, 1.4, 1.4, 1.2, 0.9],
+    # [occ 실험] semantic cls를 binary {0=bg, 1=fg}로 통합 (car/truck/... 구분 제거).
+    # query_class_ids는 8개 raw 유지, num_classes만 2, 가중치 2개. raw->compact는 many-to-one.
+    query_cls_binary_fg=True,
+    query_num_classes=2,
+    query_cls_loss_class_weights=[0.05, 1.0],
     query_attn_match_metric='inside_log',
     query_attn_match_cost_weight=0.3,
     query_embed_dim=bev_feat_dim,
+    use_query_dt_loss=False,  # DT loss off: utils_loss.py:3340 branch skipped, loss_query_dt 미생성
     query_id_reinject_scale=0.2,
     query_decor_loss_weight=1.0,
     use_query_attn_bbox_loss=True,
@@ -386,8 +389,11 @@ model_cfg = dict(
     query_num_queries=200,
     query_cls_match_cost_weight=0.2,
     query_center_match_cost_weight=10.0,
-    query_temporal_offset_match_cost_weight=0.5,
+    query_temporal_offset_match_cost_weight=0.0, #0으로 제거
     query_center_routed_loss_weight=0.3,
+    # [past 실험] matched-pair GMO(occupancy)+center loss를 과거3(과거+현재)에만 적용.
+    # 미래4(traj로 민 프레임)는 trajectory loss만 supervise. (efficientocf.py _hist_slice)
+    query_matched_loss_history_only=True,
     # --- trajectory: 2-mode (TRAJECTORY_CONFIG.md / cen10_6) ---
     query_traj_num_modes=2,
     query_traj_use_stationary_mode=True,
@@ -425,42 +431,62 @@ model_cfg = dict(
     query_traj_teacher_forcing_schedule_iters=(),
     query_traj_teacher_forcing_schedule_gt_ratios=(),
     query_matched_gmo_bce_occ_size=(64, 64, 20),
-    query_num_gaussians=16,
-    query_multi_gaussian_offset_max_m=(3.0, 3.0, 0.7),
-    query_multi_gaussian_sigma_min_m=(0.15, 0.15, 0.15),
-    query_multi_gaussian_sigma_max_m=(1.0, 1.0, 1.0),
-    query_multi_gaussian_sigma_reg_loss_weight=0.01,
-    query_multi_gaussian_weight_mode='softplus',
+    query_num_gaussians=48,
+    # [GUIDE-real] α 제거(weight_mode='ones') → (sigma↔weight) degeneracy 소멸 → occ focal이 sigma를
+    # 직접 통제. 그래서 shape bound는 'tight 제약'이 아니라 '폭발 방지 난간'으로 느슨하게 둔다.
+    # sigma_max 2.0→3.0(xy)/0.7→1.5(z): loss가 안에서 깎으므로 풀어줌. sigma_min=voxel(0.2) 바닥.
+    # sigma_reg=0: α 없으니 불필요. offset은 그대로 넉넉(트레일러 커버).
+    # 주의: binary fg라 car~trailer가 이 한 세트 공유 → car IoU/precision + over-coverage 모니터.
+    query_multi_gaussian_offset_max_m=(12.0, 12.0, 2.0),
+    query_multi_gaussian_sigma_min_m=(0.2, 0.2, 0.2),
+    query_multi_gaussian_sigma_max_m=(3.0, 3.0, 1.5),
+    query_multi_gaussian_sigma_reg_loss_weight=0.0,
+    # [GUIDE-real] GUIDE 논문 그대로: weight/opacity 없음. union p = 1 - Π(1 - G), 모든 가우시안
+    # 중심 peak=1. weight_mode='ones'면 weight head 출력 무시하고 weights≡1 (sigmoid opacity 제거).
+    # → weight collapse/몰빵 + (sigma↔weight) degeneracy 동시 소멸. combine_mode='union' 필수.
+    query_multi_gaussian_weight_mode='ones',
+    query_multi_gaussian_occ_combine_mode='union',
+    query_multi_gaussian_softplus_bias_init=0.0,
+    query_multi_gaussian_weight_reg_loss_weight=0.0,
+    # eval도 학습과 동일하게 16개 mixture를 그대로 splat (평균 타원 X). occ_combine_mode=union 적용.
+    query_eval_occ_use_mixture=True,
+    # ===== [임계값 1/2] occ 점유 판정 =====================================
+    # metric + 2D occ-grid + 3D mixture3d 에 공통 적용. config 값=학습·추론 공통.
+    # 추론에서만 env EOCF_EVAL_OCC_THR 주면 그때 override. (fg score는 visualization_cfg)
+    eval_occ_threshold=0.5, # occ 임계값 학습/추론/시각화 공통
 )
 
 debug_cfg = dict(
-    debug_query_vis_every=8,
+    debug_query_vis_every=8,                  # 2D query_debug_vis
     debug_query_cam_gaussian_vis_enabled=True,
-    debug_query_cam_gaussian_vis_every=48,
-    debug_query_inst_depth_lift_vis_every=48,
-    debug_query_attn_softargmax_vis_every=(
-        48
-    ),
+    debug_query_cam_gaussian_vis_every=48,    # cam_gaussian
+    debug_query_mixture3d_vis_every=48,       # 3D mixture3d
 )
 
 visualization_cfg = dict(
-    debug_query_vis_dir="./work_dirs/query_debug_vis_no_pretrain",
-    debug_query_gaussian_vis_mode='prob',
+    # ===== [임계값 2/2] query(fg) score =================================
+    # query 선택 + 2D 표시 + 3D 필터 에 공통 적용. config 값=학습·추론 공통.
+    # 추론에서만 env EOCF_EVAL_FG_THR 주면 그때 override. (occ는 model_cfg의 eval_occ_threshold)
+    debug_query_score_threshold=0.75, # fg 임계값 학습/추론/시각화 공통
+    # fg score '합성' 가중치 (무엇으로 점수를 매길지 결정 → 위 임계값으로 컷).
+    # 이 config는 cls 확률만 사용(iou/cam off). utils_visualization.py:1655
+    #   score = (w_iou*iou + w_cls*cls + w_cam*cam) / (w_iou+w_cls + w_cam)
     debug_query_score_iou_weight=0.0,
     debug_query_score_cls_weight=1.0,
     debug_query_score_cam_attn_weight=0.0,
-    debug_instance_img_vis_dir="./work_dirs/instance_img_debug_vis_no_pretrain",
-    debug_instance_img_vis_max_frames=n_future_frames_plus,
+    # ── 2D query_debug_vis ─────────────────────────────────────────────
+    debug_query_vis_dir="./work_dirs/query_debug_vis_no_pretrain",
+    debug_query_gaussian_vis_mode='prob',     # footprint 렌더 외형(prob heatmap)
+    # ── cam_gaussian ───────────────────────────────────────────────────
     debug_query_cam_gaussian_vis_dir="./work_dirs/query_cam_gaussian_vis_no_pretrain",
     debug_query_cam_gaussian_vis_max_frames=3,
     debug_query_cam_gaussian_vis_gt_overlay_enabled=True,
     debug_query_cam_gaussian_vis_topk_matched=8,
-    debug_gt_alignment_vis_dir="./work_dirs/gt_alignment_vis_no_pretrain",
-    debug_query_inst_depth_lift_vis_dir="./work_dirs/query_inst_depth_lift_vis_no_pretrain",
-    debug_query_inst_depth_lift_vis_max_frames=2,
-    debug_query_inst_depth_lift_vis_max_instances=12,
-    debug_query_attn_softargmax_vis_dir="./work_dirs/query_attn_softargmax_vis_no_pretrain",
-    query_attn_vis_dir="./work_dirs/query_attn_vis_no_pretrain",
+    # ── 3D mixture3d ───────────────────────────────────────────────────
+    debug_query_mixture3d_vis_dir="./work_dirs/query_mixture3d_vis_no_pretrain",
+    debug_query_mixture3d_vis_max_queries=50,
+    debug_query_mixture3d_vis_max_gt_points=40000,
+    debug_query_mixture3d_vis_occ_max_voxels_per_query=4000,
 )
 
 model = dict(
@@ -541,12 +567,6 @@ lr_config = dict(
 
 runner = dict(type='EpochBasedRunner', max_epochs=15)
 checkpoint_config = dict(interval=1, filename_tmpl='epoch_{}_lss_only.pth')
-evaluation = dict(
-    interval=1,
-    pipeline=test_pipeline,
-    save_best='IOU_mean',
-    rule='greater',
-)
 
 # 주의: hook은 매 epoch 시작 시 begin_epoch ≤ 현재 epoch인 "마지막 stage 하나"만 적용함.
 # 따라서 각 stage는 전체 키를 다 들고 있어야 함 (누적 merge 아님).

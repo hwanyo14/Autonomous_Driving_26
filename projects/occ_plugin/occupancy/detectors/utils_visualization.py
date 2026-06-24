@@ -1204,6 +1204,325 @@ class EfficientOCFVisualizationMixin:
             ),
         )
 
+    _QUERY_CLS_NAMES_8 = ("bg", "bicycle", "bus", "car", "constr_veh", "motorcycle", "trailer", "truck")
+
+    def maybe_save_query_mixture_3d_vis(
+        self,
+        query_vis_bundle=None,
+        gt_instance_occ3d_txyz=None,
+        gt_inst_center_world_tn3=None,
+        gt_inst_center_valid_tn=None,
+        gt_inst_cls_n=None,
+        img_metas=None,
+        step: int = 0,
+        occ_threshold: float = None,
+        frame_idx: int = None,
+    ) -> None:
+        vis_every = int(getattr(self, "debug_query_mixture3d_vis_every", 0))
+        if vis_every <= 0:
+            return
+        if (int(step) % vis_every) != 0:
+            return
+        # eval 시각화는 rank별로 서로 다른 샘플을 처리하므로 모든 rank에서 저장(2D viz와 동일 정책).
+        if (not self._is_main_process()) and (not getattr(self, "_eval_vis_all_ranks", False)):
+            return
+        if not isinstance(query_vis_bundle, dict):
+            return
+        if (not torch.is_tensor(gt_instance_occ3d_txyz)) or gt_instance_occ3d_txyz.dim() != 4:
+            return
+        sel_points_tq3 = query_vis_bundle.get("selected_points_tq3", None)
+        if (not torch.is_tensor(sel_points_tq3)) or sel_points_tq3.dim() != 3:
+            return
+        try:
+            import numpy as np
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            from matplotlib import cm
+        except Exception:
+            return
+
+        pc = [float(v) for v in self.point_cloud_range]
+        x_dim, y_dim, z_dim = [int(v) for v in gt_instance_occ3d_txyz.shape[1:4]]
+        vx = (pc[3] - pc[0]) / x_dim
+        vy = (pc[4] - pc[1]) / y_dim
+        vz = (pc[5] - pc[2]) / z_dim
+        # 표시 프레임: 기본은 present(time_receptive_field-1). frame_idx 지정 시 그 프레임
+        # (future 모드는 미래 tail에서 2번째=1 등)을 본다.
+        t_present = max(0, int(getattr(self, "time_receptive_field", 3)) - 1)
+        if frame_idx is not None:
+            t_present = max(0, int(frame_idx))
+
+        # GT instance voxels (present frame) -> world-coordinate scatter points.
+        t_occ = min(t_present, int(gt_instance_occ3d_txyz.shape[0]) - 1)
+        occ = gt_instance_occ3d_txyz[t_occ].detach()
+        occ_idx = torch.nonzero(occ > 0, as_tuple=False)
+        inst_ids = occ[occ_idx[:, 0], occ_idx[:, 1], occ_idx[:, 2]].to(torch.long)
+        max_pts = int(getattr(self, "debug_query_mixture3d_vis_max_gt_points", 40000))
+        if int(occ_idx.shape[0]) > max_pts:
+            stride = -(-int(occ_idx.shape[0]) // max_pts)
+            occ_idx = occ_idx[::stride]
+            inst_ids = inst_ids[::stride]
+        occ_xyz = occ_idx.to(torch.float32).cpu().numpy()
+        occ_xyz[:, 0] = pc[0] + (occ_xyz[:, 0] + 0.5) * vx
+        occ_xyz[:, 1] = pc[1] + (occ_xyz[:, 1] + 0.5) * vy
+        occ_xyz[:, 2] = pc[2] + (occ_xyz[:, 2] + 0.5) * vz
+        occ_colors = cm.tab20((inst_ids.cpu().numpy() % 20) / 19.0)
+
+        # GT centers (present frame) with class labels.
+        gt_centers = None
+        gt_cls = None
+        if torch.is_tensor(gt_inst_center_world_tn3) and gt_inst_center_world_tn3.dim() == 3:
+            t_gt = min(t_present, int(gt_inst_center_world_tn3.shape[0]) - 1)
+            centers_n3 = gt_inst_center_world_tn3[t_gt].detach()
+            valid_n = (
+                gt_inst_center_valid_tn[t_gt].detach().to(torch.bool)
+                if torch.is_tensor(gt_inst_center_valid_tn)
+                and gt_inst_center_valid_tn.dim() == 2
+                and int(gt_inst_center_valid_tn.shape[1]) == int(centers_n3.shape[0])
+                else torch.ones((int(centers_n3.shape[0]),), device=centers_n3.device, dtype=torch.bool)
+            )
+            gt_centers = centers_n3[valid_n].cpu().numpy()
+            if torch.is_tensor(gt_inst_cls_n) and int(gt_inst_cls_n.numel()) == int(centers_n3.shape[0]):
+                gt_cls = gt_inst_cls_n.detach().reshape(-1)[valid_n.cpu()].to(torch.long).cpu().numpy()
+
+        # Selected queries (score-based selection from the bundle), present frame.
+        max_q = int(getattr(self, "debug_query_mixture3d_vis_max_queries", 50))
+        t_q = min(t_present, int(sel_points_tq3.shape[0]) - 1)
+        sel_pts = sel_points_tq3[t_q, :max_q].detach().cpu().numpy()
+        sel_cls = query_vis_bundle.get("selected_pred_cls_q", None)
+        sel_cls = (
+            sel_cls.detach()[:max_q].to(torch.long).cpu().numpy()
+            if torch.is_tensor(sel_cls) else np.zeros((sel_pts.shape[0],), dtype=np.int64)
+        )
+        sel_score = query_vis_bundle.get("selected_score_q", None)
+        sel_score = (
+            sel_score.detach()[:max_q].cpu().numpy()
+            if torch.is_tensor(sel_score) else np.zeros((sel_pts.shape[0],), dtype=np.float32)
+        )
+        sel_idx = query_vis_bundle.get("selected_query_idx_q", None)
+        matched_idx = query_vis_bundle.get("matched_query_idx_q", None)
+        matched_set = (
+            set(int(v) for v in matched_idx.detach().cpu().tolist())
+            if torch.is_tensor(matched_idx) else set()
+        )
+        sel_is_matched = np.array(
+            [int(v) in matched_set for v in sel_idx.detach()[:max_q].cpu().tolist()]
+            if torch.is_tensor(sel_idx) else [False] * sel_pts.shape[0],
+            dtype=bool,
+        )
+
+        mix_centers = query_vis_bundle.get("selected_mixture_centers_tqg3", None)
+        mix_sigmas = query_vis_bundle.get("selected_mixture_sigmas_tqg3", None)
+        mix_yaw = query_vis_bundle.get("selected_mixture_yaw_tqg", None)
+        mix_weights = query_vis_bundle.get("selected_mixture_weights_tqg", None)
+        has_mixture = all(torch.is_tensor(v) for v in (mix_centers, mix_sigmas, mix_yaw, mix_weights))
+        # torch slices (present frame, on-device) kept for GMM occupancy voxelization.
+        mc_t = ms_t = my_t = mw_t = None
+        if has_mixture:
+            t_m = min(t_present, int(mix_centers.shape[0]) - 1)
+            mc_t = mix_centers[t_m, :max_q].detach()
+            ms_t = mix_sigmas[t_m, :max_q].detach()
+            my_t = mix_yaw[t_m, :max_q].detach()
+            mw_t = mix_weights[t_m, :max_q].detach()
+            mix_centers = mc_t.cpu().numpy()
+            mix_sigmas = ms_t.cpu().numpy()
+            mix_yaw = my_t.cpu().numpy()
+            mix_weights = mw_t.cpu().numpy()
+
+        # Common score gate (shared by both rows): keep queries with score >= threshold.
+        # 2D query 선택과 동일한 단일 임계값(config debug_query_score_threshold) + env(EOCF_EVAL_FG_THR)
+        # 사용 → 학습/추론, 2D/3D 모두 같은 score 임계값으로 일관. (옛 debug_query_mixture3d_vis_score_threshold 폐기)
+        import os as _os
+        score_thr = float(_os.environ.get("EOCF_EVAL_FG_THR", getattr(self, "debug_query_score_threshold", 0.5)))
+        keep = sel_score >= score_thr
+        n_before = int(sel_pts.shape[0])
+        sel_pts = sel_pts[keep]
+        sel_cls = sel_cls[keep]
+        sel_score = sel_score[keep]
+        sel_is_matched = sel_is_matched[keep]
+        if has_mixture:
+            keep_t = torch.as_tensor(keep, device=mc_t.device)
+            mc_t, ms_t, my_t, mw_t = mc_t[keep_t], ms_t[keep_t], my_t[keep_t], mw_t[keep_t]
+            mix_centers, mix_sigmas = mix_centers[keep], mix_sigmas[keep]
+            mix_yaw, mix_weights = mix_yaw[keep], mix_weights[keep]
+
+        def _cls_color(cls_id):
+            return cm.tab10((int(cls_id) % 10) / 9.0)
+
+        def _cls_name(cls_id):
+            cls_id = int(cls_id)
+            if 0 <= cls_id < len(self._QUERY_CLS_NAMES_8):
+                return self._QUERY_CLS_NAMES_8[cls_id]
+            return f"c{cls_id}"
+
+        def _ellipsoid_wire(center, sigma, yaw):
+            u = np.linspace(0.0, 2.0 * np.pi, 13)
+            v = np.linspace(0.0, np.pi, 7)
+            xs = np.outer(np.cos(u), np.sin(v)) * sigma[0]
+            ys = np.outer(np.sin(u), np.sin(v)) * sigma[1]
+            zs = np.outer(np.ones_like(u), np.cos(v)) * sigma[2]
+            c, s = np.cos(yaw), np.sin(yaw)
+            return (
+                c * xs - s * ys + center[0],
+                s * xs + c * ys + center[1],
+                zs + center[2],
+            )
+
+        # Bottom-row GMM occupancy: voxelize each kept query's mixture with the model's
+        # own voxelizer and keep voxels with p = 1 - exp(-sum_g w_g * G_g(x)) >= occ_thr.
+        # occ threshold는 평가 metric과 동일한 단일 키(eval_occ_threshold)로 통일.
+        # eval에서는 env(EOCF_EVAL_OCC_THR)로 해석된 값을 occ_threshold 인자로 직접 받는다.
+        occ_thr = (
+            float(occ_threshold)
+            if occ_threshold is not None
+            else float(getattr(self, "eval_occ_threshold", 0.5))
+        )
+        occ_max_vox = int(getattr(self, "debug_query_mixture3d_vis_occ_max_voxels_per_query", 4000))
+        gmm_xyz = np.zeros((0, 3), dtype=np.float32)
+        gmm_colors = np.zeros((0, 4), dtype=np.float32)
+        voxelizer = getattr(self, "voxelizer", None)
+        if (
+            has_mixture and sel_pts.shape[0] > 0 and voxelizer is not None
+            and hasattr(voxelizer, "forward_gaussian_mixture_grouped")
+        ):
+            pts_list, col_list = [], []
+            for q_i in range(int(mc_t.shape[0])):
+                try:
+                    occ_q = voxelizer.forward_gaussian_mixture_grouped(
+                        mixture_centers_world_tkg3=mc_t[q_i][None, None],
+                        mixture_sigmas_world_tkg3=ms_t[q_i][None, None],
+                        mixture_weights_tkg=mw_t[q_i][None, None],
+                        mixture_yaw_tkg=my_t[q_i][None, None],
+                    )
+                except Exception:
+                    continue
+                p_zyx = occ_q[0, 0, 0]  # [D,H,W] = [z,y,x]
+                vox_idx = torch.nonzero(p_zyx >= occ_thr, as_tuple=False)
+                m = int(vox_idx.shape[0])
+                if m == 0:
+                    continue
+                if m > occ_max_vox:
+                    sub = torch.linspace(0, m - 1, occ_max_vox, device=vox_idx.device).round().long()
+                    vox_idx = vox_idx.index_select(0, sub)
+                vox_idx = vox_idx.cpu().numpy()
+                wx = pc[0] + (vox_idx[:, 2].astype(np.float32) + 0.5) * vx
+                wy = pc[1] + (vox_idx[:, 1].astype(np.float32) + 0.5) * vy
+                wz = pc[2] + (vox_idx[:, 0].astype(np.float32) + 0.5) * vz
+                pts_list.append(np.stack([wx, wy, wz], axis=1))
+                col_list.append(np.tile(np.asarray(_cls_color(sel_cls[q_i]))[None, :], (wx.shape[0], 1)))
+            if pts_list:
+                gmm_xyz = np.concatenate(pts_list, axis=0)
+                gmm_colors = np.concatenate(col_list, axis=0)
+
+        # 2 views x 2 rows. Top row: 1-sigma component ellipsoids. Bottom: GMM occ >= occ_thr.
+        # 요청: 중복 뷰 제거(3→2), true-z, 그리고 2D BEV와 방향 일치(azim -60/-90 + y축 반전).
+        views = (
+            ("oblique true-z", 35.0, -60.0, 0.078),
+            ("low side true-z", 8.0, -90.0, 0.078),
+        )
+        n_views = len(views)
+
+        def _finalize(ax, title, elev, azim, z_aspect):
+            ax.set_xlim(pc[0], pc[3])
+            ax.set_ylim(pc[4], pc[1])   # y 반전: 2D BEV(위=Ymin,아래=Ymax)와 일치
+            ax.set_zlim(pc[2], pc[5])
+            ax.set_box_aspect((1.0, 1.0, float(z_aspect)))
+            ax.view_init(elev=elev, azim=azim)
+            ax.set_title(title, fontsize=9)
+
+        try:
+            fig = plt.figure(figsize=(9 * n_views, 18))
+            _CSZ = 45   # 센터 점. 예측=검정(테두리X)/GT=lime(얇은 검은테두리).
+            for view_i, (view_name, elev, azim, z_aspect) in enumerate(views):
+                # ---- TOP row: 1-sigma component ellipsoids ----
+                ax = fig.add_subplot(2, n_views, view_i + 1, projection="3d")
+                if occ_xyz.shape[0] > 0:
+                    # GT는 단일색(요청). 이전엔 객체(instance)별 tab20 → 단일 회색으로.
+                    ax.scatter(
+                        occ_xyz[:, 0], occ_xyz[:, 1], occ_xyz[:, 2],
+                        c="0.6", s=1.5, alpha=0.32, linewidths=0,
+                    )
+                # 센터는 작은 점(모든 뷰 동일): GT=lime, 예측=클래스색, 검은 테두리, 구름 위.
+                if gt_centers is not None and gt_centers.shape[0] > 0:
+                    ax.scatter(
+                        gt_centers[:, 0], gt_centers[:, 1], gt_centers[:, 2],
+                        marker="o", c="lime", s=_CSZ, edgecolors="black",
+                        linewidths=0.8, depthshade=False, zorder=25,
+                    )
+                    if gt_cls is not None and view_i == 0:
+                        for n_i in range(gt_centers.shape[0]):
+                            ax.text(
+                                gt_centers[n_i, 0], gt_centers[n_i, 1], gt_centers[n_i, 2] + 0.5,
+                                _cls_name(gt_cls[n_i]), color="lime", fontsize=6,
+                            )
+                for q_i in range(sel_pts.shape[0]):
+                    q_color = _cls_color(sel_cls[q_i])
+                    ax.scatter(
+                        sel_pts[q_i, 0], sel_pts[q_i, 1], sel_pts[q_i, 2],
+                        c="black", s=_CSZ, marker="o",
+                        edgecolors="none", linewidths=0, depthshade=False, zorder=25,
+                    )
+                    if has_mixture:
+                        w_g = mix_weights[q_i]
+                        ax.scatter(
+                            mix_centers[q_i, :, 0], mix_centers[q_i, :, 1], mix_centers[q_i, :, 2],
+                            c=[q_color], s=3.0 + 18.0 * (w_g / max(float(w_g.max()), 1e-6)),
+                            alpha=0.5, linewidths=0,
+                        )
+                        for g_i in np.argsort(-w_g)[:6]:
+                            ex, ey, ez = _ellipsoid_wire(
+                                mix_centers[q_i, g_i], mix_sigmas[q_i, g_i], mix_yaw[q_i, g_i]
+                            )
+                            ax.plot_wireframe(ex, ey, ez, color=q_color, linewidth=0.4, alpha=0.45)
+                _finalize(ax, f"{view_name} 1σ | iter {int(step)} t={t_occ}", elev, azim, z_aspect)
+
+                # ---- BOTTOM row: GMM occupancy (p >= occ_thr), real mixture density ----
+                ax2 = fig.add_subplot(2, n_views, view_i + 1 + n_views, projection="3d")
+                # GT occ 구름(레퍼런스): 회색이지만 진하게 → 예측과 겹쳐도 형태가 보이게.
+                if occ_xyz.shape[0] > 0:
+                    ax2.scatter(
+                        occ_xyz[:, 0], occ_xyz[:, 1], occ_xyz[:, 2],
+                        c="0.4", s=1.7, alpha=0.45, linewidths=0,
+                    )
+                # 예측 GMM occ: 옅게 → GT가 비쳐 보이도록(색이 너무 세지 않게).
+                if gmm_xyz.shape[0] > 0:
+                    ax2.scatter(
+                        gmm_xyz[:, 0], gmm_xyz[:, 1], gmm_xyz[:, 2],
+                        c=gmm_colors, s=1.4, alpha=0.18, linewidths=0,
+                    )
+                # 센터는 작은 점(구름 위 마지막). GT=lime, 예측=클래스색.
+                if gt_centers is not None and gt_centers.shape[0] > 0:
+                    ax2.scatter(
+                        gt_centers[:, 0], gt_centers[:, 1], gt_centers[:, 2],
+                        marker="o", c="lime", s=_CSZ, edgecolors="black",
+                        linewidths=0.8, depthshade=False, zorder=25,
+                    )
+                for q_i in range(sel_pts.shape[0]):
+                    ax2.scatter(
+                        sel_pts[q_i, 0], sel_pts[q_i, 1], sel_pts[q_i, 2],
+                        marker="o", c="black", s=_CSZ,
+                        edgecolors="none", linewidths=0, depthshade=False, zorder=25,
+                    )
+                _finalize(ax2, f"{view_name} gmm occ≥{occ_thr:g} | iter {int(step)} t={t_occ}", elev, azim, z_aspect)
+            fig.suptitle(
+                f"score≥{score_thr:g}: selected={sel_pts.shape[0]}/{n_before} "
+                f"matched(sel)={int(sel_is_matched.sum())} "
+                f"gt_inst={0 if gt_centers is None else gt_centers.shape[0]} | "
+                f"top=1σ ellipsoid, bottom=gmm occ≥{occ_thr:g}",
+                fontsize=11,
+            )
+            vis_dir = str(getattr(self, "debug_query_mixture3d_vis_dir", "./work_dirs/query_mixture3d_vis"))
+            os.makedirs(vis_dir, exist_ok=True)
+            fig.savefig(
+                os.path.join(vis_dir, f"iter_{int(step):06d}.png"),
+                dpi=120, bbox_inches="tight",
+            )
+        except Exception as exc:
+            print(f"[query_mixture3d_vis] render failed at iter {int(step)}: {exc}")
+        finally:
+            plt.close("all")
+
     def _build_query_visualization_bundle(
         self,
         centers_world_tq3: torch.Tensor,
@@ -1344,7 +1663,9 @@ class EfficientOCFVisualizationMixin:
         selected_candidate_idx = torch.nonzero(fg_mask_q, as_tuple=False).squeeze(1)
         if int(selected_candidate_idx.numel()) > 0:
             candidate_scores = score_q.index_select(0, selected_candidate_idx)
-            keep_thr = candidate_scores >= float(self.debug_query_score_threshold)
+            import os as _os
+            _fg_thr = float(_os.environ.get("EOCF_EVAL_FG_THR", self.debug_query_score_threshold))
+            keep_thr = candidate_scores >= _fg_thr
             selected_candidate_idx = selected_candidate_idx[keep_thr]
 
         if int(selected_candidate_idx.numel()) > 0 and int(self.debug_query_score_topk) > 0:

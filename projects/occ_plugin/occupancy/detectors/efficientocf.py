@@ -94,8 +94,13 @@ class EfficientOCF(
             fill_value=-1,
             dtype=torch.long,
         )
-        for compact_id, raw_id in enumerate(self.query_class_ids):
-            query_raw_to_compact[raw_id] = int(compact_id)
+        if getattr(self, "query_cls_binary_fg", False):
+            # binary fg/bg: bg(query_bg_class)->compact 0, every movable raw id->compact 1
+            for raw_id in self.query_class_ids:
+                query_raw_to_compact[int(raw_id)] = 0 if int(raw_id) == int(self.query_bg_class) else 1
+        else:
+            for compact_id, raw_id in enumerate(self.query_class_ids):
+                query_raw_to_compact[raw_id] = int(compact_id)
         self.register_buffer(
             "query_raw_to_compact_class_map",
             query_raw_to_compact,
@@ -169,9 +174,13 @@ class EfficientOCF(
             query_traj_mode_infer_policy=self.query_traj_mode_infer_policy,
             num_overlap_frames=self.query_overlap_frames,
             num_query_classes=self.query_num_classes,
-            query_class_ids=self.query_class_ids,
-            query_class_names=self.query_class_names,
+            # In binary-fg mode the head is 2-way; pass compact ids/names (the detector keeps
+            # self.query_class_ids = full raw list for GT loading & the raw->compact map).
+            query_class_ids=((0, 1) if getattr(self, "query_cls_binary_fg", False) else self.query_class_ids),
+            query_class_names=(("background", "foreground") if getattr(self, "query_cls_binary_fg", False) else self.query_class_names),
             query_depth_num_bins=self.query_inst_depth_num_bins,
+            query_depth_head_num_layers=self.query_depth_head_num_layers,
+            query_depth_head_hidden_mult=self.query_depth_head_hidden_mult,
             center_out_dim=3,
             offset_out_dim=3,
             num_pcd=256,
@@ -194,8 +203,6 @@ class EfficientOCF(
             debug_vis_dir=self.debug_query_vis_dir,
             center_only_mode=self.center_only_mode,
             debug_query_center_marker_radius=self.debug_query_center_marker_radius,
-            debug_query_confidence_vis_threshold=self.debug_query_confidence_vis_threshold,
-            debug_query_objectness_vis_threshold=self.debug_query_objectness_vis_threshold,
             debug_query_gaussian_vis_mode=self.debug_query_gaussian_vis_mode,
             debug_query_gaussian_prob_threshold=self.debug_query_gaussian_prob_threshold,
             debug_query_gaussian_prob_alpha_scale=self.debug_query_gaussian_prob_alpha_scale)
@@ -213,7 +220,8 @@ class EfficientOCF(
             voxel_size=0.2,
             occ_size=(512, 512, 40),
             as_prob=True,
-            lambda_occ=1.0
+            lambda_occ=1.0,
+            gaussian_combine_mode=self.query_multi_gaussian_occ_combine_mode,
         )
         low_x, low_y, low_z = self.query_matched_gmo_bce_occ_size
         range_x = float(self.point_cloud_range[3] - self.point_cloud_range[0])
@@ -227,6 +235,7 @@ class EfficientOCF(
             lambda_occ=1.0,
             gaussian_truncate_sigma=float(self.voxelizer.gaussian_truncate_sigma),
             gaussian_sigma_floor_vox=float(self.voxelizer.gaussian_sigma_floor_vox),
+            gaussian_combine_mode=self.query_multi_gaussian_occ_combine_mode,
         )
 
         self.n_cam = 6
@@ -1233,6 +1242,863 @@ class EfficientOCF(
         )
 
 
+    def _maybe_save_eval_query_vis(self, pred_occ_prob, gt_inst, centers_world,
+                                   present_idx, cls_scores_qc, bundle, prob_threshold,
+                                   img_metas=None, img_inputs_seq=None,
+                                   future_egomotion=None, instance_img_debug_bundle=None,
+                                   eval_mode="future", centers_future_tq3=None,
+                                   pred_occ_future=None, mix_future=None):
+        """Eval-time query debug visualization (opt-in via EOCF_EVAL_VIS=1).
+
+        Reuses the SAME renderer as training (``query_head.maybe_save_query_debug_vis``)
+        so eval images match the training ``query_debug_vis`` style, but writes to a
+        dedicated dir (``EOCF_EVAL_VIS_DIR``) and gates on a per-sample counter
+        (``EOCF_EVAL_VIS_EVERY``, default 50). Has zero effect on metrics and never
+        raises -- eval must not break on a visualization failure.
+        """
+        import os
+        if os.environ.get("EOCF_EVAL_VIS", "0") != "1":
+            return
+        try:
+            from mmcv.runner import get_dist_info
+            step_local = int(getattr(self, "_eval_vis_step", 0))
+            self._eval_vis_step = step_local + 1
+            every = max(1, int(os.environ.get("EOCF_EVAL_VIS_EVERY", "50")))
+            if (step_local % every) != 0:
+                return
+            head = getattr(self, "query_head", None)
+            if head is None or not hasattr(head, "maybe_save_query_debug_vis"):
+                return
+            vis_dir = os.environ.get("EOCF_EVAL_VIS_DIR", "./work_dirs/eval_vis")
+            os.makedirs(vis_dir, exist_ok=True)
+            qdv_dir = os.path.join(vis_dir, "query_debug_vis")   # 학습과 동일하게 하위폴더로
+            os.makedirs(qdv_dir, exist_ok=True)
+            head.debug_vis_dir = qdv_dir
+            head.debug_vis_every = 1
+            head._eval_vis_all_ranks = True   # cover all sharded ranks, not just rank0
+            self._eval_vis_all_ranks = True   # detector-level viz(mixture3d/attn/cam)도 동일 정책
+            # future도 present처럼 gaussian footprint로 그린다(미래 프레임 mixture 사용).
+            # occ 오버레이는 EOCF_VIS_PRED_STYLE 명시 시에만(기본 OFF).
+            rank, _ = get_dist_info()
+            step = int(rank) * 1000000 + step_local
+            global_idx = self._extract_eval_global_idx(img_metas)
+            if global_idx is not None:
+                step = int(global_idx)
+            pres = int(present_idx)
+            conf = (1.0 - cls_scores_qc[:, int(self.query_bg_class)]).clamp(0.0, 1.0).detach()
+            cls_ids = torch.argmax(cls_scores_qc, dim=-1).detach()
+            # 시각화 프레임을 metric과 동일 기준으로: future면 미래 n_future프레임, present면 현재 1프레임.
+            if str(eval_mode).lower() != "present" and torch.is_tensor(centers_future_tq3) \
+                    and centers_future_tq3.dim() == 3:
+                n_f = int(centers_future_tq3.shape[0])
+                if os.environ.get("EOCF_VIS_DBG", "0") == "1":
+                    _mc = mix_future[0] if isinstance(mix_future, (tuple, list)) else None
+                    _pc = self.point_cloud_range
+                    print(f"[vis_dbg] centers_future {tuple(centers_future_tq3.shape)} "
+                          f"x[{centers_future_tq3[...,0].min():.1f},{centers_future_tq3[...,0].max():.1f}] "
+                          f"y[{centers_future_tq3[...,1].min():.1f},{centers_future_tq3[...,1].max():.1f}] | "
+                          f"pc_range x[{_pc[0]},{_pc[3]}] y[{_pc[1]},{_pc[4]}] | "
+                          f"mix_c {None if _mc is None else tuple(_mc.shape)} "
+                          f"{'' if _mc is None else f'x[{_mc[...,0].min():.1f},{_mc[...,0].max():.1f}] nan={int(torch.isnan(_mc).sum())}'}",
+                          flush=True)
+                pts = centers_future_tq3.detach()                              # [F,Q,3]
+                pred_vis = pred_occ_future.detach() if torch.is_tensor(pred_occ_future) else None
+                gt_vis = self._eval_future_tail(gt_inst).detach() if torch.is_tensor(gt_inst) else None
+                conf_seq = conf.unsqueeze(0).expand(n_f, -1).contiguous()
+                cls_seq = cls_ids.unsqueeze(0).expand(n_f, -1).contiguous()
+                vis_max_frames = n_f
+            else:
+                pts = centers_world[pres:pres + 1].detach()                    # [1,Q,3]
+                pred_vis = pred_occ_prob.detach() if torch.is_tensor(pred_occ_prob) else None
+                gt_vis = gt_inst.detach() if torch.is_tensor(gt_inst) else None
+                conf_seq = conf.unsqueeze(0)
+                cls_seq = cls_ids.unsqueeze(0)
+                vis_max_frames = 1
+            vis_bundle = dict(bundle) if isinstance(bundle, dict) else None
+            if isinstance(vis_bundle, dict):
+                vis_bundle["_skip_traj_rows"] = True
+                if global_idx is not None:
+                    vis_bundle["_filename_prefix"] = "sample"
+            # 2D 전용 bundle: 미래 모드면 present-기반 bundle(receptive 3프레임)과 미래 프레임수가
+            # 안 맞아(_build_query_visualization_bundle이 receptive로 캡) per-frame 데이터를 직접
+            # 미래 centers/mixture로 재구성해 예측 gaussian footprint를 미래 프레임에 그린다.
+            # mixture3d/cam은 present full bundle 그대로 사용.
+            if str(eval_mode).lower() != "present" and vis_max_frames > 1 and isinstance(vis_bundle, dict):
+                bundle_2d = self._build_eval_future_2d_bundle(vis_bundle, pts, mix_future, conf, cls_ids)
+            else:
+                bundle_2d = vis_bundle
+            head.maybe_save_query_debug_vis(
+                pred_occ_prob=pred_vis,
+                gt_occ=None,
+                gt_occ_inst=gt_vis,
+                gt_occ_semantic=None,
+                ignore_index=255,
+                points_world=pts,
+                step=step,
+                max_frames=vis_max_frames,
+                voxel_center_offset=0.5,
+                prob_threshold=float(prob_threshold),
+                pred_layout="zyx",
+                pred_occ_prob_all_obj=pred_vis,
+                points_world_all=pts,
+                point_conf_all=conf_seq,
+                point_class_ids_all=cls_seq,
+                query_vis_bundle=bundle_2d,
+            )
+            # 3D mixture shape vis (학습 viz와 parity). 동일 renderer를 재사용하되 eval 전용
+            # 하위 dir에 저장하고, occ threshold는 metric과 동일한 값(prob_threshold)으로 통일.
+            if torch.is_tensor(gt_inst) and isinstance(vis_bundle, dict):
+                m3d_dir = os.path.join(vis_dir, "query_mixture3d_vis")
+                os.makedirs(m3d_dir, exist_ok=True)
+                self.debug_query_mixture3d_vis_dir = m3d_dir
+                self.debug_query_mixture3d_vis_every = 1
+                self._eval_vis_all_ranks = True
+                # mixture3d도 mode를 따른다: present=present bundle+full gt(present 프레임),
+                # future=future bundle+미래 tail gt(미래 2번째 프레임=frame_idx 1).
+                if str(eval_mode).lower() != "present" and isinstance(bundle_2d, dict) \
+                        and torch.is_tensor(bundle_2d.get("selected_points_tq3", None)):
+                    self.maybe_save_query_mixture_3d_vis(
+                        query_vis_bundle=bundle_2d,
+                        gt_instance_occ3d_txyz=self._eval_future_tail(gt_inst).detach(),
+                        img_metas=img_metas, step=step,
+                        occ_threshold=float(prob_threshold), frame_idx=1,
+                    )
+                else:
+                    self.maybe_save_query_mixture_3d_vis(
+                        query_vis_bundle=vis_bundle,
+                        gt_instance_occ3d_txyz=gt_inst.detach(),
+                        img_metas=img_metas, step=step,
+                        occ_threshold=float(prob_threshold),
+                    )
+            # cam-gaussian vis: instance_img_debug_bundle(이미지/캘리브)이 있어야 함.
+            # enabled/every는 eval에서 강제 ON, 출력 dir만 eval용. 나머지 스타일은 config 그대로.
+            gt_inst_d = gt_inst.detach() if torch.is_tensor(gt_inst) else None
+            if isinstance(instance_img_debug_bundle, dict) and isinstance(vis_bundle, dict):
+                self.debug_query_cam_gaussian_vis_dir = os.path.join(vis_dir, "query_cam_gaussian_vis")
+                os.makedirs(self.debug_query_cam_gaussian_vis_dir, exist_ok=True)
+                self.debug_query_cam_gaussian_vis_enabled = True
+                self.debug_query_cam_gaussian_vis_every = 1
+                self.maybe_save_query_cam_gaussian_vis(
+                    debug_bundle=instance_img_debug_bundle,
+                    query_vis_bundle=vis_bundle,
+                    future_egomotion=future_egomotion,
+                    step=step,
+                    gt_segmentation_instance3d=gt_inst_d,
+                )
+        except Exception as e:
+            print(f"[eval_vis] skipped (err={e})", flush=True)
+
+    @staticmethod
+    def _extract_eval_global_idx(img_metas):
+        if img_metas is None:
+            return None
+        meta = img_metas
+        while isinstance(meta, (list, tuple)) and len(meta) > 0:
+            meta = meta[0]
+        if not isinstance(meta, dict):
+            return None
+        val = meta.get("global_idx", None)
+        if isinstance(val, (list, tuple)) and len(val) > 0:
+            val = val[0]
+        if torch.is_tensor(val):
+            if val.numel() == 0:
+                return None
+            val = val.reshape(-1)[0].item()
+        try:
+            return int(val)
+        except Exception:
+            return None
+
+    def forward_test(self, img_inputs_seq=None, img_metas=None, future_egomotion=None,
+                     segmentation=None, segmentation_bev=None, gt_occ=None, gt_occ_inst=None,
+                     segmentation_instance3d=None, segmentation_cls_instance3d=None,
+                     **kwargs):
+        """Eval entry for the current query-based architecture.
+
+        The legacy multi-frame forecasting eval (pts_bbox_head/flow_head) no
+        longer exists here. We reproduce the model's **actual inference scoring**
+        (the query selection used in the debug visualization, row 3):
+        ``_build_query_visualization_bundle`` -> ``selected_query_idx_q`` applies
+        fg(argmax!=bg) -> score>=threshold -> distance-NMS -> top-k. We render
+        those selected queries over the future trajectory horizon, collapse to
+        BEV, and report movable-object occupancy metrics over the future tail.
+        NOT the legacy IOU_future/VPQ.
+        """
+        return self.simple_test(
+            img_inputs_seq=img_inputs_seq, img_metas=img_metas,
+            future_egomotion=future_egomotion, segmentation_bev=segmentation_bev,
+            gt_occ=gt_occ, gt_occ_inst=gt_occ_inst,
+            segmentation=segmentation, segmentation_instance3d=segmentation_instance3d,
+            segmentation_cls_instance3d=segmentation_cls_instance3d, **kwargs)
+
+    @torch.no_grad()
+    def simple_test(self, img_inputs_seq=None, img_metas=None, future_egomotion=None,
+                    segmentation=None, segmentation_bev=None, gt_occ=None, gt_occ_inst=None,
+                    segmentation_instance3d=None, segmentation_cls_instance3d=None,
+                    **kwargs):
+        import os
+        import numpy as np
+        def _pack(cm):
+            return dict(hist_for_iou=cm,
+                        hist_for_iou_bbox=np.zeros((2, 2), dtype=np.int64),
+                        height_l1=torch.tensor(0.0),
+                        iou_3d=float("nan"), recall_3d=float("nan"))
+        empty = _pack(np.zeros((2, 2), dtype=np.int64))
+
+        # eval 시각화(EOCF_EVAL_VIS=1)일 때만 attn/cam-gaussian용 디버그 산출물도 함께 반환.
+        _eval_vis_on = os.environ.get("EOCF_EVAL_VIS", "0") == "1"
+        feat_out = self.extract_feat_query(
+            img_inputs_seq, img_metas, future_egomotion, voxelize=False,
+            return_query_match_inputs=True,
+            return_instance_img_debug=_eval_vis_on,
+            return_instance_img_debug_fullseq=True,
+            return_query_cam_gaussian_vis_debug=_eval_vis_on)
+        centers_world = feat_out[4]          # [T,Q,3] (voxelizer space)
+        centers_world_traj = feat_out[5]     # [F,Q,3] future trajectory geometry when available
+        sigmas_world = feat_out[2]           # [T,Q,3]
+        cls_scores_qc = feat_out[8]          # [Q,C] (c0=background)
+        traj_mode_idx_q = feat_out[22]
+        present_idx = feat_out[23]
+        mix_c, mix_s, mix_y, mix_w = feat_out[24], feat_out[25], feat_out[26], feat_out[27]
+        sigmas_world_traj = feat_out[28] if len(feat_out) > 28 else None
+        # 미래(trajectory) mixture: future 2D viz의 footprint용. feat_out 인덱스 주의 —
+        # [29]centers/[30]sigmas/[31]yaw/[32]weights (이전에 [30~33]로 잘못 잡아 sigma를 center로
+        # 써서 future footprint가 전부 안 그려졌었음).
+        mix_future = (
+            self._eval_future_tail(feat_out[29]) if len(feat_out) > 29 and torch.is_tensor(feat_out[29]) else None,
+            self._eval_future_tail(feat_out[30]) if len(feat_out) > 30 and torch.is_tensor(feat_out[30]) else None,
+            self._eval_future_tail(feat_out[31]) if len(feat_out) > 31 and torch.is_tensor(feat_out[31]) else None,
+            self._eval_future_tail(feat_out[32]) if len(feat_out) > 32 and torch.is_tensor(feat_out[32]) else None,
+        )
+        eval_instance_img_debug_bundle = feat_out[16]   # cam-gaussian vis용 (이미지/캘리브)
+        if not (torch.is_tensor(centers_world) and torch.is_tensor(cls_scores_qc)
+                and torch.is_tensor(segmentation_bev)):
+            return empty
+        present_idx = int(present_idx) if present_idx is not None else centers_world.shape[0] - 1
+
+        # ---- GT instance-3d (required by the scoring bundle) ----
+        gt_seg_inst3d = self._prepare_segmentation_instance3d(
+            segmentation_instance3d=segmentation_instance3d)
+        gt_bundle = self._prepare_gt_occ_inst_primary_targets(
+            gt_occ_inst=gt_occ_inst, fallback_segmentation_instance3d_txyz=gt_seg_inst3d)
+        gt_inst = gt_bundle.get("dense_inst_txyz", None) if isinstance(gt_bundle, dict) else None
+        if torch.is_tensor(gt_inst):
+            while gt_inst.dim() > 4:
+                gt_inst = gt_inst[0]
+            gt_inst = gt_inst.to(centers_world.device)
+
+        # ---- actual-inference query selection (== debug-vis row-3 scoring) ----
+        sel_idx = None
+        selected_score = None
+        bundle = self._build_query_visualization_bundle(
+            centers_world_tq3=centers_world,
+            query_cls_scores_qc=cls_scores_qc,
+            inst_match_result={},
+            gt_segmentation_instance3d_txyz=gt_inst,
+            gaussian_sigmas_world_tq3=sigmas_world,
+            mixture_centers_world_tqg3=mix_c, mixture_sigmas_world_tqg3=mix_s,
+            mixture_yaw_tqg=mix_y, mixture_weights_tqg=mix_w,
+            traj_mode_idx_q=traj_mode_idx_q, query_attn_cam_score_pack=None)
+        if isinstance(bundle, dict):
+            sel_idx = bundle.get("selected_query_idx_q", None)
+            selected_score = bundle.get("selected_score_q", None)
+
+        # occ 이진화 threshold: config 단일 키(eval_occ_threshold)가 기본, env로 override.
+        thr = float(os.environ.get("EOCF_EVAL_OCC_THR", getattr(self, "eval_occ_threshold", 0.5)))
+        # eval 기준 프레임: present(현재 1프레임) / future(미래 n_future프레임). metric·viz 공통.
+        eval_mode = "present" if self._eval_mode_is_present() else "future"
+        H, W, D = int(self.voxelizer.H), int(self.voxelizer.W), int(self.voxelizer.D)
+        n_sel = int(sel_idx.numel()) if torch.is_tensor(sel_idx) else 0
+        _pred_occ_vis = None
+        pred_occ_eval = None
+        centers_eval_tq3 = self._eval_future_tail(self._pick_tensor(centers_world_traj, centers_world))
+        sigmas_eval_tq3 = self._eval_future_tail(self._pick_tensor(sigmas_world_traj, sigmas_world))
+        if not (torch.is_tensor(centers_eval_tq3) and torch.is_tensor(sigmas_eval_tq3)):
+            return empty
+        if n_sel == 0:
+            pred_bev = torch.zeros((H, W), dtype=torch.bool, device=centers_world.device)
+            pred_occ3d = torch.zeros((D, H, W), dtype=torch.bool, device=centers_world.device)
+            pred_txyz = centers_world.new_zeros(
+                (int(centers_eval_tq3.shape[0]), W, H, D), dtype=torch.bool)
+        else:
+            cen = centers_world[present_idx].index_select(0, sel_idx)        # [S,3]
+            weights_sel = (
+                selected_score.to(device=cen.device, dtype=cen.dtype).reshape(-1)
+                if torch.is_tensor(selected_score) and int(selected_score.numel()) == n_sel
+                else cen.new_ones((n_sel,), dtype=cen.dtype)
+            )
+            cen_eval = centers_eval_tq3.index_select(1, sel_idx)             # [T,S,3]
+            weights_tq = weights_sel.view(1, -1).expand(int(cen_eval.shape[0]), -1).contiguous()
+
+            use_mix = (
+                bool(getattr(self, "query_eval_occ_use_mixture", False))
+                and all(torch.is_tensor(m) for m in (mix_c, mix_s, mix_y, mix_w))
+                and mix_c.dim() == 4
+                and int(mix_c.shape[0]) > int(present_idx)
+                and int(mix_c.shape[1]) == int(centers_world.shape[1])
+            )
+            if use_mix:
+                # eval = 학습과 동일하게 16개 mixture를 그대로 splat (occ_combine_mode 적용, yaw 살림).
+                # 프레임-불변 per-gaussian offset/sigma/yaw/weight를 present mixture에서 뽑아
+                # present 프레임(cen)과 trajectory 프레임(cen_eval) 중심에 각각 얹어 scene으로 누적.
+                off_sg3, sig_sg3, yaw_sg, w_sg = self._eval_select_mixture_params(
+                    present_idx, mix_c, mix_s, mix_y, mix_w, centers_world, sel_idx)
+                pred_occ = self._eval_mixture_scene_occ(
+                    cen.unsqueeze(0), off_sg3, sig_sg3, yaw_sg, w_sg, weights_sel.view(1, -1))
+                pred_occ_eval = self._eval_mixture_scene_occ(
+                    cen_eval, off_sg3, sig_sg3, yaw_sg, w_sg, weights_tq)
+            else:
+                sig = (sigmas_world[present_idx].index_select(0, sel_idx)
+                       if torch.is_tensor(sigmas_world) else None)
+                sig_eval = sigmas_eval_tq3.index_select(1, sel_idx)
+                pred_occ = self.voxelizer(
+                    cen.unsqueeze(0),
+                    sigmas_world=(sig.unsqueeze(0) if torch.is_tensor(sig) else None),
+                    weights=weights_sel.view(1, -1))
+                pred_occ_eval = self.voxelizer(cen_eval, sigmas_world=sig_eval, weights=weights_tq)
+
+            pred_occ3d = (pred_occ[0, 0] > thr)             # [D,H,W] = [Z,Y,X]
+            pred_bev = pred_occ3d.amax(dim=0)               # collapse Z -> [H,W]
+            _pred_occ_vis = pred_occ
+            pred_txyz = (pred_occ_eval[:, 0] > thr).permute(0, 3, 2, 1).contiguous()
+
+        # present 모드: metric을 미래 tail 대신 현재 프레임 기준으로 (pred_txyz=현재 1프레임).
+        if eval_mode == "present":
+            pred_txyz = pred_occ3d.permute(2, 1, 0).unsqueeze(0).contiguous()  # [1,X,Y,Z]
+
+        # ---- eval-time query visualization (opt-in via EOCF_EVAL_VIS) ----
+        self._maybe_save_eval_query_vis(
+            pred_occ_prob=_pred_occ_vis, gt_inst=gt_inst, centers_world=centers_world,
+            present_idx=present_idx, cls_scores_qc=cls_scores_qc, bundle=bundle,
+            prob_threshold=thr, img_metas=img_metas,
+            img_inputs_seq=img_inputs_seq, future_egomotion=future_egomotion,
+            instance_img_debug_bundle=eval_instance_img_debug_bundle,
+            eval_mode=eval_mode, centers_future_tq3=centers_eval_tq3,
+            pred_occ_future=pred_occ_eval, mix_future=mix_future)
+
+        # ---- GT BEV movable occupancy from segmentation_bev ([..,T,Hb,Wb]) ----
+        gt = segmentation_bev
+        while gt.dim() > 3:                  # drop batch -> [T,Hb,Wb]
+            gt = gt[0]
+        gt = (gt > 0).to(pred_bev.device)
+        pred_bev_t = pred_txyz.permute(0, 3, 2, 1).any(dim=1).contiguous()
+
+        # BEV/3D 기하 정렬 (transpose, flipH, flipW): pred 그리드를 GT 방향에 맞춘다. 데이터 그리드가
+        # 같으면 고정값이라 기본값을 쓰고, 한 번 잠근 뒤 모든 샘플에 재사용한다(공정 비교).
+        # env override: EOCF_EVAL_ALIGN="frame,transpose,flipH,flipW" 강제 / "auto" 자동 캘리브레이션.
+        # (frame은 BEV 정렬에 미사용, 호환을 위해 자리만 유지.)
+        align = getattr(self, "_eval_occ_align", None)
+        if align is None:
+            env = os.environ.get("EOCF_EVAL_ALIGN", "").strip().lower()
+            if env == "auto":
+                print(f"[simple_test][diag] #selected={n_sel}/{int(cls_scores_qc.shape[0])} "
+                      f"pred_bev#={int(pred_bev.sum())} pred_shape={tuple(pred_bev.shape)} "
+                      f"gt_shape={tuple(gt.shape)} (thr={thr})", flush=True)
+                align = self._calibrate_eval_bev_align(pred_bev, gt)
+            else:
+                t, tr, fh, fw = [int(x) for x in env.split(",")] if env else (2, 1, 0, 0)
+                align = (t, bool(tr), (fh, fw))
+            self._eval_occ_align = align
+            print(f"[simple_test] BEV align {align}", flush=True)
+        if align is None:
+            return empty
+        _, bev_transpose, bev_flips = align
+        gt_bin_t = self._apply_bev_align_sequence(
+            self._eval_mode_slice(gt), bev_transpose, bev_flips)
+        t_bev = min(int(pred_bev_t.shape[0]), int(gt_bin_t.shape[0]))
+        cm_nusocc = (
+            self._binary_occ_cm(pred_bev_t[:t_bev], gt_bin_t[:t_bev])
+            if t_bev > 0 else np.zeros((2, 2), dtype=np.int64)
+        )
+
+        # ---- extra eval metrics (eval-only; never reached by training) ----
+        # 3D IoU uses nuScenes-Occupancy gt_occ [T,X,Y,Z]. Recall_3d keeps the
+        # legacy bbox-corrected formula, but on real 3D voxels:
+        # (TP + bbox_FP) / (TP + FN + FP - bbox_FP).
+        iou_3d, recall_3d = float("nan"), float("nan")
+        cm_bbox = np.zeros((2, 2), dtype=np.int64)
+        gt_bbox_src = self._eval_bbox_cls_occ_txyz(segmentation_cls_instance3d)
+        if not torch.is_tensor(gt_bbox_src):
+            gt_bbox_src = self._eval_bbox_occ_txyz(
+                segmentation=segmentation,
+                segmentation_instance3d=segmentation_instance3d,
+                gt_occ_inst=gt_occ_inst,
+                fallback_shape=(tuple(gt_occ.shape) if torch.is_tensor(gt_occ) else None),
+            )
+        if torch.is_tensor(gt_bbox_src):
+            gt_bbox_src = gt_bbox_src.to(device=pred_occ3d.device, dtype=torch.long)
+        gt_occ_fg = self._eval_nusocc_3d_fg(gt_occ, device=pred_occ3d.device)
+        gt_occ_valid = self._eval_nusocc_3d_valid(gt_occ, device=pred_occ3d.device)
+        if torch.is_tensor(gt_occ_fg) and gt_occ_fg.dim() == 4:
+            align3d = getattr(self, "_eval_3d_align", None)
+            if align3d is None:
+                align3d = self._calibrate_eval_3d_align(pred_occ3d, gt_occ_fg)
+                self._eval_3d_align = align3d
+            if align3d is not None:
+                t_idx, transpose, fh, fw, fz = align3d
+                gt3d_t = self._apply_3d_align_sequence(
+                    self._eval_mode_slice(gt_occ_fg), transpose, fh, fw, fz)
+                valid3d_t = (
+                    self._apply_3d_align_sequence(self._eval_mode_slice(gt_occ_valid), transpose, fh, fw, fz)
+                    if torch.is_tensor(gt_occ_valid) and gt_occ_valid.dim() == 4 else None
+                )
+                bbox3d_t = None
+                if tuple(gt3d_t.shape[1:]) == tuple(pred_occ3d.shape):
+                    if torch.is_tensor(gt_bbox_src) and gt_bbox_src.dim() == 4:
+                        bbox3d_src_t = self._eval_mode_slice((gt_bbox_src > 0) & (gt_bbox_src != 255))
+                        bbox3d_t = self._apply_3d_align_sequence(
+                            bbox3d_src_t, transpose, fh, fw, fz)
+                        if torch.is_tensor(bbox3d_t):
+                            bbox_bev_t = bbox3d_t.any(dim=1).contiguous()
+                            t_bbox = min(int(pred_bev_t.shape[0]), int(bbox_bev_t.shape[0]))
+                            if t_bbox > 0 and tuple(bbox_bev_t.shape[1:]) == tuple(pred_bev_t.shape[1:]):
+                                cm_bbox = self._binary_occ_cm(
+                                    pred_bev_t[:t_bbox], bbox_bev_t[:t_bbox])
+                    t_eval = min(int(pred_txyz.shape[0]), int(gt3d_t.shape[0]))
+                    if t_eval > 0:
+                        pred_zyx_t = pred_txyz[:t_eval].permute(0, 3, 2, 1).contiguous()
+                        gt3d_t = gt3d_t[:t_eval]
+                        if tuple(pred_zyx_t.shape) == tuple(gt3d_t.shape):
+                            bbox_arg = bbox3d_t[:t_eval] if (
+                                torch.is_tensor(bbox3d_t) and int(bbox3d_t.shape[0]) >= t_eval
+                            ) else None
+                            valid_arg = valid3d_t[:t_eval] if (
+                                torch.is_tensor(valid3d_t) and int(valid3d_t.shape[0]) >= t_eval
+                            ) else None
+                            iou_3d, recall_3d = self._iou_recall_3d(
+                                pred_zyx_t, gt3d_t, bbox3d=bbox_arg, valid3d=valid_arg)
+
+        return dict(hist_for_iou=cm_nusocc, hist_for_iou_bbox=cm_bbox,
+                    height_l1=torch.tensor(0.0),
+                    iou_3d=iou_3d, recall_3d=recall_3d)
+
+    @staticmethod
+    def _binary_occ_cm(pred_bin, gt_bin):
+        import numpy as np
+        p = pred_bin.bool().reshape(-1)
+        g = gt_bin.bool().reshape(-1)
+        tp = int((p & g).sum()); fp = int((p & ~g).sum())
+        fn = int((~p & g).sum()); tn = int((~p & ~g).sum())
+        return np.array([[tn, fp], [fn, tp]], dtype=np.int64)  # [[free],[movable]]
+
+    @staticmethod
+    def _apply_bev_align(gt, t_idx, transpose, flips):
+        g = gt[t_idx]
+        if transpose:
+            g = g.transpose(0, 1)
+        for d, f in enumerate(flips):
+            if f:
+                g = torch.flip(g, dims=[d])
+        return g.contiguous()
+
+    @staticmethod
+    def _apply_bev_align_sequence(gt_txy, transpose, flips):
+        g = gt_txy.transpose(1, 2).contiguous() if transpose else gt_txy
+        for d, f in enumerate(flips):
+            if f:
+                g = torch.flip(g, dims=[d + 1])
+        return g.contiguous()
+
+    def _calibrate_eval_bev_align(self, pred_bev, gt):
+        """One-time geometric calibration in BEV: pick (frame, transpose, flips)
+        maximizing movable IoU vs the rendered present-frame prediction. Locked
+        once and reused for every sample / both checkpoints (same data grid), so
+        the comparison stays fair."""
+        T = int(gt.shape[0])
+        best, best_iou = None, -1.0
+        for t in range(T):
+            base = gt[t]
+            for transpose in (False, True):
+                g0 = base.transpose(0, 1).contiguous() if transpose else base
+                if tuple(g0.shape) != tuple(pred_bev.shape):
+                    continue
+                for fh in (0, 1):
+                    for fw in (0, 1):
+                        g = g0
+                        for d, fl in ((0, fh), (1, fw)):
+                            if fl:
+                                g = torch.flip(g, dims=[d])
+                        inter = float((pred_bev & g).sum())
+                        union = float((pred_bev | g).sum())
+                        iou = inter / union if union > 0 else 0.0
+                        if iou > best_iou:
+                            best_iou, best = iou, (t, transpose, (fh, fw))
+        print(f"[simple_test] calib best BEV movable IoU={best_iou:.4f} at {best}", flush=True)
+        return best
+
+    @staticmethod
+    def _apply_xy_align(b_xy, transpose, flipH, flipW):
+        """Map an [X,Y] BEV array into the pred [H,W]=[Y,X] grid (XY part of the
+        locked 3D alignment)."""
+        b = b_xy.transpose(0, 1) if transpose else b_xy
+        if flipH:
+            b = torch.flip(b, dims=[0])
+        if flipW:
+            b = torch.flip(b, dims=[1])
+        return b.contiguous()
+
+    @staticmethod
+    def _apply_3d_align(fg_txyz, t_idx, transpose, flipH, flipW, flipZ):
+        """Map dense GT [T,X,Y,Z] frame into the pred [D,H,W]=[Z,Y,X] grid."""
+        g = fg_txyz[t_idx].permute(2, 0, 1)          # [X,Y,Z] -> [Z,X,Y]
+        if transpose:
+            g = g.transpose(1, 2)                     # -> [Z,Y,X]
+        if flipZ:
+            g = torch.flip(g, dims=[0])
+        if flipH:
+            g = torch.flip(g, dims=[1])
+        if flipW:
+            g = torch.flip(g, dims=[2])
+        return g.bool().contiguous()
+
+    @staticmethod
+    def _apply_3d_align_sequence(fg_txyz, transpose, flipH, flipW, flipZ):
+        """Map dense GT [T,X,Y,Z] into pred sequence [T,Z,Y,X]."""
+        g = fg_txyz.permute(0, 3, 1, 2)              # [T,X,Y,Z] -> [T,Z,X,Y]
+        if transpose:
+            g = g.transpose(2, 3)                    # -> [T,Z,Y,X]
+        if flipZ:
+            g = torch.flip(g, dims=[1])
+        if flipH:
+            g = torch.flip(g, dims=[2])
+        if flipW:
+            g = torch.flip(g, dims=[3])
+        return g.bool().contiguous()
+
+    def _calibrate_eval_3d_align(self, pred_occ3d, fg_txyz):
+        """One-time 3D calibration: pick (frame, XY-transpose, flipH, flipW,
+        flipZ) maximizing movable 3D IoU vs the rendered present-frame
+        prediction. Locked once and reused for every sample (eval-only)."""
+        T = int(fg_txyz.shape[0])
+        p = pred_occ3d.bool()
+        best, best_iou = None, -1.0
+        for t in range(T):
+            for transpose in (False, True):
+                for fz in (0, 1):
+                    for fh in (0, 1):
+                        for fw in (0, 1):
+                            g = self._apply_3d_align(fg_txyz, t, transpose, fh, fw, fz)
+                            if tuple(g.shape) != tuple(p.shape):
+                                continue
+                            inter = float((p & g).sum())
+                            union = float((p | g).sum())
+                            iou = inter / union if union > 0 else 0.0
+                            if iou > best_iou:
+                                best_iou, best = iou, (t, transpose, fh, fw, fz)
+        if best_iou <= 0.0:
+            # No overlap yet (e.g. empty prediction on this sample) — defer the
+            # lock so the orientation is not fixed from a degenerate sample.
+            return None
+        print(f"[simple_test] calib best 3D movable IoU={best_iou:.4f} at {best}", flush=True)
+        return best
+
+    @staticmethod
+    def _iou_recall_3d(pred3d, gt3d, bbox3d=None, valid3d=None):
+        p = pred3d.bool(); g = gt3d.bool()
+        if torch.is_tensor(valid3d) and tuple(valid3d.shape) == tuple(p.shape):
+            valid = valid3d.bool()
+            p = p & valid
+            g = g & valid
+        tp = float((p & g).sum()); fp = float((p & ~g).sum()); fn = float((~p & g).sum())
+        iou = tp / (tp + fp + fn) if (tp + fp + fn) > 0 else float("nan")
+        bbox_fp = 0.0
+        if torch.is_tensor(bbox3d) and tuple(bbox3d.shape) == tuple(p.shape):
+            bbox_fp = float((p & ~g & bbox3d.bool()).sum())
+        denom = tp + fn + fp - bbox_fp
+        recall = (tp + bbox_fp) / denom if denom > 0 else float("nan")
+        return iou, recall
+
+    def _eval_nusocc_3d_fg(self, gt_occ, device=None):
+        if gt_occ is None:
+            return None
+        if isinstance(gt_occ, (list, tuple)):
+            frames = [x for x in gt_occ if torch.is_tensor(x)]
+            if len(frames) <= 0:
+                return None
+            gt = torch.stack(frames, dim=0)
+        elif torch.is_tensor(gt_occ):
+            gt = gt_occ
+        else:
+            return None
+        while gt.dim() > 4:
+            gt = gt[0]
+        if gt.dim() != 4:
+            return None
+        gt = gt.to(device=device, dtype=torch.long)
+        ids = [
+            int(v) for v in getattr(self, "query_class_ids", ())
+            if int(v) > 0 and int(v) != int(self.query_bg_class)
+        ]
+        if len(ids) <= 0:
+            return (gt > 0) & (gt != 255)
+        mask = torch.zeros_like(gt, dtype=torch.bool)
+        for cls_id in ids:
+            mask |= (gt == int(cls_id))
+        return mask
+
+    @staticmethod
+    def _eval_unwrap_single(x):
+        x = getattr(x, "data", x)
+        while isinstance(x, (list, tuple)) and len(x) == 1:
+            x = getattr(x[0], "data", x[0])
+        return x
+
+    def _eval_tensor_to_txyz(self, x):
+        x = self._eval_unwrap_single(x)
+        if isinstance(x, (list, tuple)):
+            x = [getattr(v, "data", v) for v in x]
+            if len(x) == 0 or not all(torch.is_tensor(v) for v in x):
+                return None
+            x = torch.stack(x, dim=0)
+        if not torch.is_tensor(x):
+            return None
+        if x.dim() == 6 and int(x.shape[0]) == 1 and int(x.shape[2]) == 1:
+            x = x[0, :, 0]
+        elif x.dim() == 5 and int(x.shape[0]) == 1:
+            x = x[0]
+        elif x.dim() == 5 and int(x.shape[1]) == 1:
+            x = x[:, 0]
+        elif x.dim() == 4:
+            pass
+        else:
+            return None
+        return x.to(torch.long).contiguous()
+
+    def _eval_bbox_cls_occ_txyz(self, segmentation_cls_instance3d=None):
+        if segmentation_cls_instance3d is None:
+            return None
+        seg_cls = self._eval_unwrap_single(segmentation_cls_instance3d)
+        if not torch.is_tensor(seg_cls):
+            return None
+        if seg_cls.dim() == 6 and int(seg_cls.shape[0]) == 1 and int(seg_cls.shape[2]) == 2:
+            cls_txyz = seg_cls[0, :, 0].to(torch.long).contiguous()
+        elif seg_cls.dim() == 5 and int(seg_cls.shape[1]) == 2:
+            cls_txyz = seg_cls[:, 0].to(torch.long).contiguous()
+        else:
+            return None
+        cls_txyz = cls_txyz.clone()
+        cls_txyz[cls_txyz == 7] = 0
+        return cls_txyz
+
+    def _eval_bbox_occ_txyz(
+            self,
+            segmentation=None,
+            segmentation_instance3d=None,
+            gt_occ_inst=None,
+            fallback_shape=None,
+        ):
+        out = self._eval_tensor_to_txyz(segmentation_instance3d)
+        if torch.is_tensor(out):
+            return out
+        out = self._eval_tensor_to_txyz(segmentation)
+        if torch.is_tensor(out):
+            return out
+
+        gt_occ_inst_bundle = self._prepare_gt_occ_inst_primary_targets(
+            gt_occ_inst=gt_occ_inst,
+            fallback_segmentation_instance3d_txyz=None,
+        )
+        if isinstance(gt_occ_inst_bundle, dict) and torch.is_tensor(gt_occ_inst_bundle.get("dense_inst_txyz", None)):
+            return gt_occ_inst_bundle["dense_inst_txyz"].to(torch.long).contiguous()
+
+        if fallback_shape is None:
+            return None
+        shape = tuple(int(v) for v in fallback_shape)
+        while len(shape) > 4 and shape[0] == 1:
+            shape = shape[1:]
+        if len(shape) != 4:
+            return None
+        return torch.zeros(shape, dtype=torch.long)
+
+    def _eval_nusocc_3d_valid(self, gt_occ, device=None):
+        if gt_occ is None:
+            return None
+        if isinstance(gt_occ, (list, tuple)):
+            frames = [x for x in gt_occ if torch.is_tensor(x)]
+            if len(frames) <= 0:
+                return None
+            gt = torch.stack(frames, dim=0)
+        elif torch.is_tensor(gt_occ):
+            gt = gt_occ
+        else:
+            return None
+        while gt.dim() > 4:
+            gt = gt[0]
+        if gt.dim() != 4:
+            return None
+        gt = gt.to(device=device, dtype=torch.long)
+        return (gt != 255) & (gt != 7)
+
+    def _eval_future_tail(self, x):
+        target_t = int(self.n_future_frames)
+        if torch.is_tensor(x) and x.dim() > 0 and target_t > 0 and int(x.shape[0]) > target_t:
+            return x[-target_t:].contiguous()
+        return x
+
+    @staticmethod
+    def _eval_mode_is_present():
+        """EOCF_EVAL_MODE: 0=present(현재 1프레임) / 1=future(미래 n_future프레임). 기본 future."""
+        import os
+        return os.environ.get("EOCF_EVAL_MODE", "1").strip().lower() in ("0", "present")
+
+    def _eval_mode_slice(self, x):
+        """present면 현재 프레임 1개, future면 미래 tail n_future개.
+        present 인덱스 = T - n_future - 1 (예: T=7,n_future=4 -> idx 2)."""
+        if self._eval_mode_is_present():
+            if torch.is_tensor(x) and x.dim() > 0:
+                t = int(x.shape[0])
+                pi = max(0, t - int(self.n_future_frames) - 1)
+                return x[pi:pi + 1].contiguous()
+            return x
+        return self._eval_future_tail(x)
+
+    def _build_eval_future_2d_bundle(self, present_bundle, centers_future_tq3, mix_future,
+                                     conf_q=None, cls_ids_q=None):
+        """미래 프레임용 2D query_debug_vis bundle 직접 구성.
+        _build_query_visualization_bundle은 score_frame_count=min(time_receptive_field,...)로
+        receptive(≤3) 프레임만 반환 → 미래4를 못 그림. 그래서 present bundle의 '선택된 query'만
+        미래 centers/mixture로 re-index한 [F,Qsel,...] per-frame 데이터로 새 bundle을 만든다.
+        실패 시 meta 키만 남긴 dict 반환(예측 행 비고 GT만 표시)."""
+        meta_only = {k: v for k, v in present_bundle.items() if str(k).startswith("_")}
+        sel_idx = present_bundle.get("selected_query_idx_q", None)
+        if (not torch.is_tensor(sel_idx)) or int(sel_idx.numel()) == 0:
+            return meta_only
+        if (not isinstance(mix_future, (tuple, list))) or len(mix_future) != 4:
+            return meta_only
+        mc, ms, my, mw = mix_future
+        if not all(torch.is_tensor(t) for t in (centers_future_tq3, mc, ms, my, mw)):
+            return meta_only
+        sel = sel_idx.to(dtype=torch.long, device=centers_future_tq3.device)
+
+        def _isel(x):  # [F,Q,...] -> [F,Qsel,...]
+            return x.index_select(1, sel).detach() if torch.is_tensor(x) and x.dim() >= 2 else None
+
+        pts_sel = _isel(centers_future_tq3)
+        mc_s, ms_s, my_s, mw_s = _isel(mc), _isel(ms), _isel(my), _isel(mw)
+        if pts_sel is None or mc_s is None:
+            return meta_only
+        score_q = present_bundle.get("selected_score_q", None)
+        cls_q = present_bundle.get("selected_pred_cls_q", None)
+        fb = dict(meta_only)
+        # selected(hi 행) = 선택된 query만.
+        fb["selected_points_tq3"] = pts_sel
+        fb["selected_mixture_centers_tqg3"] = mc_s
+        fb["selected_mixture_sigmas_tqg3"] = ms_s
+        fb["selected_mixture_yaw_tqg"] = my_s
+        fb["selected_mixture_weights_tqg"] = mw_s
+        fb["selected_score_q"] = score_q
+        fb["selected_pred_cls_q"] = cls_q
+        # candidate(all 행) = 전체 fg query(background 제외) — present처럼 임계값 못 넘은 저신뢰까지 다 표시.
+        cand_idx = None
+        if torch.is_tensor(cls_ids_q) and torch.is_tensor(conf_q):
+            cand_idx = (cls_ids_q.to(device=sel.device) != int(self.query_bg_class)).nonzero(as_tuple=False).reshape(-1)
+        if torch.is_tensor(cand_idx) and int(cand_idx.numel()) > 0:
+            def _ic(x):
+                return x.index_select(1, cand_idx).detach() if torch.is_tensor(x) and x.dim() >= 2 else None
+            fb["candidate_points_tq3"] = _ic(centers_future_tq3)
+            fb["candidate_mixture_centers_tqg3"] = _ic(mc)
+            fb["candidate_mixture_sigmas_tqg3"] = _ic(ms)
+            fb["candidate_mixture_yaw_tqg"] = _ic(my)
+            fb["candidate_mixture_weights_tqg"] = _ic(mw)
+            fb["candidate_score_q"] = conf_q.index_select(0, cand_idx).detach()
+            fb["candidate_pred_cls_q"] = cls_ids_q.index_select(0, cand_idx).detach()
+        else:  # fallback: candidate=selected
+            for k in ("points_tq3", "mixture_centers_tqg3", "mixture_sigmas_tqg3",
+                      "mixture_yaw_tqg", "mixture_weights_tqg", "score_q", "pred_cls_q"):
+                fb[f"candidate_{k}"] = fb[f"selected_{k}"]
+        fb["selected_query_idx_q"] = sel
+        # footprint 표시 게이트: score_thr 키가 없으면 렌더러가 기본 0.5로 다 걸러서 미래 예측이
+        # 안 보였음(present는 이미 선택된 query라 0으로 표시). 선택된 query는 다 보이게 0으로.
+        fb["score_thr"] = 0.0
+        for k in ("top_k", "w_iou", "w_cls", "w_cam", "distance_nms_radius_m"):
+            if k in present_bundle:
+                fb[k] = present_bundle[k]
+        return fb
+
+    def _eval_select_mixture_params(self, present_idx, mix_c, mix_s, mix_y, mix_w,
+                                    centers_world, sel_idx):
+        """Pull frame-invariant per-gaussian mixture params for the selected queries.
+
+        Per-gaussian offsets are recovered from the present-frame mixture
+        (mix_c[pi] = center[pi] + offset, so offset = mix_c[pi] - center[pi]); these,
+        together with the (frame-invariant) sigmas/yaws/weights, can be re-centered on
+        any frame's query centers. Returns (off_sg3 [S,G,3], sig_sg3 [S,G,3],
+        yaw_sg [S,G], w_sg [S,G]).
+        """
+        pi = int(present_idx)
+        off_qg3 = mix_c[pi] - centers_world[pi].unsqueeze(1)        # [Q,G,3]
+        off_sg3 = off_qg3.index_select(0, sel_idx).contiguous()
+        sig_sg3 = mix_s[pi].index_select(0, sel_idx).contiguous()
+        yaw_sg = mix_y[pi].index_select(0, sel_idx).contiguous()
+        w_sg = mix_w[pi].index_select(0, sel_idx).contiguous()
+        return off_sg3, sig_sg3, yaw_sg, w_sg
+
+    def _eval_mixture_scene_occ(self, centers_frames_ts3, off_sg3, sig_sg3, yaw_sg, w_sg,
+                                pair_w_ts):
+        """Re-center the per-gaussian mixture on each frame's query centers and splat the
+        whole mixture into one scene occupancy volume [T,1,D,H,W] (union over queries).
+        ``centers_frames_ts3`` is [T,S,3] (present or trajectory-propagated centers).
+        """
+        T = int(centers_frames_ts3.shape[0])
+        cen_tsg3 = centers_frames_ts3.unsqueeze(2) + off_sg3.unsqueeze(0)   # [T,S,G,3]
+        sig_tsg3 = sig_sg3.unsqueeze(0).expand(T, -1, -1, -1)
+        yaw_tsg = yaw_sg.unsqueeze(0).expand(T, -1, -1)
+        w_tsg = w_sg.unsqueeze(0).expand(T, -1, -1)
+        return self.voxelizer.forward_gaussian_mixture_scene(
+            cen_tsg3, sig_tsg3, w_tsg, yaw_tsg, pair_weights_tq=pair_w_ts)
+
+    @staticmethod
+    def _bbox_aabb_bev_from_inst(inst_txyz, t_idx):
+        """Per-instance axis-aligned XY bbox (filled) at frame t, in the instance
+        grid's [X,Y] convention. Returns bool [X,Y] or None."""
+        if (not torch.is_tensor(inst_txyz)) or inst_txyz.dim() != 4:
+            return None
+        inst = inst_txyz[t_idx].to(torch.long)         # [X,Y,Z]
+        fg = (inst > 0) & (inst != 255)
+        bbox = torch.zeros(inst.shape[:2], dtype=torch.bool, device=inst.device)
+        if not bool(fg.any()):
+            return bbox
+        for iid in torch.unique(inst[fg]).tolist():
+            m = (inst == int(iid)).any(dim=2)          # [X,Y] footprint
+            nz = torch.nonzero(m, as_tuple=False)
+            if nz.numel() == 0:
+                continue
+            x0, x1 = int(nz[:, 0].min()), int(nz[:, 0].max())
+            y0, y1 = int(nz[:, 1].min()), int(nz[:, 1].max())
+            bbox[x0:x1 + 1, y0:y1 + 1] = True
+        return bbox
+
+    @staticmethod
+    def _bbox_aabb_3d_from_inst(inst_txyz, t_idx):
+        """Per-instance axis-aligned XYZ bbox volume at frame t, in [X,Y,Z]."""
+        if (not torch.is_tensor(inst_txyz)) or inst_txyz.dim() != 4:
+            return None
+        inst = inst_txyz[int(t_idx)].to(torch.long)
+        fg = (inst > 0) & (inst != 255)
+        bbox = torch.zeros_like(fg, dtype=torch.bool)
+        if not bool(fg.any()):
+            return bbox
+        for iid in torch.unique(inst[fg]).tolist():
+            m = (inst == int(iid))
+            nz = torch.nonzero(m, as_tuple=False)
+            if nz.numel() == 0:
+                continue
+            x0, x1 = int(nz[:, 0].min()), int(nz[:, 0].max())
+            y0, y1 = int(nz[:, 1].min()), int(nz[:, 1].max())
+            z0, z1 = int(nz[:, 2].min()), int(nz[:, 2].max())
+            bbox[x0:x1 + 1, y0:y1 + 1, z0:z1 + 1] = True
+        return bbox
+
+    @staticmethod
+    def _bbox_aabb_3d_sequence_from_inst(inst_txyz):
+        """Per-instance axis-aligned XYZ bbox volume for every frame, [T,X,Y,Z]."""
+        if (not torch.is_tensor(inst_txyz)) or inst_txyz.dim() != 4:
+            return None
+        frames = []
+        for t_idx in range(int(inst_txyz.shape[0])):
+            frames.append(EfficientOCF._bbox_aabb_3d_from_inst(inst_txyz, t_idx))
+        return torch.stack(frames, dim=0) if len(frames) > 0 else None
+
     def forward_train(self,
             img_inputs_seq=None,
             segmentation=None,
@@ -1892,9 +2758,27 @@ class EfficientOCF(
             loss_weight=float(self.query_depth_loss_weight),
             label_smoothing=float(self.query_depth_label_smoothing),
         )
+        # When query_matched_loss_history_only is set, restrict the matched-pair
+        # GMO(occupancy) + center losses to the receptive-field (past+present)
+        # frames [0:time_receptive_field]; the trajectory loss alone supervises
+        # the future horizon. Only valid on the 7-frame timeline, where frames
+        # [0:T_rf] are the real lifted history and [T_rf:] are traj-rolled copies.
+        _matched_hist_only = bool(self.query_matched_loss_history_only) and bool(use_full7_temporal_sup)
+        _matched_hist_n = int(self.time_receptive_field)
+
+        def _hist_slice(t):
+            if (
+                _matched_hist_only
+                and torch.is_tensor(t)
+                and t.dim() >= 1
+                and int(t.shape[0]) > _matched_hist_n
+            ):
+                return t[:_matched_hist_n].contiguous()
+            return t
+
         if self.use_query_inst_center_match_loss:
             center_match_loss = self._compute_query_center_match_loss_from_match(
-                centers_world_tq3=centers_world_match_tq3,
+                centers_world_tq3=_hist_slice(centers_world_match_tq3),
                 inst_match_result=inst_match_result,
                 loss_weight=float(self.query_center_routed_loss_weight),
                 loss_type=self.query_center_match_loss_type,
@@ -2113,13 +2997,13 @@ class EfficientOCF(
             and torch.is_tensor(match_gt_instance_occ3d_txyz)
         ):
             matched_gmo_loss = self._compute_matched_pair_gmo_losses(
-                centers_world_tq3=centers_world_match_tq3,
-                sigmas_world_tq3=gaussian_sigmas_world_match_tq3,
-                mixture_centers_world_tqg3=mixture_centers_world_match_tqg3,
-                mixture_sigmas_world_tqg3=mixture_sigmas_world_match_tqg3,
-                mixture_yaw_tqg=mixture_yaw_match_tqg,
-                mixture_weights_tqg=mixture_weights_match_tqg,
-                gt_instance_occ3d_txyz_pred=match_gt_instance_occ3d_txyz,
+                centers_world_tq3=_hist_slice(centers_world_match_tq3),
+                sigmas_world_tq3=_hist_slice(gaussian_sigmas_world_match_tq3),
+                mixture_centers_world_tqg3=_hist_slice(mixture_centers_world_match_tqg3),
+                mixture_sigmas_world_tqg3=_hist_slice(mixture_sigmas_world_match_tqg3),
+                mixture_yaw_tqg=_hist_slice(mixture_yaw_match_tqg),
+                mixture_weights_tqg=_hist_slice(mixture_weights_match_tqg),
+                gt_instance_occ3d_txyz_pred=_hist_slice(match_gt_instance_occ3d_txyz),
                 objectness_scores_tq=None,
                 inst_match_result=inst_match_result,
                 loss_weight=0.1,
@@ -2227,7 +3111,7 @@ class EfficientOCF(
                 # 7 frames: time_receptive_field (past+present) + n_future_frames.
                 max_frames=int(self.time_receptive_field) + int(self.n_future_frames),
                 voxel_center_offset=0.5,
-                prob_threshold=0.5,
+                prob_threshold=float(getattr(self, "eval_occ_threshold", 0.5)),
                 pred_layout="zyx",
                 pred_occ_prob_pos_obj=None,
                 pred_occ_prob_all_obj=pred_occ.detach() if pred_occ is not None else None,
@@ -2235,6 +3119,16 @@ class EfficientOCF(
                 point_conf_all=query_conf_scores_tq.detach(),
                 point_class_ids_all=query_cls_pred_tq.detach(),
                 query_vis_bundle=query_vis_bundle,
+            )
+        with torch.no_grad():
+            self.maybe_save_query_mixture_3d_vis(
+                query_vis_bundle=query_vis_bundle,
+                gt_instance_occ3d_txyz=gt_instance_occ3d_txyz_query_vis,
+                gt_inst_center_world_tn3=gt_inst_center_world_full_tn3,
+                gt_inst_center_valid_tn=gt_inst_center_valid_full_tn,
+                gt_inst_cls_n=gt_inst_cls_full_n,
+                img_metas=img_metas,
+                step=cur_train_iter,
             )
         self.maybe_save_instance_img_debug(
             debug_bundle=instance_img_debug_bundle,

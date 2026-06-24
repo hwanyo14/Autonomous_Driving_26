@@ -489,6 +489,7 @@ class EfficientOCFLyftDataset(Dataset):
         
         input_seq_data.update(
             dict(
+                global_idx=int(index),
                 time_receptive_field=self.time_receptive_field,
                 sequence_length=self.sequence_length,
                 egopose_list=self.egopose_list,
