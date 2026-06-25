@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-06-25 KST — shape_guide_128_dice_weight 신규 config: opacity 부활(weight_mode 'ones'→'sigmoid')
+
+- **배경**: 실행 중인 `shape_guide_128_dice` 로그 분석 → `loss_gmo_dice`가 iter 1부터 0.49→0.46으로 **평탄**(657 iter 평균 0.467, 기울기 ~0). over-spread equilibrium에 갇힘. 원인 진단: `weight_mode='ones'`(48개 가우시안 always-on, opacity off-switch 없음) + union이라, FP를 줄이는 길이 "sigma 축소"뿐 → 줄이면 FN(gap) 발생 → 적당히 퍼진 blob이 tversky 최소점.
+- **변경**([shape_guide_128_dice_weight.py](projects/configs/baselines/shape_guide_128_dice_weight.py), 128_dice 복사본): **단일변수** `query_multi_gaussian_weight_mode='ones'→'sigmoid'` 한 줄만 변경. union p=1−Π(1−α·G)에서 α=sigmoid(logit)∈[0,1]가 per-gaussian opacity → α→0으로 잉여 blob OFF 가능. tversky FP항(α=0.7)이 그 압력 제공.
+- **유지(미변경)**: `occ_combine_mode='union'`(sigmoid 필수쌍, 이미 union이라 단일변수 성립), `sigma_reg=0`, `weight_reg=0`(sparsity는 tversky에 위임), `softplus_bias_init=0.0`(→초기 α=0.5). offset_max=12/sigma_max=3 등 제한값 동일.
+- **trade-off/주의**: opacity 부활로 (sigma↔weight) degeneracy 복귀 → sigma 폭주 시 sigma_reg 소량 켜는 것 고려. 관련 주석 3곳(loss 헤더/sigma 블록/weight 블록) 현실에 맞게 갱신.
+- **영향 범위**: `efficientocf_config.py` 미변경(새 인자 아님, baseline override 값만 변경). 실행 중인 dice 런 무관(새 런부터 적용).
+
 ## 2026-06-25 KST — eval 3D mixture vis 전용 해상도 키 신설 (eval=512³ GT/metric 일치, train=128 유지)
 
 - **문제**: 3D `mixture3d` vis가 train·eval 모두 `matched_gmo_voxelizer`(128, 0.8m)를 써서 그림. 그런데 eval **메트릭**은 `self.voxelizer`(512³, 0.2m)로 계산 → 같은 eval 런서 점수(0.2m)와 cube(0.8m) 해상도 불일치.

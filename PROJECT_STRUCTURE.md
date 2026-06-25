@@ -39,6 +39,8 @@
 │   │   ├── baselines/
 │   │   │   ├── shape_guide.py  # 현재 주력 config; semantic cls를 binary {0=bg,1=fg}로 통합한 shape-guide 실험 설정
 │   │   │   ├── shape_guide_128.py  # shape_guide 변형; 학습 occ-loss 격자를 128x128x20으로 올린 실험 설정
+│   │   │   ├── shape_guide_128_dice.py  # 128 변형; occ에 dice(tversky FP-heavy) 추가, weight_mode='ones'(opacity 없음)
+│   │   │   ├── shape_guide_128_dice_weight.py  # 128_dice에서 weight_mode='sigmoid'(opacity 부활)만 바꾼 단일변수 실험
 │   │   │   └── test.py  # 평가용 config (test pipeline/dataset 설정)
 │   │   └── datasets/
 │   │       └── custom_nus-3d.py  # MMDet3D 기반 nuScenes 3D dataset/pipeline 기본 템플릿
