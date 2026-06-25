@@ -1,5 +1,40 @@
 # Changelog
 
+## 2026-06-23 17:17 KST
+
+### GMO quality bbox-vs-fine voxel alignment 시각화 추가
+
+- `utils_visualization.py`: bbox 기반 dense instance GT와 fine instance voxel GT의 BEV 정합을 frame별 PNG로 저장하는 `maybe_save_gmo_quality_alignment_vis` 추가. 각 PNG는 bbox GT, fine voxel GT, overlap/diff 3개 panel을 포함함.
+- `efficientocf.py`: matched GMO filtering에 쓰이는 동일 temporal slice를 시각화 함수에 전달. 모든 frame을 `gmo_quality_alignment_vis/iter_xxx_scene_lidar/frame_txx.png`로 저장함.
+- `efficientocf_config.py`, `test_traj_large_adj_lr.py`, `mmdet_train.py`: `debug_gmo_quality_alignment_vis_every` 및 전용 저장 dir 설정 추가. `train_total.sh` 기준 main config에서는 매 iteration 저장되도록 `1`로 활성화.
+- 검증: 대상 파일 `py_compile`, `git diff --check`, synthetic PNG 저장 테스트 통과.
+
+## 2026-06-23 17:08 KST
+
+### GMO quality TensorBoard 로그 누락 수정
+
+- `utils_loss.py`: `_aggregate_training_losses`의 debug key 삭제 필터에서 `dbg_gmo_quality_*` prefix를 허용하도록 수정. `train_total.sh`의 `TensorboardLoggerHookSplitTabs` 경로에서 `dbg/gmo_quality_scene_pass_object_count`가 기록되도록 함.
+- 원인: matched GMO quality debug 값은 생성됐지만 aggregation 마지막 단계에서 whitelist되지 않아 TensorBoard hook까지 전달되지 않았음.
+- 검증: `utils_loss.py`, `test_traj_large_adj_lr.py`, `tensorboard_hooks.py` `py_compile` 및 `git diff --check` 통과.
+
+## 2026-06-23 17:01 KST
+
+### Matched GMO quality filter main config 반영 및 scene count 로그 추가
+
+- `test_traj_large_adj_lr.py`: 실제 사용 config에 `use_query_gmo_quality_filter=True`, ROI 30m, occupancy ratio 0.4 설정 적용.
+- `EfficientOCF_V1.1_1gpu.py`: 이전에 추가했던 quality filter 활성화 설정 제거.
+- `utils_loss.py`: 필터를 모두 통과한 현재 scene/sample의 object 수를 `dbg_gmo_quality_scene_pass_object_count`로 추가. 기존 TensorBoard hook에서 `dbg/gmo_quality_scene_pass_object_count` scalar로 기록됨.
+- 검증: 대상 파일 `py_compile`, quality-mask synthetic test, zero-pass scene count test, `git diff --check` 통과.
+
+## 2026-06-23 16:55 KST
+
+### Matched GMO quality filter 추가
+
+- `utils_loss.py`: Hungarian matched GMO focal/BCE/dice loss 전에 pair-level quality filter를 추가. 현재 frame 기준 ROI 30m 이내이고 fine GT instance voxel / bbox instance voxel 비율이 설정 threshold 이상인 pair만 loss에 사용함.
+- `efficientocf.py`: matched GMO loss 호출부에 bbox 기반 dense instance GT와 현재-frame index를 전달.
+- `efficientocf_config.py`, `EfficientOCF_V1.1_1gpu.py`: `use_query_gmo_quality_filter`, `query_gmo_quality_roi_radius_m`, `query_gmo_quality_min_occupancy_ratio` 설정 추가. baseline은 30m / 0.4 기준으로 활성화.
+- 검증: 대상 파일 `py_compile`, `git diff --check`, `eo` 환경 synthetic quality-mask 테스트 통과.
+
 ## 2026-06-23 13:51 KST
 
 ### QueryDepthHead depth supervision soft label CE 전환

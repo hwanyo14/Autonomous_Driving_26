@@ -86,7 +86,7 @@ else:
     num_cls = 2
     query_num_classes = 2
     query_cls_names = ['background', 'foreground']
-    query_cls_loss_class_weights = [0.2, 1.0]
+    query_cls_loss_class_weights = [0.1, 1.0]
 
 img_norm_cfg = None
 
@@ -374,6 +374,9 @@ model_cfg = dict(
     use_segmentation_as_query_gt=True,
     use_gmo_bce_loss=True,
     query_gmo_loss_type='focal',
+    use_query_gmo_quality_filter=True,
+    query_gmo_quality_roi_radius_m=30.0,
+    query_gmo_quality_min_occupancy_ratio=0.1,
     query_gt2p_instance_labeled_tau=0.3,
     query_gt2p_cooldown_iters=4000,
     use_separate_classes=use_separate_classes,
@@ -412,9 +415,9 @@ model_cfg = dict(
     query_traj_teacher_forcing_until_iter=0,
     query_matched_gmo_bce_occ_size=(64, 64, 20),
     query_num_gaussians=16,
-    query_multi_gaussian_offset_max_m=(3.0, 3.0, 0.7),
+    query_multi_gaussian_offset_max_m=(5.0, 5.0, 1.5),
     query_multi_gaussian_sigma_min_m=(0.15, 0.15, 0.15),
-    query_multi_gaussian_sigma_max_m=(1.0, 1.0, 1.0),
+    query_multi_gaussian_sigma_max_m=(1.5, 1.5, 1.5),
     query_multi_gaussian_sigma_reg_loss_weight=0.01,
     query_multi_gaussian_weight_mode='softplus',
     query_inst_depth_num_bins=112,
@@ -424,6 +427,7 @@ debug_cfg = dict(
     debug_query_vis_every=8,
     debug_query_cam_gaussian_vis_enabled=True,
     debug_query_cam_gaussian_vis_every=48,
+    debug_gmo_quality_alignment_vis_every=0,
     debug_query_inst_depth_lift_vis_every=48,
     debug_query_attn_softargmax_vis_every=(
         48
@@ -443,6 +447,7 @@ visualization_cfg = dict(
     debug_query_cam_gaussian_vis_gt_overlay_enabled=True,
     debug_query_cam_gaussian_vis_topk_matched=8,
     debug_gt_alignment_vis_dir="./work_dirs/gt_alignment_vis_no_pretrain",
+    debug_gmo_quality_alignment_vis_dir="./work_dirs/gmo_quality_alignment_vis_no_pretrain",
     debug_query_inst_depth_lift_vis_dir="./work_dirs/query_inst_depth_lift_vis_no_pretrain",
     debug_query_inst_depth_lift_vis_max_frames=2,
     debug_query_inst_depth_lift_vis_max_instances=12,

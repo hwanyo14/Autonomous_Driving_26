@@ -208,6 +208,179 @@ class EfficientOCFVisualizationMixin:
         img.save(os.path.join(vis_dir, out_name))
 
     @staticmethod
+    def _bev_mask_from_instance_txyz(frame_xyz):
+        if (not torch.is_tensor(frame_xyz)) or frame_xyz.dim() != 3:
+            return None
+        return torch.any((frame_xyz.to(torch.long) > 0) & (frame_xyz.to(torch.long) != 255), dim=2)
+
+    @staticmethod
+    def _bev_mask_for_ids(frame_xyz, instance_ids):
+        if (
+            (not torch.is_tensor(frame_xyz))
+            or frame_xyz.dim() != 3
+            or (not torch.is_tensor(instance_ids))
+            or int(instance_ids.numel()) <= 0
+        ):
+            return None
+        out = torch.zeros(frame_xyz.shape[:2], device=frame_xyz.device, dtype=torch.bool)
+        frame = frame_xyz.to(torch.long)
+        for iid in instance_ids.to(device=frame.device, dtype=torch.long).reshape(-1).tolist():
+            out = out | torch.any(frame == int(iid), dim=2)
+        return out
+
+    @torch.no_grad()
+    def maybe_save_gmo_quality_alignment_vis(
+        self,
+        fine_instance_occ3d_txyz=None,
+        bbox_instance_occ3d_txyz=None,
+        inst_match_result=None,
+        img_metas=None,
+        step: int = 0,
+        present_idx: int = 0,
+    ) -> None:
+        vis_every = int(getattr(self, "debug_gmo_quality_alignment_vis_every", 0))
+        if vis_every <= 0:
+            return
+        if (int(step) % vis_every) != 0:
+            return
+        if not self._is_main_process():
+            return
+
+        fine_txyz = self._normalize_dense_txyz(fine_instance_occ3d_txyz)
+        bbox_txyz = self._normalize_dense_txyz(bbox_instance_occ3d_txyz)
+        if fine_txyz is None or bbox_txyz is None:
+            return
+        t_all = min(int(fine_txyz.shape[0]), int(bbox_txyz.shape[0]))
+        if t_all <= 0:
+            return
+        fine_txyz = fine_txyz[:t_all]
+        bbox_txyz = bbox_txyz[:t_all]
+        pidx = max(0, min(int(present_idx), t_all - 1))
+
+        pass_ids = fine_txyz.new_empty((0,), dtype=torch.long)
+        if isinstance(inst_match_result, dict):
+            matched_query_idx = inst_match_result.get("matched_query_idx", None)
+            matched_inst_idx = inst_match_result.get("matched_inst_idx", None)
+            gt_ids_n = inst_match_result.get("gt_ids_n", None)
+            gt_valid_tn = inst_match_result.get("gt_valid_tn", None)
+            gt_centers_tn3 = inst_match_result.get("gt_centers_tn3", None)
+            if (
+                torch.is_tensor(matched_query_idx)
+                and torch.is_tensor(matched_inst_idx)
+                and torch.is_tensor(gt_ids_n)
+                and int(matched_query_idx.numel()) > 0
+                and int(matched_query_idx.numel()) == int(matched_inst_idx.numel())
+                and int(gt_ids_n.numel()) > 0
+            ):
+                mq = matched_query_idx.to(device=fine_txyz.device, dtype=torch.long).reshape(-1)
+                mi = matched_inst_idx.to(device=fine_txyz.device, dtype=torch.long).reshape(-1)
+                gt_ids = gt_ids_n.to(device=fine_txyz.device, dtype=torch.long).reshape(-1)
+                keep = (mq >= 0) & (mi >= 0) & (mi < int(gt_ids.numel()))
+                if bool(keep.any().item()):
+                    mi = mi[keep]
+                    pair_gt_ids = gt_ids.index_select(0, mi)
+                    quality_keep, _, _, ratios = self._build_matched_gmo_quality_mask(
+                        pair_gt_ids=pair_gt_ids,
+                        matched_inst_idx=mi,
+                        gt_occ_txyz=fine_txyz,
+                        bbox_instance_occ3d_txyz=bbox_txyz,
+                        gt_centers_tn3=gt_centers_tn3,
+                        gt_valid_tn=gt_valid_tn,
+                        present_idx=pidx,
+                        roi_radius_m=float(getattr(self, "query_gmo_quality_roi_radius_m", 30.0)),
+                        min_occupancy_ratio=float(getattr(self, "query_gmo_quality_min_occupancy_ratio", 0.4)),
+                    )
+                    if bool(quality_keep.any().item()):
+                        pass_ids = torch.unique(pair_gt_ids[quality_keep], sorted=True)
+        try:
+            import numpy as np
+            from PIL import Image, ImageDraw
+        except Exception:
+            return
+
+        scene_token, lidar_token = self._extract_meta_tokens(img_metas)
+        vis_dir = str(getattr(self, "debug_gmo_quality_alignment_vis_dir", "./work_dirs/gmo_quality_alignment_vis"))
+        out_dir = os.path.join(vis_dir, f"iter_{int(step):06d}_{scene_token}_{lidar_token}")
+        os.makedirs(out_dir, exist_ok=True)
+
+        x_dim = int(min(fine_txyz.shape[1], bbox_txyz.shape[1]))
+        y_dim = int(min(fine_txyz.shape[2], bbox_txyz.shape[2]))
+        gap = 6
+        text_h = 44
+        panel_w = x_dim
+        panel_h = y_dim
+        canvas_w = panel_w * 3 + gap * 2
+        canvas_h = text_h + panel_h
+        pass_ids_cpu = pass_ids.detach().cpu() if torch.is_tensor(pass_ids) else torch.empty((0,), dtype=torch.long)
+        pass_preview = ",".join(str(int(v)) for v in pass_ids_cpu[:12].tolist())
+        if int(pass_ids_cpu.numel()) > 12:
+            pass_preview += ",..."
+
+        for t in range(t_all):
+            fine = fine_txyz[t, :x_dim, :y_dim].to(torch.long)
+            bbox = bbox_txyz[t, :x_dim, :y_dim].to(torch.long)
+            fine_bev_t = self._bev_mask_from_instance_txyz(fine)
+            bbox_bev_t = self._bev_mask_from_instance_txyz(bbox)
+            if fine_bev_t is None or bbox_bev_t is None:
+                continue
+            pass_fine_t = self._bev_mask_for_ids(fine, pass_ids)
+            pass_bbox_t = self._bev_mask_for_ids(bbox, pass_ids)
+
+            fine_bev = fine_bev_t.detach().cpu().numpy().T
+            bbox_bev = bbox_bev_t.detach().cpu().numpy().T
+            pass_fine = pass_fine_t.detach().cpu().numpy().T if pass_fine_t is not None else np.zeros_like(fine_bev)
+            pass_bbox = pass_bbox_t.detach().cpu().numpy().T if pass_bbox_t is not None else np.zeros_like(bbox_bev)
+
+            bbox_rgb = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
+            fine_rgb = np.zeros_like(bbox_rgb)
+            diff_rgb = np.zeros_like(bbox_rgb)
+            bbox_rgb[bbox_bev] = np.array([70, 150, 255], dtype=np.uint8)
+            fine_rgb[fine_bev] = np.array([255, 110, 70], dtype=np.uint8)
+            bbox_rgb[pass_bbox] = np.array([180, 220, 255], dtype=np.uint8)
+            fine_rgb[pass_fine] = np.array([255, 210, 170], dtype=np.uint8)
+
+            overlap = bbox_bev & fine_bev
+            bbox_only = bbox_bev & (~fine_bev)
+            fine_only = fine_bev & (~bbox_bev)
+            diff_rgb[overlap] = np.array([255, 220, 70], dtype=np.uint8)
+            diff_rgb[bbox_only] = np.array([70, 150, 255], dtype=np.uint8)
+            diff_rgb[fine_only] = np.array([255, 70, 70], dtype=np.uint8)
+            pass_any = pass_bbox | pass_fine
+            diff_rgb[pass_any & overlap] = np.array([255, 255, 255], dtype=np.uint8)
+
+            canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+            y0 = text_h
+            canvas[y0:y0 + panel_h, 0:panel_w] = bbox_rgb
+            x1 = panel_w + gap
+            canvas[y0:y0 + panel_h, x1:x1 + panel_w] = fine_rgb
+            x2 = (panel_w + gap) * 2
+            canvas[y0:y0 + panel_h, x2:x2 + panel_w] = diff_rgb
+
+            img = Image.fromarray(canvas, mode="RGB")
+            draw = ImageDraw.Draw(img)
+            tag = f"iter={int(step)} frame={t}/{t_all - 1}"
+            if t == pidx:
+                tag += " present/filter"
+            bbox_n = int(np.count_nonzero(bbox_bev))
+            fine_n = int(np.count_nonzero(fine_bev))
+            overlap_n = int(np.count_nonzero(overlap))
+            ratio = float(fine_n) / float(max(bbox_n, 1))
+            draw.text((4, 2), f"{tag} scene={scene_token} lidar={lidar_token}", fill=(255, 255, 255))
+            draw.text(
+                (4, 20),
+                f"bbox={bbox_n} fine={fine_n} overlap={overlap_n} fine/bbox={ratio:.3f} pass_obj={int(pass_ids_cpu.numel())} ids={pass_preview}",
+                fill=(255, 255, 255),
+            )
+            draw.text((4, text_h + 4), "bbox GT", fill=(255, 255, 255))
+            draw.text((x1 + 4, text_h + 4), "fine voxel GT", fill=(255, 255, 255))
+            draw.text((x2 + 4, text_h + 4), "overlap: yellow, bbox-only: blue, fine-only: red, pass-overlap: white", fill=(255, 255, 255))
+            draw.rectangle((0, y0, panel_w - 1, y0 + panel_h - 1), outline=(255, 255, 255), width=1)
+            draw.rectangle((x1, y0, x1 + panel_w - 1, y0 + panel_h - 1), outline=(255, 255, 255), width=1)
+            draw.rectangle((x2, y0, x2 + panel_w - 1, y0 + panel_h - 1), outline=(255, 255, 255), width=1)
+            out_name = f"frame_t{int(t):02d}.png"
+            img.save(os.path.join(out_dir, out_name))
+
+    @staticmethod
     def _depth_bin_center_from_cfg(bin_idx: torch.Tensor, num_bins: int, depth_min: float, depth_max: float):
         if (num_bins <= 0) or (not (depth_max > depth_min)):
             return None

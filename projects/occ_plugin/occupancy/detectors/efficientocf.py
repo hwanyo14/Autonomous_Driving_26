@@ -1549,6 +1549,7 @@ class EfficientOCF(
         mixture_yaw_match_tqg = mixture_yaw_loss
         mixture_weights_match_tqg = mixture_weights_loss
         match_gt_instance_occ3d_txyz = gt_instance_occ3d_txyz_query
+        match_bbox_instance_occ3d_txyz = gt_segmentation_instance3d_txyz_query
         match_gt_centers_tn3 = gt_inst_center_world_tn3
         match_gt_valid_tn = gt_inst_center_valid_tn
         match_gt_ids_n = gt_inst_ids_n
@@ -1565,6 +1566,7 @@ class EfficientOCF(
             mixture_yaw_match_tqg = mixture_yaw_loss_full_tqg
             mixture_weights_match_tqg = mixture_weights_loss_full_tqg
             match_gt_instance_occ3d_txyz = gt_instance_occ3d_txyz_query_vis
+            match_bbox_instance_occ3d_txyz = gt_segmentation_instance3d_txyz_query_vis
             match_gt_centers_tn3 = gt_inst_center_world_full_tn3
             match_gt_valid_tn = gt_inst_center_valid_full_tn
             match_gt_ids_n = gt_inst_ids_full_n
@@ -1845,6 +1847,7 @@ class EfficientOCF(
                 mixture_yaw_tqg=mixture_yaw_match_tqg,
                 mixture_weights_tqg=mixture_weights_match_tqg,
                 gt_instance_occ3d_txyz_pred=match_gt_instance_occ3d_txyz,
+                bbox_instance_occ3d_txyz=match_bbox_instance_occ3d_txyz,
                 objectness_scores_tq=None,
                 inst_match_result=inst_match_result,
                 loss_weight=0.1,
@@ -1856,7 +1859,19 @@ class EfficientOCF(
                 tversky_alpha=float(self.query_gmo_tversky_alpha),
                 tversky_beta=float(self.query_gmo_tversky_beta),
                 pair_chunk_size=int(self.query_multi_gaussian_pair_chunk),
+                quality_filter_enabled=bool(self.use_query_gmo_quality_filter),
+                quality_roi_radius_m=float(self.query_gmo_quality_roi_radius_m),
+                quality_min_occupancy_ratio=float(self.query_gmo_quality_min_occupancy_ratio),
+                quality_present_idx=int(traj_loss_present_local_idx),
             )
+        self.maybe_save_gmo_quality_alignment_vis(
+            fine_instance_occ3d_txyz=match_gt_instance_occ3d_txyz,
+            bbox_instance_occ3d_txyz=match_bbox_instance_occ3d_txyz,
+            inst_match_result=inst_match_result,
+            img_metas=img_metas,
+            step=cur_train_iter,
+            present_idx=int(traj_loss_present_local_idx),
+        )
 
         if torch.is_tensor(query_cls_scores_tqc) and query_cls_scores_tqc.numel() > 0:
             query_conf_scores_tq = (1.0 - query_cls_scores_tqc[..., self.query_bg_class]).to(torch.float32)

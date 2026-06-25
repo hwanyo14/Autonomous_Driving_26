@@ -1563,11 +1563,82 @@ class EfficientOCFLossMixin:
         score = (tp + float(eps)) / (denom + float(eps))
         return 1.0 - score.clamp(0.0, 1.0)
 
+    @staticmethod
+    def _build_matched_gmo_quality_mask(
+        pair_gt_ids: torch.Tensor,
+        matched_inst_idx: torch.Tensor,
+        gt_occ_txyz: torch.Tensor,
+        bbox_instance_occ3d_txyz: torch.Tensor,
+        gt_centers_tn3: torch.Tensor,
+        gt_valid_tn: torch.Tensor,
+        present_idx: int,
+        roi_radius_m: float,
+        min_occupancy_ratio: float,
+        eps: float = 1e-6,
+    ):
+        device = pair_gt_ids.device
+        k_count = int(pair_gt_ids.numel())
+        keep = torch.zeros((k_count,), device=device, dtype=torch.bool)
+        roi_keep = torch.zeros_like(keep)
+        ratio_keep = torch.zeros_like(keep)
+        ratios = pair_gt_ids.new_zeros((k_count,), dtype=torch.float32)
+        if k_count <= 0:
+            return keep, roi_keep, ratio_keep, ratios
+        if (
+            (not torch.is_tensor(gt_occ_txyz))
+            or gt_occ_txyz.dim() != 4
+            or (not torch.is_tensor(bbox_instance_occ3d_txyz))
+            or bbox_instance_occ3d_txyz.dim() != 4
+            or (not torch.is_tensor(gt_centers_tn3))
+            or gt_centers_tn3.dim() != 3
+            or (not torch.is_tensor(gt_valid_tn))
+            or gt_valid_tn.dim() != 2
+        ):
+            return keep, roi_keep, ratio_keep, ratios
+
+        t_count = min(
+            int(gt_occ_txyz.shape[0]),
+            int(bbox_instance_occ3d_txyz.shape[0]),
+            int(gt_centers_tn3.shape[0]),
+            int(gt_valid_tn.shape[0]),
+        )
+        if t_count <= 0:
+            return keep, roi_keep, ratio_keep, ratios
+        pidx = max(0, min(int(present_idx), t_count - 1))
+
+        mi = matched_inst_idx.to(device=device, dtype=torch.long)
+        valid_mi = (mi >= 0) & (mi < int(gt_centers_tn3.shape[1])) & (mi < int(gt_valid_tn.shape[1]))
+        if bool(valid_mi.any().item()):
+            centers = gt_centers_tn3[pidx].to(device=device, dtype=torch.float32)
+            valid = gt_valid_tn[pidx].to(device=device, dtype=torch.bool)
+            pair_centers = centers.index_select(0, mi.clamp(0, max(int(centers.shape[0]) - 1, 0)))
+            pair_valid = valid.index_select(0, mi.clamp(0, max(int(valid.shape[0]) - 1, 0))) & valid_mi
+            dist_xy = torch.linalg.norm(pair_centers[:, :2], dim=-1)
+            roi_keep = pair_valid & (dist_xy <= float(roi_radius_m))
+
+        fine_frame = gt_occ_txyz[pidx].to(device=device, dtype=torch.long)
+        bbox_frame = bbox_instance_occ3d_txyz[pidx].to(device=device, dtype=torch.long)
+        for k in range(k_count):
+            inst_id = int(pair_gt_ids[k].item())
+            if inst_id <= 0:
+                continue
+            fine_count = (fine_frame == inst_id).sum().to(torch.float32)
+            bbox_count = (bbox_frame == inst_id).sum().to(torch.float32)
+            if float(bbox_count.item()) <= 0.0:
+                continue
+            ratio = fine_count / bbox_count.clamp_min(float(eps))
+            ratios[k] = ratio
+            ratio_keep[k] = ratio >= float(min_occupancy_ratio)
+
+        keep = roi_keep & ratio_keep
+        return keep, roi_keep, ratio_keep, ratios
+
     def _compute_matched_pair_gmo_losses(
         self,
         centers_world_tq3: torch.Tensor,
         sigmas_world_tq3: torch.Tensor,
         gt_instance_occ3d_txyz_pred: torch.Tensor,
+        bbox_instance_occ3d_txyz: torch.Tensor = None,
         objectness_scores_tq: torch.Tensor = None,
         inst_match_result: dict = None,
         loss_weight: float = 0.1,
@@ -1583,6 +1654,10 @@ class EfficientOCFLossMixin:
         mixture_yaw_tqg: torch.Tensor = None,
         mixture_weights_tqg: torch.Tensor = None,
         pair_chunk_size: int = 8,
+        quality_filter_enabled: bool = False,
+        quality_roi_radius_m: float = 30.0,
+        quality_min_occupancy_ratio: float = 0.4,
+        quality_present_idx: int = 0,
         eps: float = 1e-6,
     ) -> dict:
         z = centers_world_tq3.sum() * 0.0
@@ -1597,6 +1672,15 @@ class EfficientOCFLossMixin:
             "dbg_gmo_dice_pair_count": z,
             "dbg_gmo_dice_alpha": z.new_tensor(float(tversky_alpha)),
             "dbg_gmo_dice_beta": z.new_tensor(float(tversky_beta)),
+            "dbg_gmo_quality_filter_enabled": z.new_tensor(float(bool(quality_filter_enabled))),
+            "dbg_gmo_quality_pair_count_before": z,
+            "dbg_gmo_quality_pair_count_after": z,
+            "dbg_gmo_quality_roi_keep_count": z,
+            "dbg_gmo_quality_ratio_keep_count": z,
+            "dbg_gmo_quality_ratio_mean": z,
+            "dbg_gmo_quality_scene_pass_object_count": z,
+            "dbg_gmo_quality_roi_radius_m": z.new_tensor(float(quality_roi_radius_m)),
+            "dbg_gmo_quality_min_ratio": z.new_tensor(float(quality_min_occupancy_ratio)),
         }
         out[loss_key] = z
         if loss_key == "loss_gmo_focal":
@@ -1640,12 +1724,44 @@ class EfficientOCFLossMixin:
         if mq.numel() <= 0:
             return out
         pair_gt_ids = gt_ids.index_select(0, mi)
+        out["dbg_gmo_quality_pair_count_before"] = centers_world_tq3.new_tensor(float(mq.numel()))
 
         gt_occ_txyz = gt_instance_occ3d_txyz_pred[:T].to(device=centers_world_tq3.device, dtype=torch.long)
         if torch.is_tensor(gt_valid_tn) and gt_valid_tn.dim() == 2 and int(gt_valid_tn.shape[0]) >= T:
             gt_valid_sel_tk = gt_valid_tn[:T].to(device=centers_world_tq3.device, dtype=torch.bool).index_select(1, mi)
         else:
             gt_valid_sel_tk = torch.ones((T, int(mq.numel())), device=centers_world_tq3.device, dtype=torch.bool)
+
+        if bool(quality_filter_enabled):
+            gt_centers_tn3 = inst_match_result.get("gt_centers_tn3", None)
+            quality_keep, roi_keep, ratio_keep, quality_ratios = self._build_matched_gmo_quality_mask(
+                pair_gt_ids=pair_gt_ids,
+                matched_inst_idx=mi,
+                gt_occ_txyz=gt_occ_txyz,
+                bbox_instance_occ3d_txyz=bbox_instance_occ3d_txyz,
+                gt_centers_tn3=gt_centers_tn3,
+                gt_valid_tn=gt_valid_tn,
+                present_idx=int(quality_present_idx),
+                roi_radius_m=float(quality_roi_radius_m),
+                min_occupancy_ratio=float(quality_min_occupancy_ratio),
+                eps=float(eps),
+            )
+            out["dbg_gmo_quality_roi_keep_count"] = centers_world_tq3.new_tensor(float(roi_keep.sum().item()))
+            out["dbg_gmo_quality_ratio_keep_count"] = centers_world_tq3.new_tensor(float(ratio_keep.sum().item()))
+            valid_ratio = quality_ratios > 0.0
+            if bool(valid_ratio.any().item()):
+                out["dbg_gmo_quality_ratio_mean"] = quality_ratios[valid_ratio].mean()
+            if not bool(quality_keep.any().item()):
+                return out
+            mq = mq[quality_keep]
+            mi = mi[quality_keep]
+            pair_gt_ids = pair_gt_ids[quality_keep]
+            gt_valid_sel_tk = gt_valid_sel_tk.index_select(1, torch.nonzero(quality_keep, as_tuple=False).squeeze(1))
+            out["dbg_gmo_quality_scene_pass_object_count"] = centers_world_tq3.new_tensor(
+                float(torch.unique(pair_gt_ids).numel())
+            )
+
+        out["dbg_gmo_quality_pair_count_after"] = centers_world_tq3.new_tensor(float(mq.numel()))
 
         pair_losses = []
         dice_pair_losses = []
@@ -2249,6 +2365,7 @@ class EfficientOCFLossMixin:
             and (not k.startswith("dbg_query_traj_"))
             and (not k.startswith("dbg_query_match_cost_"))
             and (not k.startswith("dbg_query_matched_center_"))
+            and (not k.startswith("dbg_gmo_quality_"))
         ]:
             del losses[k]
         self._namespace_dbg_logs(losses)

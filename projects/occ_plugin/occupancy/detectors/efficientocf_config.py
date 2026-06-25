@@ -8,6 +8,9 @@ MODEL_CFG_DEFAULTS = {
     "query_gmo_dice_loss_weight": 0.5,
     "query_gmo_tversky_alpha": 0.7,
     "query_gmo_tversky_beta": 0.3,
+    "use_query_gmo_quality_filter": False,
+    "query_gmo_quality_roi_radius_m": 30.0,
+    "query_gmo_quality_min_occupancy_ratio": 0.4,
     "use_query_gmo_dice_loss": True,
     "use_query_inst_center_match_loss": True,
     "use_query_dt_loss": False,
@@ -113,6 +116,7 @@ DEBUG_CFG_DEFAULTS = {
     "debug_query_cam_gaussian_vis_enabled": False,
     "debug_query_cam_gaussian_vis_every": 0,
     "debug_gt_alignment_vis_every": 0,
+    "debug_gmo_quality_alignment_vis_every": 0,
     "debug_query_inst_depth_lift_vis_every": 0,
     "debug_query_attn_softargmax_vis_every": 0,
 }
@@ -141,6 +145,7 @@ VISUALIZATION_CFG_DEFAULTS = {
     "debug_query_cam_gaussian_vis_topk_matched": 0,
     "debug_gt_alignment_vis_dir": "./work_dirs/gt_alignment_vis",
     "debug_gt_alignment_vis_max_frames": 7,
+    "debug_gmo_quality_alignment_vis_dir": "./work_dirs/gmo_quality_alignment_vis",
     "debug_query_inst_depth_lift_vis_dir": "./work_dirs/query_inst_depth_lift_vis",
     "debug_query_inst_depth_lift_vis_max_frames": 3,
     "debug_query_inst_depth_lift_vis_max_cams": 2,
@@ -172,6 +177,9 @@ def apply_model_cfg(self, cfg):
     self.query_gmo_dice_loss_weight = float(cfg["query_gmo_dice_loss_weight"])
     self.query_gmo_tversky_alpha = float(cfg["query_gmo_tversky_alpha"])
     self.query_gmo_tversky_beta = float(cfg["query_gmo_tversky_beta"])
+    self.use_query_gmo_quality_filter = bool(cfg["use_query_gmo_quality_filter"])
+    self.query_gmo_quality_roi_radius_m = float(cfg["query_gmo_quality_roi_radius_m"])
+    self.query_gmo_quality_min_occupancy_ratio = float(cfg["query_gmo_quality_min_occupancy_ratio"])
     self.use_query_gmo_dice_loss = bool(cfg["use_query_gmo_dice_loss"])
     self.use_query_inst_center_match_loss = bool(cfg["use_query_inst_center_match_loss"])
     self.use_query_dt_loss = bool(cfg["use_query_dt_loss"])
@@ -312,6 +320,7 @@ def apply_debug_cfg(self, cfg):
     self.debug_query_cam_gaussian_vis_enabled = bool(cfg["debug_query_cam_gaussian_vis_enabled"])
     self.debug_query_cam_gaussian_vis_every = int(cfg["debug_query_cam_gaussian_vis_every"])
     self.debug_gt_alignment_vis_every = int(cfg["debug_gt_alignment_vis_every"])
+    self.debug_gmo_quality_alignment_vis_every = int(cfg["debug_gmo_quality_alignment_vis_every"])
     self.debug_query_inst_depth_lift_vis_every = int(cfg["debug_query_inst_depth_lift_vis_every"])
     self.debug_query_attn_softargmax_vis_every = int(cfg["debug_query_attn_softargmax_vis_every"])
 
@@ -346,6 +355,7 @@ def apply_visualization_cfg(self, cfg):
     self.debug_query_cam_gaussian_vis_topk_matched = int(cfg["debug_query_cam_gaussian_vis_topk_matched"])
     self.debug_gt_alignment_vis_dir = str(cfg["debug_gt_alignment_vis_dir"])
     self.debug_gt_alignment_vis_max_frames = max(1, int(cfg["debug_gt_alignment_vis_max_frames"]))
+    self.debug_gmo_quality_alignment_vis_dir = str(cfg["debug_gmo_quality_alignment_vis_dir"])
     self.debug_query_inst_depth_lift_vis_dir = str(cfg["debug_query_inst_depth_lift_vis_dir"])
     self.debug_query_inst_depth_lift_vis_max_frames = max(1, int(cfg["debug_query_inst_depth_lift_vis_max_frames"]))
     self.debug_query_inst_depth_lift_vis_max_cams = max(1, int(cfg["debug_query_inst_depth_lift_vis_max_cams"]))
