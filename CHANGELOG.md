@@ -1,5 +1,98 @@
 # Changelog
 
+## 2026-06-25 KST — eval 3D mixture vis 전용 해상도 키 신설 (eval=512³ GT/metric 일치, train=128 유지)
+
+- **문제**: 3D `mixture3d` vis가 train·eval 모두 `matched_gmo_voxelizer`(128, 0.8m)를 써서 그림. 그런데 eval **메트릭**은 `self.voxelizer`(512³, 0.2m)로 계산 → 같은 eval 런서 점수(0.2m)와 cube(0.8m) 해상도 불일치.
+- **변경**: eval mixture3d vis만 GT/metric 해상도로 렌더하도록 분리. train vis는 128 유지(loss 격자=loss가 보는 것, every-48 상시라 속도 위해).
+  - 신규 config 키 `debug_query_mixture3d_vis_eval_occ_size=(512,512,40)` ([efficientocf_config.py](projects/occ_plugin/occupancy/detectors/efficientocf_config.py): 기본값+apply, [shape_guide_128_dice.py](projects/configs/baselines/shape_guide_128_dice.py) 노출).
+  - `efficientocf.py.__init__`: 그 키로 `self.mixture3d_eval_voxelizer` 생성(floor=0, 고해상; range_x/y/z 재사용).
+  - `maybe_save_query_mixture_3d_vis`에 `is_eval: bool=False` 파라미터 추가 → eval일 때 eval voxelizer, train일 때 matched(128). **영속 플래그(`_eval_vis_all_ranks`) 대신 명시적 파라미터**로 train-after-eval 오염 방지.
+  - eval 호출부 2곳([efficientocf.py:1381,1389](projects/occ_plugin/occupancy/detectors/efficientocf.py))만 `is_eval=True`; train 호출부(3142)는 미전달=128.
+- **안전**: per-query bbox 렌더(K=1)+`occ_max_voxels_per_query=4000` 캡으로 512에서도 메모리/matplotlib 부담 bounded. eval은 가끔 도므로 OK. train은 미변경이라 속도 영향 0.
+- **주의**: **실행 중인 dice 런엔 영향 없음**(런치 시 로드된 코드 사용). 새 런/eval부터 적용.
+- 검증: 4개 파일 `py_compile` 통과. `is_eval=True`는 eval 2곳만, train 1곳 미전달 확인.
+
+## 2026-06-25 KST — 헷갈리는 죽은 흔적 제거(sigma/score 관련 dead code·deprecated key)
+
+- **(1) 레거시 단일-gaussian sigma 인자 제거**: `query_head.py` `gaussian_sigma_min`/`gaussian_sigma_max`(__init__ 파라미터 388-389 + `self.` 할당 577-578). **할당만 되고 어디서도 안 읽힘**(mixture 경로는 `query_multi_gaussian_sigma_min_m/max_m` 사용, efficientocf도 이것만 전달). 헷갈림 유발 → 삭제.
+- **(2) deprecated 시각화 score 키 제거**: `efficientocf_config.py` `debug_query_mixture3d_vis_score_threshold`(DEFAULTS 키 + apply 할당). 이미 `debug_query_score_threshold`(+`EOCF_EVAL_FG_THR`)로 통일돼 무시되던 키. config에서도 미사용 확인 후 삭제. 관련 stale 주석(`utils_visualization.py:1335`)도 정리.
+- **(3) `sigmoid_to_sigma_from_range` stale 기본값 제거**: 인자 default `(0.15..)/(4.0..)`가 실제(0.4/3.0)와 달라 오해 유발 + 유일 콜러(`query_head.py:1781`)가 항상 명시 전달 → default 삭제(필수 인자화).
+- **남겨둔 것(미삭제, 의도)**: `query_multi_gaussian_sigma_min_m/max_m`의 DEFAULTS `(0.15..)/(4.0..)`(`efficientocf_config.py:108-109`, `query_head.py:392-393`)는 **functional fallback**(키 없는 config 대비). 모든 실제 config가 명시 override하므로 효과 없음 — 제거 시 KeyError 위험이라 유지.
+- 검증: py_compile OK, 제거 심볼 잔존 참조 0. ⚠️ 진행 중 학습 무관(기능 무변).
+
+## 2026-06-25 KST — eval voxelizer(512) floor 제거(0.0), train(matched) floor는 0.5 유지
+
+- **대상**: `efficientocf.py:217-224` `self.voxelizer`(eval/512) → `gaussian_sigma_floor_vox=0.0`. `efficientocf.py:236` `matched_gmo_voxelizer`(train) → 상속 끊고 `0.5` 명시.
+- **이유**: eval은 forward σ를 그대로 splat — sigma_min(head, ≥0.4m)이 이미 보장하므로 0.2m 격자에서 소멸 위험 없음 → 별도 floor 불필요(요청). floor의 '소멸 방지' 역할은 거친 train 격자(0.8m)에서만 필요.
+- **영향(기능)**: **사실상 무변화(no-op)**. sigma_min=0.4m라 self.voxelizer floor(옛 0.1m)는 이미 dormant였음(σ 0.4m > 0.1m). self.voxelizer.floor를 공유하던 `utils_bev_pool`도 0이 되나 동일하게 dormant. 코드 의도("eval=raw forward")만 명확화.
+- **주의**: 이후 sigma_min을 0.1m 밑으로 내리면 eval에서 sub-voxel 소멸 가능(현재 0.4m라 안전). py_compile OK. ⚠️ 진행 중 학습 미반영.
+
+## 2026-06-25 KST — `sigma_min_m` (0.2,0.2,0.2)→(0.4,0.4,0.2): train/eval 최소 σ 통일
+
+- **대상**: `shape_guide_128.py:451` `query_multi_gaussian_sigma_min_m`. (`efficientocf_config.py` DEFAULTS `(0.15,0.15,0.10)`는 다른 해상도 config가 공유 → 미변경. 각 config는 `0.5×자기 matched voxel`로 둘 것. ⚠️ `shape_guide_128_dice.py`도 같은 변경 필요 — 아래 별도 항목/확인.)
+- **이유**: `floor_vox=0.5`는 voxel 단위라 train(matched 0.8m→**0.4m**)·eval(512 0.2m→**0.1m**) 물리 floor가 달라, σ<0.4m 구간에서 **train은 σ를 0.4m로 부풀려 학습 vs eval은 원값 렌더 → 미세 불일치**. `sigma_min_m`을 `0.5×coarsest(matched) voxel = (0.4,0.4,0.2)`로 올리면 σ가 항상 floor 이상 → **양 격자에서 floor 비활성, 네트워크 σ가 train·eval에 동일하게 흐름.**
+- **효과**: train/eval 최소 σ 완전 일치(xy 0.4m / z 0.2m). 잃는 디테일 없음 — 모델은 어차피 0.8m matched 격자로만 학습(sub-0.4m σ는 학습 안 된 noise였음).
+- **무관**: over-spread(퍼짐)와 별개(그건 offset_max·sigma_max·`weight_mode='ones'`).
+- **주의**: matched 해상도 바꾸면 sigma_min도 `0.5×새 voxel`로 재산정(예: 64→0.8m). py_compile OK. ⚠️ 진행 중 학습 미반영 — 다음 실행부터.
+
+## 2026-06-25 KST — `shape_guide_128_dice.py` 신규: occ shape over-spread 대응 dice(Tversky) 단독 실험
+
+- **신규 config** `projects/configs/baselines/shape_guide_128_dice.py` ([shape_guide_128.py](projects/configs/baselines/shape_guide_128.py) 클린 카피에서 **단 한 가지만** 변경).
+- **변경 내용**(`model_cfg`, 365–372줄):
+  - `use_query_gmo_dice_loss=False → True` (occ loss에 foreground-Tversky 추가).
+  - `query_gmo_dice_loss_weight=0.5`, `query_gmo_tversky_alpha=0.7`(FP 가중), `query_gmo_tversky_beta=0.3`(FN 가중) **명시**(값은 [efficientocf_config.py:8-10](projects/occ_plugin/occupancy/detectors/efficientocf_config.py#L8-L10) 기본과 동일 — 자기문서화 목적, 동작 불변).
+  - `query_gmo_loss_type='focal'` 유지 → focal+dice 병행(focal=불균형, dice=shape 주력).
+- **근거**: focal-only는 over-spread에서 `p.clamp` 포화 + 전격자 mean 희석으로 FP gradient≈0 → shape 못 잡음(폭발). Tversky는 FP를 foreground 크기로 정규화 → 격자 불변·비소멸 gradient, β가 recall 방어. 진단 전말은 [NOTES.md](NOTES.md) 2026-06-25 항목.
+- **단일 변수 원칙**: 제한값(`offset_max=12`/`sigma_max=3`)·`weight_mode='ones'`·init **모두 그대로**. dice 효과만 귀속. 코드 변경 없음(메커니즘은 [utils_loss.py:2670-2697](projects/occ_plugin/occupancy/detectors/utils_loss.py#L2670-L2697) `_compute_foreground_tversky_pair_loss`로 기구현·wired).
+- **검증**: `py_compile` 통과, 추가 키 3개 모두 `efficientocf_config.py`가 인식. **모니터**: `loss_gmo_dice`가 ~0.5에서 감소하는지 / matched footprint가 차 크기로 조여지는지 / recall(matched count) 유지.
+
+## 2026-06-25 KST — `gaussian_sigma_floor_vox` 기본값 0.35→0.5 (σ 하한을 '반 voxel 방지턱'으로 정정)
+
+- **대상(live 3곳, 0.35→0.5)**:
+  - `voxelizer.py:139` `SoftVoxelizerOneAdd.__init__` 기본값(+근거 주석). `self.voxelizer`·`matched_gmo_voxelizer` 모두 이 기본값을 상속(전자는 미지정, 후자는 `float(self.voxelizer...)`).
+  - `query_head.py:4618` `compute_query_point_dt_loss`의 floor 인자 기본값(콜러 `utils_loss.py:3672/3677`가 안 넘겨서 default 사용).
+  - `utils_bev_pool.py:340` getattr fallback(실사용은 voxelizer attr=0.5라 사실상 표기 일치용).
+  - dead 백업 `query_head_ori.py`는 미사용(import X)이라 제외.
+- **의미**: floor는 σ가 voxel보다 작아져 grid에서 사라지는(occ 0 → dead-gradient) 것을 막는 **방지턱**. voxel 단위라 해상도 자동 추종(0.5=반 칸 → 128:0.4m / 64:0.8m / 256:0.2m). 엄밀 안전선(최악 정렬서 nearest voxel≥0.5)이 ~0.42 voxel이라 기존 0.35는 살짝 미달 → 0.5로 정정.
+- **실효 σ 하한 = max(sigma_min_m, 0.5·voxel)**. `sigma_min_m=(0.2,0.2,0.2)`는 **사용자 요청대로 유지** → 128 matched(0.8m)에선 floor(0.4m)가 지배, eval 512(0.2m)에선 0.1m라 sigma_min(0.2m)이 지배(미세 불일치는 [[NOTES]] 참조). sigma_min_m을 0.4↑로 올리면 floor 비활성 + train/eval 완전 일치.
+- **주의**: 이번 변경은 σ '소멸 방지(아래쪽)'만. shape **over-spread(퍼짐)** 와는 무관(그건 offset_max·sigma_max·`weight_mode='ones'` 쪽).
+- config 주석 갱신: `shape_guide_128.py`의 floor 수치(0.28m→0.4m)·sigma_min 바닥 설명. 검증: py_compile 4파일 OK. ⚠️ 진행 중 학습 미반영 — 다음 실행부터.
+
+## 2026-06-25 KST — `query_multi_gaussian_pair_chunk` 기본값 8→2
+
+- 대상: `projects/occ_plugin/occupancy/detectors/efficientocf_config.py:112` (DEFAULTS). `8` → `2`.
+- 이유: grouped voxelizer 루프 보폭(메모리/속도만, **결과 불변**). GPU 실측상 128격자에서 chunk=2가 속도 sweet spot + 메모리 적당(K80 9.6GB). 8은 128에서 ~35GB(OOM)·느림.
+- **파급(override 없는 config)**: `shape_guide.py`(64격자)도 이제 기본 2 사용 → 64에선 chunk=8(45ms·10.5GB)이 最速이었으므로 **약간 느려지지만(71ms) 메모리 1/3(3.3GB)**. 결과/정확도 영향 0. `shape_guide_128.py`는 명시적으로 2라 무변화.
+- 동기화: `EfficientOCF_V1.1_1gpu.py`는 현재 tree에 없음(불필요). py_compile·mmcv 로드 확인. ⚠️ 진행 중 학습 미반영 — 다음 실행부터.
+
+## 2026-06-24 KST — mixture3d 2행: 예측 occ를 '예측 해상도 솔리드 큐브'로 (점 scatter → ax.voxels)
+
+- 대상: `projects/occ_plugin/occupancy/detectors/utils_visualization.py` `maybe_save_query_mixture_3d_vis` (학습·추론 **공유** 함수 → 양쪽 다 적용).
+- **변경 전**: mixture를 512-res(`self.voxelizer`)로 재복셀화 → 점유 복셀 센터를 sparse 점(s=1.4, alpha=0.18, query당 4000 subsample)으로 scatter → "퍼진 점"처럼 보임.
+- **변경 후**: **모델 예측 해상도(`matched_gmo_voxelizer` = `query_matched_gmo_bce_occ_size`, 현재 64×64×20)** 로 복셀화 → 점유 복셀을 **실제 스케일 솔리드 큐브**(`ax.voxels`)로. query별 클래스색 유지, GT 회색 구름 레퍼런스 유지, 1행(1σ ellipsoid) 무변경.
+  - **해상도 자동 적응**: 큐브 크기 = range/res → 64→1.6m, 128→0.8m. config(예: `shape_guide_128.py`)만 바꾸면 자동. 별도 vis 격자 기준 불필요.
+  - occ 임계값은 통일된 `eval_occ_threshold`(+`EOCF_EVAL_OCC_THR`) 그대로 사용.
+  - 속도: 예측 해상도라 큐브 수 적음(측정 64-res 43~949개 23~243ms / 128-res 115~3798개 45~611ms). 512-res 큐브(12만 개, 초 단위) 대비 빠름.
+- **검증**: 매칭 48-gaussian 체크포인트(`work_dirs/shape_guide/epoch_1_lss_only.pth`)로 eval 3샘플 → `query_mixture3d_vis/iter_*.png` 2행이 솔리드 큐브로 정상 렌더(렌더 에러/OOM 0). py_compile 통과, dead 참조(gmm_xyz/occ_max_vox) 0.
+- 주의: 진행 중 학습은 로드된 옛 코드라 미반영 — 다음 실행부터. (`debug_query_mixture3d_vis_occ_max_voxels_per_query`는 이제 미사용.)
+
+## 2026-06-24 KST — shape_guide_128.py: 학습 occ-loss 격자 64→128(xy)
+
+- **신규 실험 config** `projects/configs/baselines/shape_guide_128.py` (shape_guide.py 복제본). 단일 변경: `query_matched_gmo_bce_occ_size=(64,64,20)` → `(128,128,20)`.
+- **배경**: 학습 occ-loss는 `matched_gmo_voxelizer`(loss 격자)에서, 평가 metric occupancy는 `self.voxelizer`(512)에서 가우시안 직접 splat. 64-grid(x,y 1.6m)에선 sigma floor(0.35vox)가 0.56m로 작동 → sigma_min_m=0.2m을 압도, σ_x,y∈[0.2,0.56m] 학습 dead-zone. 또한 자동차 폭이 ~1복셀이라 형상 감독 불가.
+- **효과**: 128(x,y 0.8m)로 올리면 floor 0.56→0.28m(dead-zone 축소), 자동차 폭 ~2복셀로 형상 감독 가능. 단 x,y 실효 최소 σ=0.28m로 sigma_min(0.2m)보다 약간 높음(0.2m 도달하려면 격자≥256 필요).
+- **해상도 분리 주의**: 평가 metric occupancy = 512 직접 splat(불변, 업스케일 없음). 단 3D mixture **디버그** 시각화(`maybe_save_query_mixture_3d_vis` 2행)는 최근 변경으로 **예측 해상도(`matched_gmo_voxelizer`)** 솔리드 큐브 렌더 → 128 적용 시 큐브 1.6m→0.8m 자동 적응(별도 수정 불필요).
+- **메모리·속도 측정 + pair_chunk=2 추가**: grouped voxelizer가 청크당 `[chunk,G,bbox]` intermediate를 backward까지 retain. 흩어진 query를 묶으면 bbox≈전체 격자 → `query_multi_gaussian_pair_chunk` 기본 8이면 128격자에서 ~35GB(OOM). 결과는 chunk 무관(메모리/연산만 조절). GPU 실측(128격자, fwd+bwd, peak/ms): **K80** c8 35GB·132ms / c4 25GB·117 / **c2 9.6GB·89** / c1 1.3GB·131. **K160** c2 17.7GB·158 / c1 2.6GB·257. → **속도 sweet spot=2(모든 K 最速, c1보다 ~1.6배 빠름), 메모리 최소=1.** `shape_guide_128.py`에 **`query_multi_gaussian_pair_chunk=2`** 채택(속도 우선). 객체 多 프레임서 OOM 시 1로 폴백.
+- 참고: `efficientocf_config.py` 기본값은 `(128,128,10)`/`pair_chunk=8` 유지(이 config가 override). ⚠️ 진행 중 학습엔 미반영 — 다음 실행부터.
+
+## 2026-06-24 KST — 가우시안 footprint outline 임계값을 eval_occ_threshold로 통일
+
+- **문제**: 2D query_debug_vis의 가우시안 footprint **outline 등고선**(prob 모드)이 별도 키 `debug_query_gaussian_prob_threshold`(0.5)를 탔음 → occ metric 임계값(`eval_occ_threshold`)과 따로 놀아 env override(`EOCF_EVAL_OCC_THR`)도 안 먹음.
+- **변경**: outline + 타이틀 텍스트를 렌더러 `prob_threshold` 파라미터로 통일. 이 파라미터는 학습=`eval_occ_threshold`([efficientocf.py:3113](.)) / eval=`EOCF_EVAL_OCC_THR` override([efficientocf.py:1339](.)). → occ 임계값 한 키가 metric·occ-grid·3D mixture3d·**가우시안 footprint outline**까지 모두 통제.
+  - `query_head.py`: `_maybe_save_prob_grid_vis` 3330(outline 소스)·3760/3764(타이틀) → `prob_threshold` 사용.
+- **dead 키 제거** `debug_query_gaussian_prob_threshold`: `query_head.__init__`(param+검증), `efficientocf.py` QueryHead 생성 kwarg, `efficientocf_config.py`(DEFAULTS+주입+주석) 전부 삭제. 잔존 참조 0, py_compile 통과. (`debug_query_gaussian_prob_alpha_scale`=heatmap 밝기는 별개라 유지.)
+- ⚠️ 진행 중 학습은 이미 로드된 코드라 미반영 — 다음 실행(train/eval)부터 적용.
+
 ## 2026-06-24 KST — PROJECT_STRUCTURE.md 현행화
 
 - 실제 working tree에 맞춰 `PROJECT_STRUCTURE.md` 재정리.

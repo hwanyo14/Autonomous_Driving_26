@@ -337,7 +337,7 @@ class EfficientOCFBEVPoolMixin:
 
         trunc = float(getattr(self.voxelizer, "gaussian_truncate_sigma", 3.0))
         trunc = max(1.0, trunc)
-        sigma_floor_vox = float(getattr(self.voxelizer, "gaussian_sigma_floor_vox", 0.35))
+        sigma_floor_vox = float(getattr(self.voxelizer, "gaussian_sigma_floor_vox", 0.5))
         sigma_floor_vox = max(1e-3, sigma_floor_vox)
 
         centers = centers_world_tq3.to(torch.float32)

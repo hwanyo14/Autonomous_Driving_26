@@ -109,7 +109,9 @@ MODEL_CFG_DEFAULTS = {
     "query_multi_gaussian_sigma_max_m": (4.0, 4.0, 1.5),
     "query_multi_gaussian_sigma_reg_loss_weight": 0.0,
     "query_multi_gaussian_sigma_reg_log_eps": 1e-6,
-    "query_multi_gaussian_pair_chunk": 8,
+    # grouped voxelizer 루프 보폭(메모리/속도만, 결과 불변). 흩어진 pair를 묶을수록 bbox≈전체격자라
+    # 메모리·낭비연산↑. GPU 실측: 128격자에서 chunk=2가 속도 sweet spot(최速)+메모리 적당. → 기본 2.
+    "query_multi_gaussian_pair_chunk": 2,
     "query_multi_gaussian_weight_mode": "softmax",
     "query_multi_gaussian_softplus_bias_init": -2.0,
     "query_multi_gaussian_weight_reg_loss_weight": 1e-3,
@@ -122,10 +124,8 @@ MODEL_CFG_DEFAULTS = {
     # mixture 텐서가 없는 모델은 simple_test의 use_mix 가드가 자동으로 단일 ellipsoid로 fallback.
     "query_eval_occ_use_mixture": True,
     # occupancy 확률을 점유/비점유로 가르는 단일 threshold (= 평가 metric 기준).
-    # 이 값 하나가 (1)평가 metric 이진화, (2)2D query_debug_vis occ-grid, (3)3D mixture3d occ를
-    # 모두 결정한다. 런타임 override: 환경변수 EOCF_EVAL_OCC_THR (eval 시에만).
-    # 주의: 가우시안 footprint 색칠(debug_query_gaussian_prob_threshold)은 개별 G density 기준이라
-    # 의미가 달라 별도 노브로 유지한다.
+    # 이 값 하나가 (1)평가 metric 이진화, (2)2D query_debug_vis occ-grid, (3)3D mixture3d occ,
+    # (4)가우시안 footprint outline 등고선을 모두 결정한다. 런타임 override: EOCF_EVAL_OCC_THR (eval 시에만).
     "eval_occ_threshold": 0.5,
     "query_embed_dim": 256,
     "query_num_queries": 100,
@@ -191,7 +191,6 @@ VISUALIZATION_CFG_DEFAULTS = {
     # → config 값 = 학습·추론 공통. 추론에서만 바꾸려면 env. 둘 다 같게 하려면 config만 쓰고 env 빼면 됨.
     # ============================================================================
     "debug_query_gaussian_vis_mode": "ellipse",
-    "debug_query_gaussian_prob_threshold": 0.5,
     "debug_query_gaussian_prob_alpha_scale": 4.0,
     "debug_query_score_topk": 50,
     # ★ query score 단일 임계값: 2D 선택(3행 hi) + 2D footprint 표시 + 3D mixture3d 필터 모두 이 값 사용.
@@ -223,10 +222,10 @@ VISUALIZATION_CFG_DEFAULTS = {
     "debug_query_mixture3d_vis_dir": "./work_dirs/query_mixture3d_vis",
     "debug_query_mixture3d_vis_max_queries": 50,
     "debug_query_mixture3d_vis_max_gt_points": 40000,
-    # (deprecated) 3D score는 이제 debug_query_score_threshold(+EOCF_EVAL_FG_THR)로 통일 → 이 키는 무시됨.
-    "debug_query_mixture3d_vis_score_threshold": 0.75,
     # (deprecated) mixture3d occ threshold는 이제 eval_occ_threshold로 통일됨 → 키 제거.
     "debug_query_mixture3d_vis_occ_max_voxels_per_query": 4000,
+    # eval 전용 3D mixture vis 해상도(GT/metric=512³ 일치). train vis는 query_matched_gmo_bce_occ_size(128) 유지.
+    "debug_query_mixture3d_vis_eval_occ_size": (512, 512, 40),
 }
 
 
@@ -448,7 +447,6 @@ def apply_visualization_cfg(self, cfg):
     self.debug_query_vis_dir = str(cfg["debug_query_vis_dir"])
     self.debug_query_center_marker_radius = max(0, int(cfg["debug_query_center_marker_radius"]))
     self.debug_query_gaussian_vis_mode = str(cfg["debug_query_gaussian_vis_mode"]).lower()
-    self.debug_query_gaussian_prob_threshold = float(cfg["debug_query_gaussian_prob_threshold"])
     self.debug_query_gaussian_prob_alpha_scale = float(cfg["debug_query_gaussian_prob_alpha_scale"])
     self.debug_query_score_topk = max(0, int(cfg["debug_query_score_topk"]))
     self.debug_query_score_threshold = float(cfg["debug_query_score_threshold"])
@@ -480,9 +478,11 @@ def apply_visualization_cfg(self, cfg):
     self.debug_query_mixture3d_vis_dir = str(cfg["debug_query_mixture3d_vis_dir"])
     self.debug_query_mixture3d_vis_max_queries = max(1, int(cfg["debug_query_mixture3d_vis_max_queries"]))
     self.debug_query_mixture3d_vis_max_gt_points = max(1000, int(cfg["debug_query_mixture3d_vis_max_gt_points"]))
-    self.debug_query_mixture3d_vis_score_threshold = float(cfg["debug_query_mixture3d_vis_score_threshold"])
     self.debug_query_mixture3d_vis_occ_max_voxels_per_query = max(
         100, int(cfg["debug_query_mixture3d_vis_occ_max_voxels_per_query"])
+    )
+    self.debug_query_mixture3d_vis_eval_occ_size = tuple(
+        int(v) for v in cfg["debug_query_mixture3d_vis_eval_occ_size"]
     )
 
     return cfg

@@ -4,3 +4,12 @@ load config from local path: ./projects/configs/baselines/shape_guide.py
 -------------
 load config from local path: ./projects/configs/baselines/shape_guide.py
 [dist_train] console logging -> logs/shape_guide/20260624_163304.log  (실시간 보기: tail -f logs/shape_guide/20260624_163304.log)
+-------------
+load config from local path: ./projects/configs/baselines/shape_guide_128.py
+[dist_train] console logging -> logs/shape_guide_128/20260625_005512.log  (실시간 보기: tail -f logs/shape_guide_128/20260625_005512.log)
+-------------
+load config from local path: ./projects/configs/baselines/shape_guide_128_dice.py
+[dist_train] console logging -> logs/shape_guide_128_dice/20260625_113016.log  (실시간 보기: tail -f logs/shape_guide_128_dice/20260625_113016.log)
+-------------
+load config from local path: ./projects/configs/baselines/shape_guide_128_dice.py
+[dist_train] console logging -> logs/shape_guide_128_dice/20260625_123924.log  (실시간 보기: tail -f logs/shape_guide_128_dice/20260625_123924.log)

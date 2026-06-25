@@ -1217,6 +1217,7 @@ class EfficientOCFVisualizationMixin:
         step: int = 0,
         occ_threshold: float = None,
         frame_idx: int = None,
+        is_eval: bool = False,
     ) -> None:
         vis_every = int(getattr(self, "debug_query_mixture3d_vis_every", 0))
         if vis_every <= 0:
@@ -1332,7 +1333,7 @@ class EfficientOCFVisualizationMixin:
 
         # Common score gate (shared by both rows): keep queries with score >= threshold.
         # 2D query 선택과 동일한 단일 임계값(config debug_query_score_threshold) + env(EOCF_EVAL_FG_THR)
-        # 사용 → 학습/추론, 2D/3D 모두 같은 score 임계값으로 일관. (옛 debug_query_mixture3d_vis_score_threshold 폐기)
+        # 사용 → 학습/추론, 2D/3D 모두 같은 score 임계값으로 일관.
         import os as _os
         score_thr = float(_os.environ.get("EOCF_EVAL_FG_THR", getattr(self, "debug_query_score_threshold", 0.5)))
         keep = sel_score >= score_thr
@@ -1378,18 +1379,30 @@ class EfficientOCFVisualizationMixin:
             if occ_threshold is not None
             else float(getattr(self, "eval_occ_threshold", 0.5))
         )
-        occ_max_vox = int(getattr(self, "debug_query_mixture3d_vis_occ_max_voxels_per_query", 4000))
-        gmm_xyz = np.zeros((0, 3), dtype=np.float32)
-        gmm_colors = np.zeros((0, 4), dtype=np.float32)
-        voxelizer = getattr(self, "voxelizer", None)
+        # 예측 occ를 '예측 해상도'(query_matched_gmo_bce_occ_size, 예: 64x64x20)로 복셀화한 뒤,
+        # 각 점유 복셀을 실제 스케일 큐브로 그린다(큐브 크기=range/res 자동 추종).
+        # train: matched_gmo_voxelizer(거친 loss 격자=loss가 보는 것, 빠름, every-48 상시).
+        # eval : mixture3d_eval_voxelizer(GT/metric 해상도=512³, 실제 출력 확인, 가끔). is_eval로 분기.
+        if is_eval:
+            mvox = (getattr(self, "mixture3d_eval_voxelizer", None)
+                    or getattr(self, "voxelizer", None)
+                    or getattr(self, "matched_gmo_voxelizer", None))
+        else:
+            mvox = getattr(self, "matched_gmo_voxelizer", None) or getattr(self, "voxelizer", None)
+        W2, H2, D2 = (int(mvox.W), int(mvox.H), int(mvox.D)) if mvox is not None else (0, 0, 0)
+        gmm_vs = (
+            (float(mvox.vs[0]), float(mvox.vs[1]), float(mvox.vs[2]))
+            if mvox is not None else (vx, vy, vz)
+        )
+        gmm_occ = np.zeros((W2, H2, D2), dtype=bool)            # [x,y,z]
+        gmm_col = np.zeros((W2, H2, D2, 4), dtype=np.float32)   # per-voxel class color
         if (
-            has_mixture and sel_pts.shape[0] > 0 and voxelizer is not None
-            and hasattr(voxelizer, "forward_gaussian_mixture_grouped")
+            has_mixture and sel_pts.shape[0] > 0 and mvox is not None
+            and hasattr(mvox, "forward_gaussian_mixture_grouped")
         ):
-            pts_list, col_list = [], []
             for q_i in range(int(mc_t.shape[0])):
                 try:
-                    occ_q = voxelizer.forward_gaussian_mixture_grouped(
+                    occ_q = mvox.forward_gaussian_mixture_grouped(
                         mixture_centers_world_tkg3=mc_t[q_i][None, None],
                         mixture_sigmas_world_tkg3=ms_t[q_i][None, None],
                         mixture_weights_tkg=mw_t[q_i][None, None],
@@ -1397,23 +1410,12 @@ class EfficientOCFVisualizationMixin:
                     )
                 except Exception:
                     continue
-                p_zyx = occ_q[0, 0, 0]  # [D,H,W] = [z,y,x]
-                vox_idx = torch.nonzero(p_zyx >= occ_thr, as_tuple=False)
-                m = int(vox_idx.shape[0])
-                if m == 0:
+                vidx = torch.nonzero(occ_q[0, 0, 0] >= occ_thr, as_tuple=False).cpu().numpy()  # (z,y,x)
+                if vidx.shape[0] == 0:
                     continue
-                if m > occ_max_vox:
-                    sub = torch.linspace(0, m - 1, occ_max_vox, device=vox_idx.device).round().long()
-                    vox_idx = vox_idx.index_select(0, sub)
-                vox_idx = vox_idx.cpu().numpy()
-                wx = pc[0] + (vox_idx[:, 2].astype(np.float32) + 0.5) * vx
-                wy = pc[1] + (vox_idx[:, 1].astype(np.float32) + 0.5) * vy
-                wz = pc[2] + (vox_idx[:, 0].astype(np.float32) + 0.5) * vz
-                pts_list.append(np.stack([wx, wy, wz], axis=1))
-                col_list.append(np.tile(np.asarray(_cls_color(sel_cls[q_i]))[None, :], (wx.shape[0], 1)))
-            if pts_list:
-                gmm_xyz = np.concatenate(pts_list, axis=0)
-                gmm_colors = np.concatenate(col_list, axis=0)
+                zz, yy, xx = vidx[:, 0], vidx[:, 1], vidx[:, 2]
+                gmm_occ[xx, yy, zz] = True
+                gmm_col[xx, yy, zz] = np.asarray(_cls_color(sel_cls[q_i]), dtype=np.float32)
 
         # 2 views x 2 rows. Top row: 1-sigma component ellipsoids. Bottom: GMM occ >= occ_thr.
         # 요청: 중복 뷰 제거(3→2), true-z, 그리고 2D BEV와 방향 일치(azim -60/-90 + y축 반전).
@@ -1485,31 +1487,34 @@ class EfficientOCFVisualizationMixin:
                         occ_xyz[:, 0], occ_xyz[:, 1], occ_xyz[:, 2],
                         c="0.4", s=1.7, alpha=0.45, linewidths=0,
                     )
-                # 예측 GMM occ: 옅게 → GT가 비쳐 보이도록(색이 너무 세지 않게).
-                if gmm_xyz.shape[0] > 0:
-                    ax2.scatter(
-                        gmm_xyz[:, 0], gmm_xyz[:, 1], gmm_xyz[:, 2],
-                        c=gmm_colors, s=1.4, alpha=0.18, linewidths=0,
-                    )
-                # 센터는 작은 점(구름 위 마지막). GT=lime, 예측=클래스색.
-                if gt_centers is not None and gt_centers.shape[0] > 0:
-                    ax2.scatter(
-                        gt_centers[:, 0], gt_centers[:, 1], gt_centers[:, 2],
-                        marker="o", c="lime", s=_CSZ, edgecolors="black",
-                        linewidths=0.8, depthshade=False, zorder=25,
-                    )
+                # 예측 occ: 예측 해상도 점유 복셀을 실제 스케일 큐브로 (각 큐브 = range/res).
+                if gmm_occ.any():
+                    nz = np.argwhere(gmm_occ)
+                    x0, y0, z0 = nz.min(0)
+                    x1, y1, z1 = nz.max(0)
+                    sub = gmm_occ[x0:x1 + 1, y0:y1 + 1, z0:z1 + 1]
+                    fc = gmm_col[x0:x1 + 1, y0:y1 + 1, z0:z1 + 1].copy()
+                    fc[..., 3] = 0.85
+                    ex = pc[0] + (x0 + np.arange(sub.shape[0] + 1)) * gmm_vs[0]
+                    ey = pc[1] + (y0 + np.arange(sub.shape[1] + 1)) * gmm_vs[1]
+                    ez = pc[2] + (z0 + np.arange(sub.shape[2] + 1)) * gmm_vs[2]
+                    gx, gy, gz = np.meshgrid(ex, ey, ez, indexing="ij")
+                    ax2.voxels(gx, gy, gz, sub, facecolors=fc,
+                               edgecolors=(0.15, 0.15, 0.15, 0.25), linewidth=0.2)
+                # 예측 센터만 표시(검정). GT center는 top row(1σ)에만 둠 — 요청대로 bottom(cube) row에선 제거.
                 for q_i in range(sel_pts.shape[0]):
                     ax2.scatter(
                         sel_pts[q_i, 0], sel_pts[q_i, 1], sel_pts[q_i, 2],
                         marker="o", c="black", s=_CSZ,
                         edgecolors="none", linewidths=0, depthshade=False, zorder=25,
                     )
-                _finalize(ax2, f"{view_name} gmm occ≥{occ_thr:g} | iter {int(step)} t={t_occ}", elev, azim, z_aspect)
+                _finalize(ax2, f"{view_name} pred occ≥{occ_thr:g} cubes {W2}x{H2}x{D2}@{gmm_vs[0]:.1f}m "
+                               f"| iter {int(step)} t={t_occ}", elev, azim, z_aspect)
             fig.suptitle(
                 f"score≥{score_thr:g}: selected={sel_pts.shape[0]}/{n_before} "
                 f"matched(sel)={int(sel_is_matched.sum())} "
                 f"gt_inst={0 if gt_centers is None else gt_centers.shape[0]} | "
-                f"top=1σ ellipsoid, bottom=gmm occ≥{occ_thr:g}",
+                f"top=1σ ellipsoid, bottom=pred occ≥{occ_thr:g} cubes ({W2}x{H2}x{D2}, {gmm_vs[0]:.1f}m)",
                 fontsize=11,
             )
             vis_dir = str(getattr(self, "debug_query_mixture3d_vis_dir", "./work_dirs/query_mixture3d_vis"))

@@ -204,7 +204,6 @@ class EfficientOCF(
             center_only_mode=self.center_only_mode,
             debug_query_center_marker_radius=self.debug_query_center_marker_radius,
             debug_query_gaussian_vis_mode=self.debug_query_gaussian_vis_mode,
-            debug_query_gaussian_prob_threshold=self.debug_query_gaussian_prob_threshold,
             debug_query_gaussian_prob_alpha_scale=self.debug_query_gaussian_prob_alpha_scale)
         self.context_depth_proxy_head = nn.Conv2d(
             in_channels=int(context_feat_dim),
@@ -221,6 +220,9 @@ class EfficientOCF(
             occ_size=(512, 512, 40),
             as_prob=True,
             lambda_occ=1.0,
+            # eval(512)은 forward σ를 그대로 splat — floor 제한 없음(=0). sigma_min(head)이 이미
+            # σ≥0.4m 보장하므로 0.2m 격자에서 소멸 위험 없음. floor는 train(거친 격자)에서만 필요.
+            gaussian_sigma_floor_vox=0.0,
             gaussian_combine_mode=self.query_multi_gaussian_occ_combine_mode,
         )
         low_x, low_y, low_z = self.query_matched_gmo_bce_occ_size
@@ -234,7 +236,21 @@ class EfficientOCF(
             as_prob=True,
             lambda_occ=1.0,
             gaussian_truncate_sigma=float(self.voxelizer.gaussian_truncate_sigma),
-            gaussian_sigma_floor_vox=float(self.voxelizer.gaussian_sigma_floor_vox),
+            # train(거친 0.8m 격자)은 방지턱 유지(0.5 voxel). self.voxelizer가 0이라 상속 끊고 명시.
+            gaussian_sigma_floor_vox=0.5,
+            gaussian_combine_mode=self.query_multi_gaussian_occ_combine_mode,
+        )
+        # eval 전용 3D mixture vis voxelizer: GT/metric 해상도(기본 512³)에 맞춤(floor=0, 고해상).
+        # train mixture3d vis는 matched_gmo_voxelizer(거친 loss 격자)를 써서 'loss가 보는 것'을 보여줌.
+        ev_x, ev_y, ev_z = self.debug_query_mixture3d_vis_eval_occ_size
+        self.mixture3d_eval_voxelizer = SoftVoxelizerOneAdd(
+            point_cloud_range=point_cloud_range,
+            voxel_size=(range_x / float(ev_x), range_y / float(ev_y), range_z / float(ev_z)),
+            occ_size=(ev_x, ev_y, ev_z),
+            as_prob=True,
+            lambda_occ=1.0,
+            gaussian_truncate_sigma=float(self.voxelizer.gaussian_truncate_sigma),
+            gaussian_sigma_floor_vox=0.0,
             gaussian_combine_mode=self.query_multi_gaussian_occ_combine_mode,
         )
 
@@ -1362,6 +1378,7 @@ class EfficientOCF(
                         gt_instance_occ3d_txyz=self._eval_future_tail(gt_inst).detach(),
                         img_metas=img_metas, step=step,
                         occ_threshold=float(prob_threshold), frame_idx=1,
+                        is_eval=True,
                     )
                 else:
                     self.maybe_save_query_mixture_3d_vis(
@@ -1369,6 +1386,7 @@ class EfficientOCF(
                         gt_instance_occ3d_txyz=gt_inst.detach(),
                         img_metas=img_metas, step=step,
                         occ_threshold=float(prob_threshold),
+                        is_eval=True,
                     )
             # cam-gaussian vis: instance_img_debug_bundle(이미지/캘리브)이 있어야 함.
             # enabled/every는 eval에서 강제 ON, 출력 dir만 eval용. 나머지 스타일은 config 그대로.

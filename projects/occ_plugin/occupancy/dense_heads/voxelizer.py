@@ -133,7 +133,10 @@ class SoftVoxelizerOneAdd(nn.Module):
         norm_mode="none",  # "none", "per_object", "per_frame"
         force_fp32=True,
         gaussian_truncate_sigma=3.0,
-        gaussian_sigma_floor_vox=0.35,
+        # 방지턱(safety bump): σ가 voxel보다 작아져 grid에서 사라지는(=occ 0, dead-gradient)
+        # 것을 막는 하한. voxel 단위라 해상도를 자동 추종(0.5=반 칸: 128→0.4m, 64→0.8m).
+        # 실제 최소 σ는 max(sigma_min_m, 0.5*voxel)이며, sigma_min_m이 이 값보다 크면 비활성.
+        gaussian_sigma_floor_vox=0.5,
         gaussian_combine_mode="poisson",
     ):
         super().__init__()

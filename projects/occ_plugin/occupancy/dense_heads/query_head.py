@@ -23,8 +23,8 @@ def sigmoid_to_world_from_range(logits: torch.Tensor,
 
 
 def sigmoid_to_sigma_from_range(logits: torch.Tensor,
-                                sigma_min=(0.15, 0.15, 0.10),
-                                sigma_max=(4.0, 4.0, 1.5)) -> torch.Tensor:
+                                sigma_min,
+                                sigma_max) -> torch.Tensor:
     """
     logits: (..., 3) unconstrained
     sigma_min/max: axis-wise sigma bounds in meters
@@ -385,8 +385,6 @@ class QueryHead(nn.Module):
                  center_out_dim=3,
                  offset_out_dim=3,
                  num_pcd=256,
-                 gaussian_sigma_min=(0.15, 0.15, 0.10),
-                 gaussian_sigma_max=(4.0, 4.0, 1.5),
                  query_num_gaussians=1,
                  query_multi_gaussian_offset_max_m=(6.0, 6.0, 2.0),
                  query_multi_gaussian_sigma_min_m=(0.15, 0.15, 0.10),
@@ -411,7 +409,6 @@ class QueryHead(nn.Module):
                  center_only_mode=False,
                  debug_query_center_marker_radius=3,
                  debug_query_gaussian_vis_mode="ellipse",
-                 debug_query_gaussian_prob_threshold=0.5,
                  debug_query_gaussian_prob_alpha_scale=4.0):
         super(QueryHead, self).__init__()
         self.embed_dim = embed_dim
@@ -575,8 +572,6 @@ class QueryHead(nn.Module):
                 f"query_depth_num_bins must be positive, got {self.query_depth_num_bins}"
             )
         self.num_pcd = num_pcd
-        self.gaussian_sigma_min = tuple(float(v) for v in gaussian_sigma_min)
-        self.gaussian_sigma_max = tuple(float(v) for v in gaussian_sigma_max)
         self.query_num_gaussians = int(query_num_gaussians)
         if self.query_num_gaussians <= 0:
             raise ValueError(f"query_num_gaussians must be >= 1, got {self.query_num_gaussians}")
@@ -641,12 +636,6 @@ class QueryHead(nn.Module):
                 "debug_query_gaussian_vis_mode must be one of "
                 "{'ellipse','prob','threshold'}, "
                 f"got {self.debug_query_gaussian_vis_mode!r}"
-            )
-        self.debug_query_gaussian_prob_threshold = float(debug_query_gaussian_prob_threshold)
-        if not (0.0 <= self.debug_query_gaussian_prob_threshold <= 1.0):
-            raise ValueError(
-                "debug_query_gaussian_prob_threshold must be in [0,1], "
-                f"got {self.debug_query_gaussian_prob_threshold}"
             )
         self.debug_query_gaussian_prob_alpha_scale = float(debug_query_gaussian_prob_alpha_scale)
         if self.debug_query_gaussian_prob_alpha_scale < 0.0:
@@ -3327,7 +3316,8 @@ class QueryHead(nn.Module):
             class_palette.get(int(rid), hi_color) for rid in self.query_class_ids
         ]
         gaussian_vis_mode = str(getattr(self, "debug_query_gaussian_vis_mode", "ellipse")).lower()
-        gaussian_prob_threshold = float(getattr(self, "debug_query_gaussian_prob_threshold", 0.5))
+        # 가우시안 footprint outline 등고선도 occ 임계값으로 통일 (eval_occ_threshold + EOCF_EVAL_OCC_THR).
+        gaussian_prob_threshold = float(prob_threshold)
         gaussian_prob_alpha_scale = float(getattr(self, "debug_query_gaussian_prob_alpha_scale", 4.0))
         traj_points_tq3 = None
         base_traj_points_tq3 = None
@@ -3757,11 +3747,11 @@ class QueryHead(nn.Module):
         gaussian_vis_mode = str(getattr(self, "debug_query_gaussian_vis_mode", "ellipse")).lower()
         if gaussian_vis_mode == "prob":
             gaussian_desc = (
-                f"rotated Gaussian prob map (thr={float(getattr(self, 'debug_query_gaussian_prob_threshold', 0.5)):.2f})"
+                f"rotated Gaussian prob map (thr={float(prob_threshold):.2f})"
             )
         elif gaussian_vis_mode == "threshold":
             gaussian_desc = (
-                f"rotated Gaussian prob>={float(getattr(self, 'debug_query_gaussian_prob_threshold', 0.5)):.2f} fill"
+                f"rotated Gaussian prob>={float(prob_threshold):.2f} fill"
             )
         else:
             gaussian_desc = "rotated Gaussian ellipse footprint"
@@ -4621,7 +4611,7 @@ class QueryHead(nn.Module):
         gaussian_centers_world: torch.Tensor = None,
         gaussian_sigmas_world: torch.Tensor = None,
         gaussian_truncate_sigma: float = None,
-        gaussian_sigma_floor_vox: float = 0.35,
+        gaussian_sigma_floor_vox: float = 0.5,  # 방지턱: σ ≥ 0.5 voxel(=반 칸), voxel 단위로 해상도 자동 추종
     ):
         """
         p2gt loss.

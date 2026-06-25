@@ -1,5 +1,37 @@
 # NOTES
 
+## 2026-06-25 KST — ✅ [해소] sigma_min_m → (0.4,0.4,0.2)로 train/eval 최소 σ 통일
+- 배경: `floor_vox=0.5`는 **voxel 단위**라 grid마다 물리 floor가 다름: matched 128(0.8m)→**0.4m**, eval/scene 512(0.2m)→**0.1m**. 옛 `sigma_min_m=(0.2,0.2,0.2)`에선 matched 0.4m(floor 지배)/eval 0.2m(sigma_min 지배)로 같은 σ가 train·eval에서 달라지는 미세 불일치가 있었음.
+- **조치**: `sigma_min_m`을 `0.5×coarsest(matched) voxel = (0.4,0.4,0.2)`로 상향(`shape_guide_128.py`·`shape_guide_128_dice.py` 둘 다). → σ가 항상 floor 이상이라 **floor_vox가 양 격자에서 비활성**, 네트워크 σ가 train·eval에 동일하게 흐름 = **완전 일치**.
+- ⚠️ **해상도 의존**: matched 해상도 바꾸면 sigma_min도 `0.5×새 voxel`로 재산정(64→0.8m, 256→0.2m). `efficientocf_config.py` DEFAULTS(0.15)는 미변경(공유) — config별로 직접 지정할 것.
+- floor/sigma_min은 **over-spread(퍼짐)와 무관** — 그건 offset_max(12)/sigma_max(3)/`weight_mode='ones'` 쪽(아래 항목). 이 정리는 '소멸 방지(아래쪽)+train/eval 일관성'만 다룸.
+
+## 2026-06-25 KST — ⚠️ shape over-spread(폭발) 근본원인: occ focal이 shape를 못 잡음 + `weight_mode='ones'`
+- **증상**(shape_guide / shape_guide_128 공통): matched query 하나의 union-of-48-gaussian footprint가 차(≈4.5m)를 한참 넘어 퍼짐. 2D `query_debug_vis` row2~4(cand/sel/matched)·3D `mixture3d`·cam_gaussian 모두 거대 blob. 128 run은 occ≥0.5가 BEV 평면(~100×100m)을 카펫처럼 덮음.
+- **dbg 결정 증거**: `loss_gmo_focal`이 0.14→**0.005**로 수렴하는데 shape는 폭발. 즉 **over-coverage가 focal의 최소값** → 조일 gradient 없음. `loss_gmo_dice=0`(off)·`loss_query_sigma_reg=0`(off)·`loss_query_weight_reg=0`(off)이라 **shape를 잡는 항이 하나도 안 돎**. (비교: `loss_query_center_match`~1.7–2.7). 64·128 두 run의 focal 궤적은 **동일** → 격자 변경은 폭발과 무관.
+- **근본원인 A — focal이 spread를 못 벌함**(코드 검증):
+  - `utils_loss.py:2634` `p.clamp(eps,1-eps)` → 카펫 **내부 p=1.0 포화**(union `1-Π(1-G)`는 gaussian 몇 개만 켜져도 1) → clamp가 gradient 0 통과. 큰 BCE 미분(1/(1-p))이 **실현 안 됨**.
+  - `utils_loss.py:2660-2667` class-balanced **mean**: `loss_neg=Σ/neg.count`를 **전 격자(128³=327k 셀)로 평균** + α=0.25(neg 0.75배) + 0.5 + weight 0.1 → **FP 셀당 gradient ≈1e-7**. gradient 있는 곳은 얇은 경계 shell뿐인데, union-max라 한 gaussian 가장자리를 깎아도 **나머지 47개가 그 셀을 여전히 1로 덮음**.
+  - ❗ 128은 64 대비 neg 셀 4배 → **FP 셀당 gradient 1/4로 더 약해짐**(스칼라 loss는 mean이라 동일하게 보이지만 per-cell gradient는 희석). 격자 키우면 shape는 더 안 잡힘.
+- **근본원인 B(동급) — `weight_mode='ones'`**(`query_head.py:1807` `weights=ones_like(...)`, weight head 출력 폐기): 48개 gaussian이 **항상 peak=1·union**. **opacity off-switch 없음** → 잉여 47개를 끄는 길이 (sigma→floor & offset→0으로 다른 가우시안 속에 nest)뿐인 **measure-zero 기하 조건**. 완벽한 loss라도 sigma/offset만으로는 못 모음. `sigmoid_to_sigma`(min0.2~max3.0)·`tanh*offset_max(12,12,2)`엔 0으로 당기는 prior 없음.
+- **vis 주의**: full-BEV 카펫은 일부 **scene/eval splat**(`voxelizer.py:598-709`, 512격자) 산물 — per-pair **학습 loss**는 grown bbox(~±21m)만 렌더. 카펫은 loss가 실제 보는 것보다 과장. 단 per-query 과확산 자체는 실재(matched blob·1σ 타원).
+- **수정 우선순위**(적대 검증 후):
+  1. **`use_query_gmo_dice_loss=True`(Tversky, FP-heavy α≈0.7/β≈0.3)** ← 단독 최고. `_compute_foreground_tversky_pair_loss(utils_loss.py:2690-2697)`는 FP를 **foreground 크기로 정규화**(전격자 327k 아님) → gradient 안 사라짐·격자 불변·β가 recall 방어. **단, config 주석상 GUIDE 논문 재현 위해 일부러 off**한 것이므로 trade-off 인지하고 켤 것.
+  2. **`weight_mode='sigmoid'`**(opacity 복구, `query_head.py:1799` 지원) ← dice와 **함께만**. 단독은 opacity 닫으라는 gradient가 없어 무효. `weight_reg`는 `'ones'`에선 **폐기 텐서 정규화=완전 no-op**이니 `sigmoid`로 바꾼 뒤에만 의미.
+  3. 기하 난간: `offset_max 12→4~6`, `sigma_max(xy) 3.0→1.5~2.0`. 싸고 안전하나 band-aid(너무 줄이면 트레일러 under-cover).
+  4. `sigma_reg` 단독·focal weight↑는 **지양**: 전자는 무조건 축소→under-coverage/recall 붕괴, 후자는 포화·희석된 항을 상수배라 균형만 깸.
+- **GUIDE 논문(GUIDE.pdf) 대조 — "focal only"는 GUIDE의 절반만 따라한 것**: GUIDE의 occ loss(Locc)도 focal only가 맞고(§3.5), opacity도 없음(Gaussian anchor=R^{K×10}=offset3+scale3+quat4, §3.3)이라 `weight_mode='ones'`·union·K=48(Table8)·focal-Locc는 **전부 GUIDE 충실**. 그러나 **가우시안 shape를 직접 감독하는 손실은 GUIDE도 Locc(focal) 하나뿐**(per-gaussian L1 없음) — 즉 손실로만 보면 GUIDE도 impl과 동급. GUIDE의 focal이 **작동하는 이유는 더 센 손실이 아니라 구조/초기화**: ①**instance anchor를 GT에서 k-means 초기화**(§3.2 BI∈R^{10}=pos+scale+yaw+vel, line349) → 가우시안이 처음부터 실제 객체·정위치에서 시작(focal은 *유지*만, *발견* 불필요). ②**Lreg = instance center/scale/velocity L1**(§3.5)이 가우시안의 **원점(instance center)을 GT에 고정**. ③**5-layer Gaussian decoder가 deformable 이미지 feature로 각 가우시안 anchor(offset/scale/rot)를 반복 정제**(§3.3) → 가우시안이 이미지 증거를 추종. ⚠️ Lreg는 instance box를 감독할 뿐 가우시안 offset을 기하적으로 clamp하진 않음(직전 메모의 "envelope 직접 감독"은 과장, 정정).
+- ❗ **구현이 빠뜨린 것**: (a) instance **scale/extent L1 회귀가 없음**(emit되는 loss 키에 scale/box-size 항 부재; center는 `loss_query_center_match`만, `loss_query_attn_bbox`는 2D 카메라 attention bbox지 3D box envelope 아님), (b) k-means init 없음(offset=`tanh(logits)*offset_max` 고정상수 ±12m, init logits~0→offset 0으로 **중심에 뭉친 채 시작**, sigma는 중점 ~1.6m). 결과: collapsed→focal-pos가 차 덮으려 밖으로 밀고→focal-neg(희석/포화)는 overshoot 못 막음→envelope 없이 퍼짐.
+- **GUIDE 충실 수정 = ①+②(opacity 아님!)**: GUIDE엔 opacity가 없으므로 `weight_mode='sigmoid'`는 GUIDE 이탈. GUIDE대로면 **per-query instance scale(wlh) 예측 head + 매칭 GT box에 L1**(Lreg) 추가가 정답, offset을 그 회귀 scale에 커플(고정 12m 대신), 가우시안 offset/sigma를 GT 기반 init. Tversky/dice는 GUIDE엔 없지만 효과적인 대체 엔지니어링 fix.
+
+## 2026-06-24 KST — `forward_gaussian_mixture_grouped` 메모리는 `pair_chunk`가 좌우 (GT 격자 아님)
+
+- 학습 occ-loss/매칭의 `matched_gmo_voxelizer.forward_gaussian_mixture_grouped`는 청크당 `[chunk, G, bbox]` intermediate를 만들고, 출력(`occ_tkzyx`)에 **slice 대입**(voxelizer.py:594)으로 누적 → **모든 청크의 intermediate가 backward까지 retained**. 따라서 peak ≈ (청크 수)×(청크 intermediate), K(매칭 쿼리 수)에 선형.
+- ❗ **핵심**: bbox는 청크 내 pair들의 **min/max union**(voxelizer.py:542-547). 매칭 쿼리는 scene 전역에 흩어져 있어 `chunk≥2`면 bbox가 거의 **전체 격자**가 됨 → intermediate 폭증. **`chunk=1`이면 bbox가 객체 크기로 축소**되어 메모리 급감.
+- GPU 실측(T=1, G=48, fwd+bwd, union, 128×128×20) **peak / ms**: K80 → c8 35GB·132 / c4 25GB·117 / **c2 9.6GB·89** / c1 1.3GB·131. K160 → c2 17.7GB·158 / c1 2.6GB·257. occ 출력 자체는 수십 MB뿐 — peak는 intermediate가 지배.
+- ⚠️ `pair_chunk`는 **결과 불변**(메모리/연산 chunking만). 속도는 **chunk=2가 sweet spot**(모든 K 最速): chunk=1은 Python 루프 반복↑로 느리고(~1.6배), chunk≥4는 전체격자 낭비연산으로 느림+메모리 폭증. 메모리 최소는 chunk=1(K 무관 ≤2.6GB). **균형=2(채택), 빡빡한 GPU 안전=1.** config 키는 `efficientocf.py:3016`에서 loss로 전달됨.
+- 시각화(`maybe_save_query_mixture_3d_vis`)는 쿼리당 K=1 호출이라 chunk 무관·메모리 무시 가능.
+
 ## 2026-06-23 KST — occupancy threshold 단일 출처(`eval_occ_threshold`) 주의
 - occupancy 점유 판정 threshold는 이제 **`eval_occ_threshold`(기본 0.5) 한 곳**이 출처. 참조처: ①평가 metric 이진화(`efficientocf.py:1428`, env `EOCF_EVAL_OCC_THR`로만 override), ②2D `query_debug_vis` occ-grid(학습 `efficientocf.py:2943` / 추론은 ①의 `thr` 전달), ③3D `mixture3d` occ(`utils_visualization.py:1364`, eval은 env-resolved 값을 `occ_threshold` 인자로 받음).
 - ⚠️ **`debug_query_mixture3d_vis_occ_threshold`는 제거됨(deprecated).** config에 남겨도 `_merge_cfg`가 non-strict라 무해하지만 **아무 효과 없음**. mixture3d occ threshold를 바꾸려면 `eval_occ_threshold`를 바꿀 것(metric도 같이 움직임 = 의도된 정렬).
