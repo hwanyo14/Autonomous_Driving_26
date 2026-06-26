@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-06-26 KST — 3D calib grid search 제거 (기본값 고정)
+
+- `projects/occ_plugin/occupancy/detectors/efficientocf.py:1651`: `_calibrate_eval_3d_align` grid search를 BEV align과 동일한 패턴으로 교체.
+- 기본값 `(t=0, transpose=True, fh=0, fw=0, fz=0)` 고정 — 64회 512³ IoU 연산 제거.
+- `EOCF_EVAL_3D_ALIGN=auto` 시에만 기존 grid search 실행.
+- `EOCF_EVAL_3D_ALIGN=0,1,0,0,0` 형태로 명시적 override 가능.
+- **버그 수정**: 기존 calib은 첫 샘플 prediction이 비어있으면 `(0, False, 1, 1, 1)` 등 노이즈 alignment에 잠기는 문제 있었음.
+
+## 2026-06-26 KST — dist_test.sh MPS 관리 코드 추가
+
+- `tools/dist_test.sh`: `dist_train.sh`와 동일한 MPS(Multi-Process Service) 관리 블록 추가.
+- `USE_MPS=1` 기본값. eval 동시 실행 시 GPU SM을 MPS로 공유해 CUDA illegal memory access 방지.
+- `USE_MPS=0`으로 비활성화 가능 (eval_total.sh 등에서 환경변수 앞에 설정).
+
+## 2026-06-25 21:39:56 KST — shape_guide_128_dice_weight_24 Gaussian 수 축소
+
+- `projects/configs/baselines/shape_guide_128_dice_weight_24.py`: shape guide Gaussian ablation을 위해 `query_num_gaussians`를 48에서 24로 변경.
+
 ## 2026-06-25 KST — shape_guide_128_dice_weight 신규 config: opacity 부활(weight_mode 'ones'→'sigmoid')
 
 - **배경**: 실행 중인 `shape_guide_128_dice` 로그 분석 → `loss_gmo_dice`가 iter 1부터 0.49→0.46으로 **평탄**(657 iter 평균 0.467, 기울기 ~0). over-spread equilibrium에 갇힘. 원인 진단: `weight_mode='ones'`(48개 가우시안 always-on, opacity off-switch 없음) + union이라, FP를 줄이는 길이 "sigma 축소"뿐 → 줄이면 FN(gap) 발생 → 적당히 퍼진 blob이 tversky 최소점.

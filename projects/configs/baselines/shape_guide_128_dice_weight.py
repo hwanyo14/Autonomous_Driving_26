@@ -485,6 +485,7 @@ debug_cfg = dict(
     debug_query_cam_gaussian_vis_enabled=True,
     debug_query_cam_gaussian_vis_every=48,    # cam_gaussian
     debug_query_mixture3d_vis_every=48,       # 3D mixture3d
+    debug_query_attn_softargmax_vis_every=48, # query attention map
 )
 
 visualization_cfg = dict(

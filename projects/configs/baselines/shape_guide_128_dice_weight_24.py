@@ -362,8 +362,16 @@ model_cfg = dict(
     use_segmentation_as_query_gt=True,
     use_gmo_bce_loss=True,
     query_gmo_loss_type='focal',
-    # [GUIDE-real] dice off → GUIDE 논문처럼 occupancy 손실은 focal only.
-    use_query_gmo_dice_loss=False,
+    # [dice 실험] focal-only는 over-spread에서 occ focal이 clamp 포화 + 전격자 mean 희석으로
+    # FP gradient ≈0 → shape 못 잡음(NOTES 2026-06-25). Tversky(FP-heavy)를 켜서 FP를
+    # foreground 크기로 정규화 → 퍼짐에 안 사라지는 gradient 부여. 격자 불변, β가 recall 방어.
+    # focal(364줄)은 불균형 처리로 병행 유지, dice가 shape 주력.
+    # 단일 변수 실험: 이번엔 weight_mode='ones'→'sigmoid'(opacity)만 바꿈. 나머지 dice/tversky 설정과
+    #   제한값(offset_max=12/sigma_max=3)은 dice run과 동일하게 유지.
+    use_query_gmo_dice_loss=True,
+    query_gmo_dice_loss_weight=0.5,
+    query_gmo_tversky_alpha=0.7,   # FP(over-coverage) 가중
+    query_gmo_tversky_beta=0.3,    # FN(under-coverage) 가중
     query_gt2p_instance_labeled_tau=0.3,
     query_gt2p_cooldown_iters=4000,
     query_class_ids=query_class_ids,           # full raw ids kept for GT loading/validation
@@ -430,21 +438,37 @@ model_cfg = dict(
     query_traj_teacher_forcing_gt_ratio=1.0,
     query_traj_teacher_forcing_schedule_iters=(),
     query_traj_teacher_forcing_schedule_gt_ratios=(),
-    query_matched_gmo_bce_occ_size=(64, 64, 20),
-    query_num_gaussians=48,
-    # [GUIDE-real] α 제거(weight_mode='ones') → (sigma↔weight) degeneracy 소멸 → occ focal이 sigma를
-    # 직접 통제. 그래서 shape bound는 'tight 제약'이 아니라 '폭발 방지 난간'으로 느슨하게 둔다.
-    # sigma_max 2.0→3.0(xy)/0.7→1.5(z): loss가 안에서 깎으므로 풀어줌. sigma_min=voxel(0.2) 바닥.
-    # sigma_reg=0: α 없으니 불필요. offset은 그대로 넉넉(트레일러 커버).
+    # loss 격자 64→128(xy): 학습 occ-loss를 BEV 해상도(0.8m)에 맞춰 촘촘하게.
+    # 효과: x,y sigma floor(=0.5 voxel, 방지턱)가 64→128에서 0.8m→0.4m, 자동차 폭이
+    # ~1칸→~2칸으로 형상 감독 가능. 추론/시각화는 무관(항상 512에서 가우시안 직접 splat).
+    query_matched_gmo_bce_occ_size=(128, 128, 20),
+    # [메모리·속도] grouped voxelizer는 청크당 (chunk·G·bbox) intermediate를 backward까지 retain.
+    # 흩어진 query를 묶으면 bbox≈전체 격자 → chunk 클수록 메모리·낭비연산 폭증. 결과는 chunk 무관.
+    # GPU 실측(128격자, fwd+bwd, peak / ms): K80 → c8 35GB·132 / c4 25GB·117 / c2 9.6GB·89 / c1 1.3GB·131.
+    #   K160 → c2 17.7GB·158 / c1 2.6GB·257.  → 속도 sweet spot=2(모든 K 최速), 메모리 최소=1.
+    # 채택 2: 속도 우선(c1 대비 ~1.6배 빠름). 객체 多 프레임서 OOM(특히 여유 적은 GPU) 나면 1로 내릴 것.
+    query_multi_gaussian_pair_chunk=2,
+    query_num_gaussians=24,
+    # shape bound(sigma)는 'tight 제약'이 아니라 '폭발 방지 난간'으로 느슨하게 둔다.
+    # (이 run은 weight_mode='sigmoid'라 α opacity가 sigma와 함께 shape를 통제 — 아래 weight 블록 참고.)
+    # sigma_max 2.0→3.0(xy)/0.7→1.5(z): loss가 안에서 깎으므로 풀어줌.
+    # sigma_min_m = 0.5 × matched voxel (= train/eval 최소 σ 통일). matched(0.8m xy/0.4m z)
+    #   → (0.4, 0.4, 0.2). 이러면 σ가 항상 floor_vox 이상 → floor가 양 격자에서 비활성,
+    #   네트워크 σ가 train·eval에 동일하게 흐름(불일치 제거). ※해상도 바꾸면 이 값도 0.5×새 voxel로.
+    # sigma_reg=0: 단일변수 유지 위해 유보. ※weight_mode='sigmoid'로 α가 부활했으므로
+    #   (sigma↔weight) degeneracy가 돌아옴 → sigma 폭주 시 소량 켜는 것 고려. offset은 넉넉(트레일러).
     # 주의: binary fg라 car~trailer가 이 한 세트 공유 → car IoU/precision + over-coverage 모니터.
     query_multi_gaussian_offset_max_m=(12.0, 12.0, 2.0),
-    query_multi_gaussian_sigma_min_m=(0.2, 0.2, 0.2),
+    query_multi_gaussian_sigma_min_m=(0.4, 0.4, 0.2),
     query_multi_gaussian_sigma_max_m=(3.0, 3.0, 1.5),
     query_multi_gaussian_sigma_reg_loss_weight=0.0,
-    # [GUIDE-real] GUIDE 논문 그대로: weight/opacity 없음. union p = 1 - Π(1 - G), 모든 가우시안
-    # 중심 peak=1. weight_mode='ones'면 weight head 출력 무시하고 weights≡1 (sigmoid opacity 제거).
-    # → weight collapse/몰빵 + (sigma↔weight) degeneracy 동시 소멸. combine_mode='union' 필수.
-    query_multi_gaussian_weight_mode='ones',
+    # [weight 실험] opacity 부활: weight_mode='sigmoid' → 가우시안마다 α=sigmoid(logit)∈[0,1].
+    # union p = 1 - Π(1 - α·G), α→0 이면 그 blob OFF. dice 'ones' run이 48개 always-on이라
+    # over-spread equilibrium(dice 평탄)에 갇혔던 걸, tversky FP항이 잉여 blob의 α를 내려
+    # 끄게 만들어 풀려는 의도. combine_mode='union' 필수(이미 union이라 단일변수 성립).
+    # trade-off: (sigma↔weight) degeneracy 복귀 → 아래 sigma_reg=0 근거가 깨짐(모니터 필요).
+    # 단일변수 유지: weight_reg=0(아래)·sigma_reg=0 그대로 두고 tversky에만 sparsity를 맡김.
+    query_multi_gaussian_weight_mode='sigmoid',
     query_multi_gaussian_occ_combine_mode='union',
     query_multi_gaussian_softplus_bias_init=0.0,
     query_multi_gaussian_weight_reg_loss_weight=0.0,
@@ -488,6 +512,8 @@ visualization_cfg = dict(
     debug_query_mixture3d_vis_max_queries=50,
     debug_query_mixture3d_vis_max_gt_points=40000,
     debug_query_mixture3d_vis_occ_max_voxels_per_query=4000,
+    # eval mixture3d만 GT/metric 해상도(512³, 0.2m)로 렌더. 학습 vis는 loss 격자(128, 0.8m) 유지.
+    debug_query_mixture3d_vis_eval_occ_size=(512, 512, 40),
 )
 
 model = dict(

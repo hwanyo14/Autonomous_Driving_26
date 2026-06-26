@@ -1650,7 +1650,13 @@ class EfficientOCF(
         if torch.is_tensor(gt_occ_fg) and gt_occ_fg.dim() == 4:
             align3d = getattr(self, "_eval_3d_align", None)
             if align3d is None:
-                align3d = self._calibrate_eval_3d_align(pred_occ3d, gt_occ_fg)
+                env3d = os.environ.get("EOCF_EVAL_3D_ALIGN", "").strip().lower()
+                if env3d == "auto":
+                    align3d = self._calibrate_eval_3d_align(pred_occ3d, gt_occ_fg)
+                else:
+                    t, tr, fh, fw, fz = [int(x) for x in env3d.split(",")] if env3d else (0, 1, 0, 0, 0)
+                    align3d = (t, bool(tr), fh, fw, fz)
+                    print(f"[simple_test] 3D align {align3d}", flush=True)
                 self._eval_3d_align = align3d
             if align3d is not None:
                 t_idx, transpose, fh, fw, fz = align3d
