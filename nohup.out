@@ -70,3 +70,55 @@ load config from local path: ./projects/configs/baselines/shape_guide_128_dice_w
 -------------
 load config from local path: ./projects/configs/baselines/shape_guide_128_dice_weight_24.py
 [dist_train] console logging -> logs/shape_guide_128_dice_weight_24/20260626_161342.log  (실시간 보기: tail -f logs/shape_guide_128_dice_weight_24/20260626_161342.log)
+[dist_test] console logging -> logs/shape_guide_128_dice/eval/20260626_171253.log  (실시간 보기: tail -f logs/shape_guide_128_dice/eval/20260626_171253.log)
+[dist_test] console logging -> logs/shape_guide_128_dice/eval/20260626_174827.log  (실시간 보기: tail -f logs/shape_guide_128_dice/eval/20260626_174827.log)
+[dist_test] console logging -> logs/shape_guide_128_dice/eval/20260626_174837.log  (실시간 보기: tail -f logs/shape_guide_128_dice/eval/20260626_174837.log)
+[dist_test] console logging -> logs/shape_guide_128_dice/eval/20260626_174935.log  (실시간 보기: tail -f logs/shape_guide_128_dice/eval/20260626_174935.log)
+[dist_test] console logging -> logs/shape_guide_128_dice/eval/20260626_174937.log  (실시간 보기: tail -f logs/shape_guide_128_dice/eval/20260626_174937.log)
+-------------
+load config from local path: ./projects/configs/baselines/shape_guide_128_dice_weight.py
+[dist_train] console logging -> logs/shape_guide_128_dice_weight/20260626_174958.log  (실시간 보기: tail -f logs/shape_guide_128_dice_weight/20260626_174958.log)
+-------------
+load config from local path: ./projects/configs/baselines/shape_guide_128_dice_weight_24.py
+[dist_train] console logging -> logs/shape_guide_128_dice_weight_24/20260626_175507.log  (실시간 보기: tail -f logs/shape_guide_128_dice_weight_24/20260626_175507.log)
+eval_total_2.sh: line 22: unexpected EOF while looking for matching `"'
+[dist_test] console logging -> logs/shape_guide_128_dice_weight/eval/20260626_195904.log  (실시간 보기: tail -f logs/shape_guide_128_dice_weight/eval/20260626_195904.log)
+-------------
+load config from local path: ./projects/configs/baselines/shape_guide_128_dice_weight_fl25.py
+[dist_train] console logging -> logs/shape_guide_128_dice_weight_fl25/20260626_200154.log  (실시간 보기: tail -f logs/shape_guide_128_dice_weight_fl25/20260626_200154.log)
+-------------
+load config from local path: ./projects/configs/baselines/shape_guide_128_dice_weight_full.py
+[dist_train] console logging -> logs/shape_guide_128_dice_weight_full/20260626_220650.log  (실시간 보기: tail -f logs/shape_guide_128_dice_weight_full/20260626_220650.log)
+-------------
+load config from local path: ./projects/configs/baselines/shape_guide_128_dice_weight_fl25.py
+[dist_train] console logging -> logs/shape_guide_128_dice_weight_fl25/20260627_194729.log  (실시간 보기: tail -f logs/shape_guide_128_dice_weight_fl25/20260627_194729.log)
+-------------
+load config from local path: ./projects/configs/baselines/shape_guide_128_dice_weight_24.py
+[dist_train] console logging -> logs/shape_guide_128_dice_weight_24/20260627_194756.log  (실시간 보기: tail -f logs/shape_guide_128_dice_weight_24/20260627_194756.log)
+-------------
+load config from local path: ./projects/configs/baselines/shape_guide_128_dice_weight_full.py
+[dist_train] console logging -> logs/shape_guide_128_dice_weight_full/20260627_194801.log  (실시간 보기: tail -f logs/shape_guide_128_dice_weight_full/20260627_194801.log)
+-------------
+load config from local path: ./projects/configs/baselines/shape_guide_128_dice_weight_full.py
+[dist_train] console logging -> logs/shape_guide_128_dice_weight_full/20260627_195850.log  (실시간 보기: tail -f logs/shape_guide_128_dice_weight_full/20260627_195850.log)
+-------------
+load config from local path: ./projects/configs/baselines/shape_guide_128_dice_weight_full.py
+[dist_train] console logging -> logs/shape_guide_128_dice_weight_full/20260627_195853.log  (실시간 보기: tail -f logs/shape_guide_128_dice_weight_full/20260627_195853.log)
+-------------
+load config from local path: ./projects/configs/baselines/shape_guide_128_dice_weight_full.py
+[dist_train] console logging -> logs/shape_guide_128_dice_weight_full/20260627_200107.log  (실시간 보기: tail -f logs/shape_guide_128_dice_weight_full/20260627_200107.log)
+-------------
+load config from local path: ./projects/configs/baselines/shape_guide_128_dice_weight_24.py
+[dist_train] console logging -> logs/shape_guide_128_dice_weight_24/20260627_200451.log  (실시간 보기: tail -f logs/shape_guide_128_dice_weight_24/20260627_200451.log)
+-------------
+load config from local path: ./projects/configs/baselines/shape_guide_128_dice_weight_fl25.py
+[dist_train] console logging -> logs/shape_guide_128_dice_weight_fl25/20260627_200455.log  (실시간 보기: tail -f logs/shape_guide_128_dice_weight_fl25/20260627_200455.log)
+-------------
+load config from local path: ./projects/configs/baselines/shape_guide_128_dice_weight_fl25_z.py
+[dist_train] console logging -> logs/shape_guide_128_dice_weight_fl25_z/20260629_113826.log  (실시간 보기: tail -f logs/shape_guide_128_dice_weight_fl25_z/20260629_113826.log)
+-------------
+load config from local path: ./projects/configs/baselines/shape_guide_128_dice_weight_fl25_sz06_dice3d.py
+[dist_train] console logging -> logs/shape_guide_128_dice_weight_fl25_sz06_dice3d/20260629_141435.log  (실시간 보기: tail -f logs/shape_guide_128_dice_weight_fl25_sz06_dice3d/20260629_141435.log)
+-------------
+load config from local path: ./projects/configs/baselines/shape_guide_128_dice_weight_full.py
+[dist_train] console logging -> logs/shape_guide_128_dice_weight_full/20260629_141448.log  (실시간 보기: tail -f logs/shape_guide_128_dice_weight_full/20260629_141448.log)

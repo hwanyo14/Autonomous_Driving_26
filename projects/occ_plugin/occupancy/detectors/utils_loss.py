@@ -2823,9 +2823,15 @@ class EfficientOCFLossMixin:
                 if pair_loss is not None:
                     pair_losses.append(pair_loss)
                 if compute_dice:
-                    p_bev = p[:, :, 0].amax(dim=2)
-                    t_bev = t[:, :, 0].amax(dim=2)
-                    valid_bev = valid_tk[:, k:k + 1, None, None].expand_as(p_bev)
+                    if getattr(self, "query_gmo_dice_3d", False):
+                        # 3D dice: z collapse 없이 [T,1,Z,Y,X] 그대로 -> z 과확장도 Tversky FP로 벌함
+                        p_bev = p[:, :, 0]
+                        t_bev = t[:, :, 0]
+                        valid_bev = valid_tk[:, k:k + 1, None, None, None].expand_as(p_bev)
+                    else:
+                        p_bev = p[:, :, 0].amax(dim=2)
+                        t_bev = t[:, :, 0].amax(dim=2)
+                        valid_bev = valid_tk[:, k:k + 1, None, None].expand_as(p_bev)
                     dice_loss = self._compute_foreground_tversky_pair_loss(
                         pred_occ=p_bev,
                         gt_occ=t_bev,
@@ -2866,9 +2872,14 @@ class EfficientOCFLossMixin:
                 if pair_loss is not None:
                     pair_losses.append(pair_loss)
                 if compute_dice:
-                    p_bev = p.amax(dim=2)
-                    t_bev = t.amax(dim=2)
-                    valid_bev = valid_frame_t[:, None, None, None].expand_as(p_bev)
+                    if getattr(self, "query_gmo_dice_3d", False):
+                        p_bev = p
+                        t_bev = t
+                        valid_bev = valid_frame_t[:, None, None, None, None].expand_as(p_bev)
+                    else:
+                        p_bev = p.amax(dim=2)
+                        t_bev = t.amax(dim=2)
+                        valid_bev = valid_frame_t[:, None, None, None].expand_as(p_bev)
                     dice_loss = self._compute_foreground_tversky_pair_loss(
                         pred_occ=p_bev,
                         gt_occ=t_bev,

@@ -512,8 +512,8 @@ visualization_cfg = dict(
     debug_query_mixture3d_vis_max_queries=50,
     debug_query_mixture3d_vis_max_gt_points=40000,
     debug_query_mixture3d_vis_occ_max_voxels_per_query=4000,
-    # eval mixture3d만 GT/metric 해상도(512³, 0.2m)로 렌더. 학습 vis는 loss 격자(128, 0.8m) 유지.
-    debug_query_mixture3d_vis_eval_occ_size=(512, 512, 40),
+    # eval mixture3d도 lightweight 128x128x10으로 렌더해 train 중 eval/debug vis 메모리 spike를 줄임.
+    debug_query_mixture3d_vis_eval_occ_size=(128, 128, 10),
 )
 
 model = dict(

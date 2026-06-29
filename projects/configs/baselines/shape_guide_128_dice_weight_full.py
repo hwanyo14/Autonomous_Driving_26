@@ -114,8 +114,8 @@ bda_aug_conf = dict(
     flip_dy_ratio=0.5,
 )
 
-# train_capacity = 23930  # default: use all sequences
-train_capacity = 4000  # 3880
+train_capacity = 23930  # default: use all sequences
+# train_capacity = 4000  # 3880
 # train_capacity = 7  # 3880
 
 test_capacity = 5119  # default: use all sequences
@@ -448,7 +448,7 @@ model_cfg = dict(
     #   K160 → c2 17.7GB·158 / c1 2.6GB·257.  → 속도 sweet spot=2(모든 K 최速), 메모리 최소=1.
     # 채택 2: 속도 우선(c1 대비 ~1.6배 빠름). 객체 多 프레임서 OOM(특히 여유 적은 GPU) 나면 1로 내릴 것.
     query_multi_gaussian_pair_chunk=2,
-    query_num_gaussians=24,
+    query_num_gaussians=48,
     # shape bound(sigma)는 'tight 제약'이 아니라 '폭발 방지 난간'으로 느슨하게 둔다.
     # (이 run은 weight_mode='sigmoid'라 α opacity가 sigma와 함께 shape를 통제 — 아래 weight 블록 참고.)
     # sigma_max 2.0→3.0(xy)/0.7→1.5(z): loss가 안에서 깎으므로 풀어줌.

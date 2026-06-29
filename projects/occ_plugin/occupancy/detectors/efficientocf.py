@@ -236,8 +236,8 @@ class EfficientOCF(
             as_prob=True,
             lambda_occ=1.0,
             gaussian_truncate_sigma=float(self.voxelizer.gaussian_truncate_sigma),
-            # train(거친 0.8m 격자)은 방지턱 유지(0.5 voxel). self.voxelizer가 0이라 상속 끊고 명시.
-            gaussian_sigma_floor_vox=0.5,
+            # train(거친 격자)용 방지턱. config별 sharpness ablation을 위해 override 가능.
+            gaussian_sigma_floor_vox=float(self.query_matched_gmo_sigma_floor_vox),
             gaussian_combine_mode=self.query_multi_gaussian_occ_combine_mode,
         )
         # eval 전용 3D mixture vis voxelizer: GT/metric 해상도(기본 512³)에 맞춤(floor=0, 고해상).
@@ -3030,7 +3030,7 @@ class EfficientOCF(
                 gt_instance_occ3d_txyz_pred=_hist_slice(match_gt_instance_occ3d_txyz),
                 objectness_scores_tq=None,
                 inst_match_result=inst_match_result,
-                loss_weight=0.1,
+                loss_weight=float(self.query_gmo_loss_weight),
                 loss_type=self.query_gmo_loss_type,
                 focal_gamma=float(self.query_gmo_focal_gamma),
                 focal_alpha=float(self.query_gmo_focal_alpha),

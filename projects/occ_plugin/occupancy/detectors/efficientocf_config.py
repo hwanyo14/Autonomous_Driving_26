@@ -5,7 +5,9 @@ MODEL_CFG_DEFAULTS = {
     "query_gmo_loss_type": "balanced_bce",
     "query_gmo_focal_gamma": 2.0,
     "query_gmo_focal_alpha": 0.25,
+    "query_gmo_loss_weight": 0.1,   # focal/bce GMO term weight (formerly hardcoded 0.1 in efficientocf.py)
     "query_gmo_dice_loss_weight": 0.5,
+    "query_gmo_dice_3d": False,   # True면 dice/Tversky를 z collapse 없이 3D로 (z 과확장 억제)
     "query_gmo_tversky_alpha": 0.7,
     "query_gmo_tversky_beta": 0.3,
     "query_gmo_soft_gt_enabled": False,
@@ -103,6 +105,7 @@ MODEL_CFG_DEFAULTS = {
     "query_recruit_loss_weight": 0.0,
     "query_center_match_loss_type": "l1",
     "query_matched_gmo_bce_occ_size": (128, 128, 10),
+    "query_matched_gmo_sigma_floor_vox": 0.5,
     "query_num_gaussians": 1,
     "query_multi_gaussian_offset_max_m": (6.0, 6.0, 2.0),
     "query_multi_gaussian_sigma_min_m": (0.15, 0.15, 0.10),
@@ -224,8 +227,8 @@ VISUALIZATION_CFG_DEFAULTS = {
     "debug_query_mixture3d_vis_max_gt_points": 40000,
     # (deprecated) mixture3d occ threshold는 이제 eval_occ_threshold로 통일됨 → 키 제거.
     "debug_query_mixture3d_vis_occ_max_voxels_per_query": 4000,
-    # eval 전용 3D mixture vis 해상도(GT/metric=512³ 일치). train vis는 query_matched_gmo_bce_occ_size(128) 유지.
-    "debug_query_mixture3d_vis_eval_occ_size": (512, 512, 40),
+    # eval 전용 3D mixture vis 해상도. train 중 eval을 얹기 쉽게 기본은 lightweight 128x128x10.
+    "debug_query_mixture3d_vis_eval_occ_size": (128, 128, 10),
 }
 
 
@@ -245,7 +248,9 @@ def apply_model_cfg(self, cfg):
     self.query_gmo_loss_type = str(cfg["query_gmo_loss_type"]).lower()
     self.query_gmo_focal_gamma = float(cfg["query_gmo_focal_gamma"])
     self.query_gmo_focal_alpha = float(cfg["query_gmo_focal_alpha"])
+    self.query_gmo_loss_weight = float(cfg["query_gmo_loss_weight"])
     self.query_gmo_dice_loss_weight = float(cfg["query_gmo_dice_loss_weight"])
+    self.query_gmo_dice_3d = bool(cfg["query_gmo_dice_3d"])
     self.query_gmo_tversky_alpha = float(cfg["query_gmo_tversky_alpha"])
     self.query_gmo_tversky_beta = float(cfg["query_gmo_tversky_beta"])
     self.query_gmo_soft_gt_enabled = bool(cfg["query_gmo_soft_gt_enabled"])
@@ -362,6 +367,7 @@ def apply_model_cfg(self, cfg):
     self.query_recruit_loss_weight = float(cfg["query_recruit_loss_weight"])
     self.query_center_match_loss_type = str(cfg["query_center_match_loss_type"]).lower()
     self.query_matched_gmo_bce_occ_size = tuple(int(v) for v in cfg["query_matched_gmo_bce_occ_size"])
+    self.query_matched_gmo_sigma_floor_vox = float(cfg["query_matched_gmo_sigma_floor_vox"])
     self.query_num_gaussians = int(cfg["query_num_gaussians"])
     self.query_multi_gaussian_offset_max_m = tuple(float(v) for v in cfg["query_multi_gaussian_offset_max_m"])
     self.query_multi_gaussian_sigma_min_m = tuple(float(v) for v in cfg["query_multi_gaussian_sigma_min_m"])

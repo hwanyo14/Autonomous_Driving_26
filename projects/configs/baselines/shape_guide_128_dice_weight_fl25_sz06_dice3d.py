@@ -369,6 +369,7 @@ model_cfg = dict(
     # 단일 변수 실험: 이번엔 weight_mode='ones'→'sigmoid'(opacity)만 바꿈. 나머지 dice/tversky 설정과
     #   제한값(offset_max=12/sigma_max=3)은 dice run과 동일하게 유지.
     use_query_gmo_dice_loss=True,
+    query_gmo_dice_3d=True,   # dice/Tversky를 3D로: z 과확장을 FP로 벌함 (σ_z=0.6 force와 콤보)
     query_gmo_dice_loss_weight=0.5,
     query_gmo_tversky_alpha=0.7,   # FP(over-coverage) 가중
     query_gmo_tversky_beta=0.3,    # FN(under-coverage) 가중
@@ -442,25 +443,25 @@ model_cfg = dict(
     # 효과: x,y sigma floor(=0.5 voxel, 방지턱)가 64→128에서 0.8m→0.4m, 자동차 폭이
     # ~1칸→~2칸으로 형상 감독 가능. 추론/시각화는 무관(항상 512에서 가우시안 직접 splat).
     query_matched_gmo_bce_occ_size=(128, 128, 20),
+    query_matched_gmo_sigma_floor_vox=0.25,
     # [메모리·속도] grouped voxelizer는 청크당 (chunk·G·bbox) intermediate를 backward까지 retain.
     # 흩어진 query를 묶으면 bbox≈전체 격자 → chunk 클수록 메모리·낭비연산 폭증. 결과는 chunk 무관.
     # GPU 실측(128격자, fwd+bwd, peak / ms): K80 → c8 35GB·132 / c4 25GB·117 / c2 9.6GB·89 / c1 1.3GB·131.
     #   K160 → c2 17.7GB·158 / c1 2.6GB·257.  → 속도 sweet spot=2(모든 K 최速), 메모리 최소=1.
     # 채택 2: 속도 우선(c1 대비 ~1.6배 빠름). 객체 多 프레임서 OOM(특히 여유 적은 GPU) 나면 1로 내릴 것.
     query_multi_gaussian_pair_chunk=2,
-    query_num_gaussians=24,
+    query_num_gaussians=48,
     # shape bound(sigma)는 'tight 제약'이 아니라 '폭발 방지 난간'으로 느슨하게 둔다.
     # (이 run은 weight_mode='sigmoid'라 α opacity가 sigma와 함께 shape를 통제 — 아래 weight 블록 참고.)
     # sigma_max 2.0→3.0(xy)/0.7→1.5(z): loss가 안에서 깎으므로 풀어줌.
-    # sigma_min_m = 0.5 × matched voxel (= train/eval 최소 σ 통일). matched(0.8m xy/0.4m z)
-    #   → (0.4, 0.4, 0.2). 이러면 σ가 항상 floor_vox 이상 → floor가 양 격자에서 비활성,
-    #   네트워크 σ가 train·eval에 동일하게 흐름(불일치 제거). ※해상도 바꾸면 이 값도 0.5×새 voxel로.
+    # sigma_min_m = 0.5 × matched voxel. 이 fl25 run은 floor만 0.25 voxel로 낮춰
+    # floor clamp는 비활성에 가깝게 두고, 기존 sigma_min 하한은 유지하는 단일 ablation.
     # sigma_reg=0: 단일변수 유지 위해 유보. ※weight_mode='sigmoid'로 α가 부활했으므로
     #   (sigma↔weight) degeneracy가 돌아옴 → sigma 폭주 시 소량 켜는 것 고려. offset은 넉넉(트레일러).
     # 주의: binary fg라 car~trailer가 이 한 세트 공유 → car IoU/precision + over-coverage 모니터.
     query_multi_gaussian_offset_max_m=(12.0, 12.0, 2.0),
     query_multi_gaussian_sigma_min_m=(0.4, 0.4, 0.2),
-    query_multi_gaussian_sigma_max_m=(3.0, 3.0, 1.5),
+    query_multi_gaussian_sigma_max_m=(3.0, 3.0, 0.6),
     query_multi_gaussian_sigma_reg_loss_weight=0.0,
     # [weight 실험] opacity 부활: weight_mode='sigmoid' → 가우시안마다 α=sigmoid(logit)∈[0,1].
     # union p = 1 - Π(1 - α·G), α→0 이면 그 blob OFF. dice 'ones' run이 48개 always-on이라

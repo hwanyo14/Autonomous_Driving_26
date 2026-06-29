@@ -1,5 +1,36 @@
 # Changelog
 
+## 2026-06-29 13:44 KST — dice/Tversky 3D 옵션(`query_gmo_dice_3d`) 추가 + fl25_sz06_dice3d config
+
+- **배경/정정**: 직전 fl25_z(focal 가중 0.1→0.5)는 shape 조임에 부적합으로 판단. focal은 (a) `p.clamp(eps,1-eps)`(utils_loss.py:2634)로 포화 시 gradient 死, (b) FP를 전 격자(≈327k)로 평균(utils_loss.py:2664)해 per-cell FP gradient ≈0 → **over-coverage를 못 벌함**. 반면 Tversky(utils_loss.py:2684-2697)는 clamp 없음 + FP를 foreground 크기로 정규화 → **퍼짐을 실제로 벌하는 항**. 따라서 z 과확장 억제는 focal↑가 아니라 **dice를 3D로**가 맞음.
+- `query_gmo_dice_3d` model config 키 추가: 기본값 `False`(= 현행 BEV `amax(dim=2)` 동작 → 기존 모든 config 불변).
+- `utils_loss.py` `_compute_matched_pair_gmo_losses`의 dice 계산부 2곳(chunked/single)에서 `amax(dim=2)`(z collapse)를 `query_gmo_dice_3d`로 gate. True면 `[T,1,Z,Y,X]` 그대로 Tversky에 투입(z 과확장도 FP로 벌함). valid_mask 차원도 그에 맞춰 분기.
+- `efficientocf_config.py`: 기본값 + self 할당 추가.
+- 새 config `shape_guide_128_dice_weight_fl25_sz06_dice3d.py` (fl25 기반, 2변수): `sigma_max_z 1.5→0.6`(force) + `query_gmo_dice_3d=True`(reward: 브레이크를 z축에). focal weight는 기본 0.1 유지.
+
+## 2026-06-29 11:34 KST — query_gmo_loss_weight(focal 항 가중치) config화 + fl25_z 콤보 config 추가
+
+- `query_gmo_loss_weight` model config 키 추가: 기본값 `0.1` (기존 `efficientocf.py` 하드코딩과 동일 → 기존 모든 config 동작 불변).
+- `efficientocf.py`의 `_compute_matched_pair_gmo_losses(loss_weight=0.1)` 하드코딩을 `self.query_gmo_loss_weight`로 교체.
+  - 주의: 이 weight는 **focal/bce GMO 항에만** 곱해짐(`utils_loss.py:2889` `pair_loss * loss_weight`). dice는 별도 `query_gmo_dice_loss_weight`(`utils_loss.py:2891`)로 곱해지므로 영향 없음.
+- `efficientocf_config.py`: `MODEL_CFG_DEFAULTS`에 기본값 추가 + self 할당 추가.
+- 새 config `shape_guide_128_dice_weight_fl25_z.py` (fl25 기반, **2변수 콤보**):
+  - `query_multi_gaussian_sigma_max_m` z `1.5→0.6` (force: 단일 가우시안의 수직 과확장 억제).
+  - `query_gmo_loss_weight` `0.1→0.5` (reward: 3D z-aware focal 강화 → BEV dice와 동급).
+  - 목적: 가우시안이 σ_z를 부풀려 기둥이 되는 대신 **z축으로 분산되는 수직 GMM**을 유도. (단일변수 σ_z 캡만으론 reward 부재로 분산이 안 일어나 납작해지기만 하는 문제 보완.)
+
+## 2026-06-26 18:44:06 KST — matched GMO sigma floor config화 및 fl25=0.25 적용
+
+- `query_matched_gmo_sigma_floor_vox` model config 키 추가: 기본값은 기존 동작과 같은 `0.5`.
+- `efficientocf.py`의 matched GMO voxelizer floor 하드코딩 `0.5`를 config 값으로 교체.
+- `shape_guide_128_dice_weight_fl25.py`: floor ablation을 위해 `query_matched_gmo_sigma_floor_vox=0.25` 설정. `query_multi_gaussian_sigma_min_m=(0.4,0.4,0.2)`는 유지.
+
+## 2026-06-26 17:09:44 KST — eval mixture3d debug vis 해상도 128x128x10으로 축소
+
+- `debug_query_mixture3d_vis_eval_occ_size`를 `(512, 512, 40)`에서 `(128, 128, 10)`으로 변경.
+- 적용 범위: `efficientocf_config.py` 기본값, `shape_guide_128_dice.py`, `shape_guide_128_dice_weight.py`, `shape_guide_128_dice_weight_24.py`.
+- 목적: train 중 eval/debug vis를 얹을 때 512 고해상도 mixture3d 렌더로 인한 CUDA/MPS 불안정성과 메모리 spike를 줄임.
+
 ## 2026-06-26 KST — 3D calib grid search 제거 (기본값 고정)
 
 - `projects/occ_plugin/occupancy/detectors/efficientocf.py:1651`: `_calibrate_eval_3d_align` grid search를 BEV align과 동일한 패턴으로 교체.
