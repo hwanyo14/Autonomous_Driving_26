@@ -35,19 +35,19 @@ segmentation_cls_dataset_path = "./data/efficientocf_bboxcls/"
 gt_occ_inst_dataset_path = "./data/nuScenes-Occupancy_inst3d/"
 
 # Query/GMO foreground semantic classes use sparse raw nuScenes occupancy ids:
-# [2, 3, 4, 5, 6, 7, 9, 10] + background(0)
+# [2, 3, 4, 5, 6, 9, 10] + background(0); pedestrian(7) excluded
 class_names = [
     'bicycle',
     'bus',
     'car',
     'construction',
     'motorcycle',
-    'pedestrian',
     'trailer',
     'truck',
 ]
-query_class_ids = [0, 2, 3, 4, 5, 6, 7, 9, 10]
+query_class_ids = [0, 2, 3, 4, 5, 6, 9, 10]
 query_class_names = ['background'] + class_names
+exclude_occ_class_ids = (7,)  # pedestrian: 로드 단계에서 제거 (nohuman)
 validate_segmentation_cls_instance3d_alignment = True
 strict_query_class_id_validation = True
 use_separate_classes = False
@@ -74,10 +74,19 @@ voxel_x = (point_cloud_range[3] - point_cloud_range[0]) / occ_size[0]
 voxel_y = (point_cloud_range[4] - point_cloud_range[1]) / occ_size[1]
 voxel_z = (point_cloud_range[5] - point_cloud_range[2]) / occ_size[2]
 empty_idx = 0
+# use_separate_classes drives both the dense occ branch and the query branch:
+#   True  -> multi-class query classification (background + per-class)
+#   False -> binary query classification (background vs foreground)
 if use_separate_classes:
     num_cls = len(class_names) + 1
+    query_num_classes = len(query_class_ids)
+    query_cls_names = query_class_names
+    query_cls_loss_class_weights = [0.02, 1.4, 1.3, 0.30, 1.4, 1.4, 1.2, 0.9]
 else:
     num_cls = 2
+    query_num_classes = 2
+    query_cls_names = ['background', 'foreground']
+    query_cls_loss_class_weights = [0.1, 1.0]
 
 img_norm_cfg = None
 
@@ -137,6 +146,7 @@ train_pipeline = [
         validate_segmentation_cls_instance3d_alignment=validate_segmentation_cls_instance3d_alignment,
         load_gt_occ_inst=True,
         gt_occ_inst_dataset_path=gt_occ_inst_dataset_path,
+        exclude_occ_class_ids=exclude_occ_class_ids,
     ),
     dict(
         type='LoadMultiViewImageFromFiles_BEVDet',
@@ -167,6 +177,7 @@ train_pipeline = [
         strict_dt=True,
         validate_height_cache=False,
         write_height_cache=write_height_cache,
+        exclude_occ_class_ids=exclude_occ_class_ids,
     ),
     dict(type='OccDefaultFormatBundle3D', class_names=class_names),
     dict(
@@ -235,6 +246,7 @@ test_pipeline = [
         validate_segmentation_cls_instance3d_alignment=validate_segmentation_cls_instance3d_alignment,
         load_gt_occ_inst=True,
         gt_occ_inst_dataset_path=gt_occ_inst_dataset_path,
+        exclude_occ_class_ids=exclude_occ_class_ids,
     ),
     dict(
         type='LoadMultiViewImageFromFiles_BEVDet',
@@ -337,7 +349,7 @@ val_config['test_capacity'] = 100
 # In our work we use 8 NVIDIA A100 GPUs.
 data = dict(
     samples_per_gpu=1,
-    workers_per_gpu=1,
+    workers_per_gpu=0,
     train=train_config,
     # val=test_config,
     val=val_config,
@@ -354,57 +366,75 @@ grid_config = {
     'dbound': [2.0, 58.0, 0.5],
 }
 
-bev_feat_dim = 64
+bev_feat_dim = 96
 numC_Trans = bev_feat_dim
 
 gn_cfg = dict(type='GN', num_groups=16, requires_grad=True)
 model_cfg = dict(
     use_segmentation_as_query_gt=True,
+    use_query_gmo_dice_loss=False,
     use_gmo_bce_loss=True,
     query_gmo_loss_type='focal',
-    query_gmo_loss_weight=0.1,
-    query_gmo_shape_loss_mode='global',
+    query_gmo_loss_weight=1.0,
+    query_gmo_shape_loss_mode='local_aabb',
     query_gmo_local_crop_size=None,
     query_gmo_local_crop_scale=1.0,
-    query_gmo_local_crop_margin_vox=(0.0, 0.0, 0.0),
+    query_gmo_local_crop_margin_vox=(10.0, 10.0, 8.0),
+    use_query_gmo_quality_filter=True,
+    query_gmo_quality_roi_radius_m=30.0,
+    query_gmo_quality_min_occupancy_ratio=0.1,
     query_gt2p_instance_labeled_tau=0.3,
     query_gt2p_cooldown_iters=4000,
+    use_separate_classes=use_separate_classes,
     query_class_ids=query_class_ids,
-    query_class_names=query_class_names,
+    query_class_names=query_cls_names,
     strict_query_class_id_validation=strict_query_class_id_validation,
-    query_num_classes=len(query_class_ids),
-    query_cls_loss_class_weights=[0.1] + [1.0] * (len(query_class_ids) - 1),
-    query_attn_match_cost_weight=0.5,
+    query_num_classes=query_num_classes,
+    query_cls_loss_class_weights=query_cls_loss_class_weights,
+    query_attn_match_metric='inside_log',
+    query_attn_match_cost_weight=0.3,
     query_embed_dim=bev_feat_dim,
     query_id_reinject_scale=0.2,
     query_decor_loss_weight=1.0,
     use_query_attn_bbox_loss=True,
+    query_attn_bbox_other_weight=0.3,
+    query_attn_bbox_other_mode='union',
+    query_attn_bbox_unmatched_weight=0.0,
+    query_require_history_all_valid=True,
     query_attn_cam_gaussian_truncate_sigma=1.777,
-    query_center_match_cost_weight=4.0,
-    query_temporal_offset_match_cost_weight=2.0,
-    query_bev_iou_match_cost_weight=0.0,
+    query_num_queries=100,
+    query_cls_match_cost_weight=0.3,
+    query_center_match_cost_weight=10.0,
+    query_temporal_offset_match_cost_weight=0.0,
+    query_bev_iou_match_cost_weight=0.3,
     query_center_routed_loss_weight=0.3,
     query_depth_soft_label_sigma_bins=1.0,
-    query_traj_loss_weight=0.5,
+    # --- trajectory: matched-query single-head path ---
+    query_traj_matched_only=True,
     query_traj_residual_max_m=(15.0, 15.0),
+    query_traj_loss_weight=0.5,
+    query_traj_static_weight=1.0,
+    query_traj_moving_weight=5.0,
     query_traj_moving_reweight_enabled=True,
     query_traj_moving_threshold_m=0.8,
+    query_traj_teacher_forcing=True,
+    query_traj_teacher_forcing_until_iter=0,
     query_matched_gmo_bce_occ_size=(64, 64, 20),
     query_num_gaussians=16,
-    query_multi_gaussian_offset_max_m=(3.0, 3.0, 0.7),
+    query_multi_gaussian_offset_max_m=(5.0, 5.0, 1.5),
     query_multi_gaussian_sigma_min_m=(0.15, 0.15, 0.15),
-    query_multi_gaussian_sigma_max_m=(1.0, 1.0, 1.0),
-    query_multi_gaussian_sigma_reg_loss_weight=0.01,
-    query_gaussian_head_num_layers=2,
-    query_cls_head_num_layers=2,
+    query_multi_gaussian_sigma_max_m=(1.5, 1.5, 1.5),
+    query_multi_gaussian_sigma_reg_loss_weight=0.0,
+    query_inst_depth_num_bins=112,
 )
 
 debug_cfg = dict(
     debug_query_vis_every=8,
     debug_query_cam_gaussian_vis_enabled=True,
     debug_query_cam_gaussian_vis_every=48,
+    debug_gmo_quality_alignment_vis_every=0,
+    debug_gmo_local_aabb_pair_vis_every=0,
     debug_query_inst_depth_lift_vis_every=48,
-    debug_gmo_local_aabb_pair_vis_every=48,
     debug_query_attn_softargmax_vis_every=(
         48
     ),
@@ -414,8 +444,8 @@ visualization_cfg = dict(
     debug_query_vis_dir="./work_dirs/query_debug_vis_no_pretrain",
     debug_query_gaussian_vis_mode='prob',
     debug_query_score_iou_weight=0.0,
-    debug_query_score_cls_weight=0.3,
-    debug_query_score_cam_attn_weight=0.7,
+    debug_query_score_cls_weight=1.0,
+    debug_query_score_cam_attn_weight=0.0,
     debug_instance_img_vis_dir="./work_dirs/instance_img_debug_vis_no_pretrain",
     debug_instance_img_vis_max_frames=n_future_frames_plus,
     debug_query_cam_gaussian_vis_dir="./work_dirs/query_cam_gaussian_vis_no_pretrain",
@@ -423,7 +453,8 @@ visualization_cfg = dict(
     debug_query_cam_gaussian_vis_gt_overlay_enabled=True,
     debug_query_cam_gaussian_vis_topk_matched=8,
     debug_gt_alignment_vis_dir="./work_dirs/gt_alignment_vis_no_pretrain",
-    debug_gmo_local_aabb_pair_vis_dir="./work_dirs/gmo_local_aabb_pair_vis_no_pretrain",
+    debug_gmo_quality_alignment_vis_dir="./work_dirs/gmo_quality_alignment_vis_no_pretrain",
+    debug_gmo_local_aabb_pair_vis_dir="./work_dirs/gmo_local_aabb_pair_vis_crop_margin",
     debug_gmo_local_aabb_pair_vis_max_pairs=8,
     debug_query_inst_depth_lift_vis_dir="./work_dirs/query_inst_depth_lift_vis_no_pretrain",
     debug_query_inst_depth_lift_vis_max_frames=2,
@@ -482,7 +513,7 @@ model = dict(
 # Learning policy params ******************************************
 optimizer = dict(
     type='AdamW',
-    lr=3e-4,
+    lr=5e-4,
     paramwise_cfg=dict(
         custom_keys={
             'img_backbone': dict(lr_mult=0.1),
@@ -491,13 +522,13 @@ optimizer = dict(
     weight_decay=0.01,
 )
 
-# optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
+optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
 
-optimizer_config = dict(
-    type='GradientCumulativeOptimizerHook',
-    cumulative_iters=8,
-    grad_clip=dict(max_norm=35, norm_type=2),
-)
+# optimizer_config = dict(
+#     type='GradientCumulativeOptimizerHook',
+#     cumulative_iters=8,
+#     grad_clip=dict(max_norm=35, norm_type=2),
+# )
 
 lr_config = dict(
     policy='CosineAnnealing',
@@ -517,8 +548,14 @@ evaluation = dict(
     rule='greater',
 )
 
+traj_warmup_schedule = [
+    dict(begin_epoch=1, query_traj_teacher_forcing=True),
+    dict(begin_epoch=9, query_traj_teacher_forcing=False),
+]
+
 custom_hooks = [
     dict(type='OccEfficiencyHook'),
+    dict(type='TrajectoryWarmupHook', schedule=traj_warmup_schedule),
 ]
 
 # W&B logging for sweeps

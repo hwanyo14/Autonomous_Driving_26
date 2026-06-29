@@ -376,7 +376,6 @@ model_cfg = dict(
     query_multi_gaussian_sigma_min_m=(0.15, 0.15, 0.15),
     query_multi_gaussian_sigma_max_m=(1.0, 1.0, 1.0),
     query_multi_gaussian_sigma_reg_loss_weight=0.01,
-    query_multi_gaussian_weight_mode='softplus',
     # Teacher forcing: use GT past delta offsets until this iteration, then switch to prediction.
     query_traj_teacher_forcing=True,
     query_traj_teacher_forcing_until_iter=30000,

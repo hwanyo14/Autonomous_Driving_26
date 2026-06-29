@@ -1,5 +1,67 @@
 # Changelog
 
+## 2026-06-29 10:39 KST
+
+### Query Gaussian/Class Head Layer Config
+
+- `query_head.py`: `GaussianHead`, `ClassificationHead`의 MLP layer 수를 인자로 받도록 변경.
+- `efficientocf_config.py`, `efficientocf.py`: `query_gaussian_head_num_layers`, `query_cls_head_num_layers` config 기본값 및 전달 경로 추가.
+- `test_traj_large_adj_lr_crop_margin_nodepth.py`, `EfficientOCF_V1.1_1gpu.py`: 기존 동작 보존을 위해 두 설정값을 `2`로 명시.
+
+## 2026-06-26 23:35 KST
+
+### Local AABB GMO summary sigma None crash 수정
+
+- `utils_loss.py`: mixture-only 경로에서 `sigmas_world_tq3=None`인데 local AABB GMO 호출부가 `sigmas_world_tq3[:T]`를 무조건 슬라이스하던 문제 수정.
+- mixture가 유효하면 summary sigma 없이 `None`을 전달하고, helper 내부의 mixture branch가 그대로 처리하도록 변경.
+- 검증: `utils_loss.py` `py_compile`, `git diff --check` 통과.
+
+## 2026-06-26 23:31 KST
+
+### Gaussian별 독립 alpha 예측 및 mixture-only 경로 전환
+
+- `query_head.py`: Gaussian별 `gaussian_weight_head`를 추가하고 `sigmoid` alpha `[0,1]`를 예측하도록 변경. Gaussian 간 softmax/sum-to-1 정규화는 사용하지 않음.
+- `query_head.py`, `efficientocf.py`: `query_sigma_world_tq3` summary Gaussian 계산/사용을 중단하고 기존 key는 호환용 `None`으로 유지.
+- `efficientocf.py`: present occupancy voxelization을 summary Gaussian 대신 mixture voxelization 후 query 확률 union으로 생성하도록 변경.
+- `utils_loss.py`: matched GMO/sequence IoU/local AABB/DT/GT2P 보조 경로가 mixture tensors를 우선 사용하고 summary sigma가 없어도 동작하도록 정리.
+- `voxelizer.py`: mixture weight 주석을 독립 alpha 설계에 맞게 갱신.
+- 검증: 대상 파일 `py_compile`, `git diff --check` 통과. `QueryHead` dummy forward smoke는 현재 shell Python에 `torch`가 없어 실행하지 못함.
+
+## 2026-06-26 23:03 KST
+
+### 메인 config에 Local AABB GMO pair 시각화 설정 반영
+
+- `test_traj_large_adj_lr_crop_margin.py`: `debug_gmo_local_aabb_pair_vis_every=48`, 전용 저장 경로, 최대 저장 pair 수 설정 추가.
+- `NOTES.md`: 현재 메인 학습 config가 `projects/configs/baselines/test_traj_large_adj_lr_crop_margin.py`임을 기록.
+
+## 2026-06-26 22:58 KST
+
+### Local AABB GMO supervision pair 시각화 추가
+
+- `utils_loss.py`: local AABB matched GMO loss에서 실제 학습에 쓰는 `pred_pairs`, `gt_pairs`, `valid_pairs`를 PNG/`.pt`로 저장하는 디버그 훅 추가.
+- 저장 PNG는 pair별 BEV max-Z projection 기준으로 GT(green), pred(red), overlay를 함께 보여주며, `.pt`에는 crop tensor와 `query_idx`, `gt_instance_id`, valid frame 메타를 저장.
+- `efficientocf_config.py`, `EfficientOCF_V1.1_1gpu.py`: `debug_gmo_local_aabb_pair_vis_every`, `debug_gmo_local_aabb_pair_vis_dir`, `debug_gmo_local_aabb_pair_vis_max_pairs` 설정 추가.
+
+## 2026-06-25 11:43 KST
+
+### Matched GMO AABB Local Shape Loss 추가
+
+- `utils_loss.py`: matched pair별 GT AABB 중심/크기 기반 local crop을 만들고, pred Gaussian occupancy는 predicted query center 기준 local grid에서 직접 계산하는 `local_aabb` GMO shape loss 경로 추가.
+- `efficientocf_config.py`, `efficientocf.py`, `EfficientOCF_V1.1_1gpu.py`: `query_gmo_shape_loss_mode`, local crop size/scale/margin, `query_gmo_loss_weight` config 추가 및 loss 호출에 연결.
+- `test_traj_large_adj_lr.py`: 메인 실험 config에서 `query_gmo_shape_loss_mode='local_aabb'` 활성화.
+- 기본값은 기존 global GMO loss 유지(`query_gmo_shape_loss_mode='global'`).
+- 정정: `query_gmo_local_crop_size=None`일 때 `data/efficientocf_bboxcls`에서 로드된 bbox occupancy grid의 AABB voxel 크기를 그대로 사용하도록 변경. margin config는 grid voxel 단위인 `query_gmo_local_crop_margin_vox`로 변경.
+- 검증: `py_compile`, `git diff --check` 통과.
+
+## 2026-06-25 11:13 KST
+
+### Query Gaussian weight 고정
+
+- `query_head.py`: learnable Gaussian weight head를 제거하고 모든 mixture component weight를 고정 상수 `1.0`으로 생성하도록 변경.
+- `query_head.py`: Gaussian weight regularization loss 및 관련 debug reg 항목 제거. `dbg_query_weight_sum_mean`은 고정 weight 총합 확인용으로 유지.
+- `efficientocf.py`, `efficientocf_config.py`, baseline configs: 더 이상 사용하지 않는 `query_multi_gaussian_weight_*` 설정 전달과 config 항목 제거.
+- 검증: 대상 파일 `py_compile` 통과.
+
 ## 2026-06-23 17:17 KST
 
 ### GMO quality bbox-vs-fine voxel alignment 시각화 추가

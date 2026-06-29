@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -1361,6 +1363,507 @@ class EfficientOCFLossMixin:
         gt_tk1zyx = torch.cat(gt_chunks, dim=1) if len(gt_chunks) > 1 else gt_chunks[0]
         return pred_tk1zyx, gt_tk1zyx, valid_tk
 
+    def _prepare_local_aabb_matched_pair_occ(
+        self,
+        gt_occ_txyz: torch.Tensor,
+        bbox_occ_txyz: torch.Tensor,
+        matched_query_idx: torch.Tensor,
+        pair_gt_ids_k: torch.Tensor,
+        gt_valid_sel_tk: torch.Tensor,
+        centers_world_tq3: torch.Tensor,
+        sigmas_world_tq3: torch.Tensor,
+        mixture_centers_world_tqg3: torch.Tensor = None,
+        mixture_sigmas_world_tqg3: torch.Tensor = None,
+        mixture_yaw_tqg: torch.Tensor = None,
+        mixture_weights_tqg: torch.Tensor = None,
+        objectness_scores_tq: torch.Tensor = None,
+        crop_size=(32, 32, 12),
+        crop_scale: float = 1.0,
+        crop_margin_m=(0.0, 0.0, 0.0),
+        eps: float = 1e-6,
+    ):
+        if (
+            (not torch.is_tensor(gt_occ_txyz))
+            or gt_occ_txyz.dim() != 4
+            or (not torch.is_tensor(matched_query_idx))
+            or matched_query_idx.dim() != 1
+            or (not torch.is_tensor(pair_gt_ids_k))
+            or pair_gt_ids_k.dim() != 1
+            or (not torch.is_tensor(gt_valid_sel_tk))
+            or gt_valid_sel_tk.dim() != 2
+            or (not torch.is_tensor(centers_world_tq3))
+            or centers_world_tq3.dim() != 3
+        ):
+            return None, None, None, None
+
+        crop_x, crop_y, crop_z = [int(v) for v in crop_size]
+        if crop_x <= 0 or crop_y <= 0 or crop_z <= 0:
+            return None, None, None, None
+        bbox_t = int(bbox_occ_txyz.shape[0]) if torch.is_tensor(bbox_occ_txyz) and bbox_occ_txyz.dim() == 4 else int(gt_occ_txyz.shape[0])
+        T = int(min(gt_occ_txyz.shape[0], bbox_t, centers_world_tq3.shape[0], gt_valid_sel_tk.shape[0]))
+        K = int(matched_query_idx.numel())
+        if T <= 0 or K <= 0 or int(pair_gt_ids_k.numel()) != K:
+            return None, None, None, None
+
+        device = centers_world_tq3.device
+        mq = matched_query_idx.to(device=device, dtype=torch.long)
+        q_count = int(centers_world_tq3.shape[1])
+        if q_count <= 0 or not bool(((mq >= 0) & (mq < q_count)).all().item()):
+            return None, None, None, None
+
+        use_mixture = (
+            torch.is_tensor(mixture_centers_world_tqg3)
+            and torch.is_tensor(mixture_sigmas_world_tqg3)
+            and torch.is_tensor(mixture_yaw_tqg)
+            and torch.is_tensor(mixture_weights_tqg)
+            and mixture_centers_world_tqg3.dim() == 4
+            and tuple(mixture_centers_world_tqg3.shape) == tuple(mixture_sigmas_world_tqg3.shape)
+            and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_yaw_tqg.shape)
+            and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_weights_tqg.shape)
+            and int(mixture_centers_world_tqg3.shape[0]) >= T
+            and int(mixture_centers_world_tqg3.shape[1]) == q_count
+        )
+        if (not use_mixture) and (
+            (not torch.is_tensor(sigmas_world_tq3))
+            or tuple(sigmas_world_tq3.shape) != tuple(centers_world_tq3.shape)
+        ):
+            return None, None, None, None
+
+        gt_occ = gt_occ_txyz[:T].to(device=device, dtype=torch.long)
+        bbox_occ = bbox_occ_txyz[:T].to(device=device, dtype=torch.long) if torch.is_tensor(bbox_occ_txyz) and bbox_occ_txyz.dim() == 4 else gt_occ
+        valid_tk = gt_valid_sel_tk[:T].to(device=device, dtype=torch.bool)
+        pair_gt_ids = pair_gt_ids_k.to(device=device, dtype=torch.long)
+
+        pc = torch.as_tensor(self.point_cloud_range, device=device, dtype=torch.float32)
+        pc_min = pc[:3]
+        pc_max = pc[3:]
+        full_size = torch.tensor(
+            [int(gt_occ.shape[1]), int(gt_occ.shape[2]), int(gt_occ.shape[3])],
+            device=device,
+            dtype=torch.float32,
+        )
+        fine_voxel = (pc_max - pc_min) / full_size.clamp_min(1.0)
+        crop_size_t = torch.tensor([crop_x, crop_y, crop_z], device=device, dtype=torch.float32)
+        margin_t = torch.as_tensor(crop_margin_m, device=device, dtype=torch.float32)
+        if margin_t.numel() == 1:
+            margin_t = margin_t.expand(3)
+        margin_t = margin_t.reshape(3).clamp_min(0.0)
+        scale = max(float(crop_scale), float(eps))
+
+        x_alpha = ((torch.arange(crop_x, device=device, dtype=torch.float32) + 0.5) / float(crop_x)) - 0.5
+        y_alpha = ((torch.arange(crop_y, device=device, dtype=torch.float32) + 0.5) / float(crop_y)) - 0.5
+        z_alpha = ((torch.arange(crop_z, device=device, dtype=torch.float32) + 0.5) / float(crop_z)) - 0.5
+        trunc = max(1.0, float(getattr(self.matched_gmo_voxelizer, "gaussian_truncate_sigma", 3.0)))
+        trunc2 = trunc * trunc
+        sigma_floor_vox = float(getattr(self.matched_gmo_voxelizer, "gaussian_sigma_floor_vox", 0.35))
+
+        pred_tk1zyx = centers_world_tq3.new_zeros((T, K, 1, crop_z, crop_y, crop_x), dtype=torch.float32)
+        gt_tk1zyx = pred_tk1zyx.new_zeros((T, K, 1, crop_z, crop_y, crop_x))
+        valid_tk1zyx = torch.zeros((T, K, 1, crop_z, crop_y, crop_x), device=device, dtype=torch.bool)
+        valid_pair_tk = torch.zeros((T, K), device=device, dtype=torch.bool)
+
+        pair_weights_tq = None
+        if (
+            torch.is_tensor(objectness_scores_tq)
+            and objectness_scores_tq.dim() == 2
+            and int(objectness_scores_tq.shape[0]) >= T
+            and int(objectness_scores_tq.shape[1]) >= q_count
+        ):
+            pair_weights_tq = objectness_scores_tq[:T].to(device=device, dtype=torch.float32)
+
+        for t in range(T):
+            bbox_frame = bbox_occ[t]
+            gt_frame = gt_occ[t]
+            for k in range(K):
+                if not bool(valid_tk[t, k].item()):
+                    continue
+                inst_id = int(pair_gt_ids[k].item())
+                if inst_id <= 0:
+                    continue
+                pts = torch.nonzero(bbox_frame == inst_id, as_tuple=False)
+                if int(pts.numel()) <= 0:
+                    continue
+
+                mins = pts.min(dim=0).values.to(torch.float32)
+                maxs = pts.max(dim=0).values.to(torch.float32) + 1.0
+                gt_min = pc_min + mins * fine_voxel
+                gt_max = pc_min + maxs * fine_voxel
+                gt_center = 0.5 * (gt_min + gt_max)
+                crop_extent = torch.maximum((gt_max - gt_min) * scale + 2.0 * margin_t, fine_voxel)
+                crop_voxel = crop_extent / crop_size_t
+
+                gt_x = gt_center[0] + x_alpha * crop_extent[0]
+                gt_y = gt_center[1] + y_alpha * crop_extent[1]
+                gt_z = gt_center[2] + z_alpha * crop_extent[2]
+                ix = torch.floor((gt_x - pc_min[0]) / fine_voxel[0]).to(torch.long)
+                iy = torch.floor((gt_y - pc_min[1]) / fine_voxel[1]).to(torch.long)
+                iz = torch.floor((gt_z - pc_min[2]) / fine_voxel[2]).to(torch.long)
+                in_x = (ix >= 0) & (ix < int(gt_occ.shape[1]))
+                in_y = (iy >= 0) & (iy < int(gt_occ.shape[2]))
+                in_z = (iz >= 0) & (iz < int(gt_occ.shape[3]))
+                in_zyx = in_z[:, None, None] & in_y[None, :, None] & in_x[None, None, :]
+                if not bool(in_zyx.any().item()):
+                    continue
+
+                ix = ix.clamp(0, int(gt_occ.shape[1]) - 1)
+                iy = iy.clamp(0, int(gt_occ.shape[2]) - 1)
+                iz = iz.clamp(0, int(gt_occ.shape[3]) - 1)
+                gt_crop = gt_frame[
+                    ix[None, None, :],
+                    iy[None, :, None],
+                    iz[:, None, None],
+                ] == inst_id
+                gt_tk1zyx[t, k, 0] = gt_crop.to(torch.float32) * in_zyx.to(torch.float32)
+                valid_tk1zyx[t, k, 0] = in_zyx
+                valid_pair_tk[t, k] = True
+
+                q_idx = int(mq[k].item())
+                pred_center = centers_world_tq3[t, q_idx].to(torch.float32)
+                pred_x = pred_center[0] + x_alpha * crop_extent[0]
+                pred_y = pred_center[1] + y_alpha * crop_extent[1]
+                pred_z = pred_center[2] + z_alpha * crop_extent[2]
+                zz, yy, xx = torch.meshgrid(pred_z, pred_y, pred_x, indexing="ij")
+
+                if use_mixture:
+                    comp_centers = mixture_centers_world_tqg3[t, q_idx].to(device=device, dtype=torch.float32)
+                    comp_sigmas = mixture_sigmas_world_tqg3[t, q_idx].to(device=device, dtype=torch.float32)
+                    comp_yaw = mixture_yaw_tqg[t, q_idx].to(device=device, dtype=torch.float32)
+                    comp_weights = mixture_weights_tqg[t, q_idx].to(device=device, dtype=torch.float32).clamp_min(0.0)
+                else:
+                    comp_centers = centers_world_tq3[t, q_idx:q_idx + 1].to(torch.float32)
+                    comp_sigmas = sigmas_world_tq3[t, q_idx:q_idx + 1].to(torch.float32)
+                    comp_yaw = comp_centers.new_zeros((1,))
+                    comp_weights = comp_centers.new_ones((1,))
+
+                sigma_floor = (crop_voxel * sigma_floor_vox).clamp_min(float(eps))
+                comp_sigmas = torch.maximum(comp_sigmas, sigma_floor[None])
+                dx = xx[None] - comp_centers[:, 0, None, None, None]
+                dy = yy[None] - comp_centers[:, 1, None, None, None]
+                dz = zz[None] - comp_centers[:, 2, None, None, None]
+                cos_yaw = torch.cos(comp_yaw)[:, None, None, None]
+                sin_yaw = torch.sin(comp_yaw)[:, None, None, None]
+                xr = cos_yaw * dx + sin_yaw * dy
+                yr = -sin_yaw * dx + cos_yaw * dy
+                md2 = (
+                    (xr / comp_sigmas[:, 0, None, None, None]).pow(2)
+                    + (yr / comp_sigmas[:, 1, None, None, None]).pow(2)
+                    + (dz / comp_sigmas[:, 2, None, None, None]).pow(2)
+                )
+                gauss = torch.exp(-0.5 * md2) * (md2 <= trunc2).to(md2.dtype)
+                lam = (comp_weights[:, None, None, None] * gauss).sum(dim=0)
+                pred_crop = (-torch.expm1(-lam)).clamp(0.0, 1.0)
+                if pair_weights_tq is not None:
+                    pred_crop = pred_crop * pair_weights_tq[t, q_idx].clamp(min=0.0)
+                pred_tk1zyx[t, k, 0] = pred_crop
+
+        return pred_tk1zyx, gt_tk1zyx, valid_tk1zyx, valid_pair_tk
+
+    def _prepare_local_aabb_matched_pair_occ_pairs(
+        self,
+        gt_occ_txyz: torch.Tensor,
+        bbox_occ_txyz: torch.Tensor,
+        matched_query_idx: torch.Tensor,
+        pair_gt_ids_k: torch.Tensor,
+        gt_valid_sel_tk: torch.Tensor,
+        centers_world_tq3: torch.Tensor,
+        sigmas_world_tq3: torch.Tensor,
+        mixture_centers_world_tqg3: torch.Tensor = None,
+        mixture_sigmas_world_tqg3: torch.Tensor = None,
+        mixture_yaw_tqg: torch.Tensor = None,
+        mixture_weights_tqg: torch.Tensor = None,
+        objectness_scores_tq: torch.Tensor = None,
+        crop_size=None,
+        crop_scale: float = 1.0,
+        crop_margin_vox=(0.0, 0.0, 0.0),
+        eps: float = 1e-6,
+    ):
+        if (
+            (not torch.is_tensor(gt_occ_txyz))
+            or gt_occ_txyz.dim() != 4
+            or (not torch.is_tensor(bbox_occ_txyz))
+            or bbox_occ_txyz.dim() != 4
+            or (not torch.is_tensor(matched_query_idx))
+            or matched_query_idx.dim() != 1
+            or (not torch.is_tensor(pair_gt_ids_k))
+            or pair_gt_ids_k.dim() != 1
+            or (not torch.is_tensor(gt_valid_sel_tk))
+            or gt_valid_sel_tk.dim() != 2
+            or (not torch.is_tensor(centers_world_tq3))
+            or centers_world_tq3.dim() != 3
+        ):
+            return None, None, None, 0, None, None
+
+        fixed_crop = None
+        if crop_size is not None:
+            fixed_crop = tuple(int(v) for v in crop_size)
+            if len(fixed_crop) != 3 or min(fixed_crop) <= 0:
+                return None, None, None, 0, None, None
+
+        bbox_t = int(bbox_occ_txyz.shape[0])
+        T = int(min(gt_occ_txyz.shape[0], bbox_t, centers_world_tq3.shape[0], gt_valid_sel_tk.shape[0]))
+        K = int(matched_query_idx.numel())
+        if T <= 0 or K <= 0 or int(pair_gt_ids_k.numel()) != K:
+            return None, None, None, 0, None, None
+
+        device = centers_world_tq3.device
+        mq = matched_query_idx.to(device=device, dtype=torch.long)
+        q_count = int(centers_world_tq3.shape[1])
+        if q_count <= 0 or not bool(((mq >= 0) & (mq < q_count)).all().item()):
+            return None, None, None, 0, None, None
+
+        use_mixture = (
+            torch.is_tensor(mixture_centers_world_tqg3)
+            and torch.is_tensor(mixture_sigmas_world_tqg3)
+            and torch.is_tensor(mixture_yaw_tqg)
+            and torch.is_tensor(mixture_weights_tqg)
+            and mixture_centers_world_tqg3.dim() == 4
+            and tuple(mixture_centers_world_tqg3.shape) == tuple(mixture_sigmas_world_tqg3.shape)
+            and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_yaw_tqg.shape)
+            and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_weights_tqg.shape)
+            and int(mixture_centers_world_tqg3.shape[0]) >= T
+            and int(mixture_centers_world_tqg3.shape[1]) == q_count
+        )
+        if (not use_mixture) and (
+            (not torch.is_tensor(sigmas_world_tq3))
+            or tuple(sigmas_world_tq3.shape) != tuple(centers_world_tq3.shape)
+        ):
+            return None, None, None, 0, None, None
+
+        gt_occ = gt_occ_txyz[:T].to(device=device, dtype=torch.long)
+        bbox_occ = bbox_occ_txyz[:T].to(device=device, dtype=torch.long)
+        valid_tk = gt_valid_sel_tk[:T].to(device=device, dtype=torch.bool)
+        pair_gt_ids = pair_gt_ids_k.to(device=device, dtype=torch.long)
+
+        pc = torch.as_tensor(self.point_cloud_range, device=device, dtype=torch.float32)
+        full_size = torch.tensor(
+            [int(gt_occ.shape[1]), int(gt_occ.shape[2]), int(gt_occ.shape[3])],
+            device=device,
+            dtype=torch.float32,
+        )
+        fine_voxel = (pc[3:] - pc[:3]) / full_size.clamp_min(1.0)
+        margin_vox_t = torch.as_tensor(crop_margin_vox, device=device, dtype=torch.float32)
+        if margin_vox_t.numel() == 1:
+            margin_vox_t = margin_vox_t.expand(3)
+        margin_vox_t = margin_vox_t.reshape(3).clamp_min(0.0)
+        scale = max(float(crop_scale), float(eps))
+        trunc = max(1.0, float(getattr(self.matched_gmo_voxelizer, "gaussian_truncate_sigma", 3.0)))
+        trunc2 = trunc * trunc
+        sigma_floor_vox = float(getattr(self.matched_gmo_voxelizer, "gaussian_sigma_floor_vox", 0.35))
+
+        pair_weights_tq = None
+        if (
+            torch.is_tensor(objectness_scores_tq)
+            and objectness_scores_tq.dim() == 2
+            and int(objectness_scores_tq.shape[0]) >= T
+            and int(objectness_scores_tq.shape[1]) >= q_count
+        ):
+            pair_weights_tq = objectness_scores_tq[:T].to(device=device, dtype=torch.float32)
+
+        pred_pairs, gt_pairs, valid_pairs, pair_meta = [], [], [], []
+        crop_shape_sum = centers_world_tq3.new_zeros((3,), dtype=torch.float32)
+        valid_count = 0
+        for k in range(K):
+            q_idx = int(mq[k].item())
+            inst_id = int(pair_gt_ids[k].item())
+            if inst_id <= 0:
+                continue
+            frames = []
+            for t in range(T):
+                if not bool(valid_tk[t, k].item()):
+                    continue
+                pts = torch.nonzero(bbox_occ[t] == inst_id, as_tuple=False)
+                if int(pts.numel()) <= 0:
+                    continue
+                mins = pts.min(dim=0).values.to(torch.float32)
+                maxs = pts.max(dim=0).values.to(torch.float32) + 1.0
+                bbox_dims = (maxs - mins).clamp_min(1.0)
+                crop_extent_vox = bbox_dims * scale + 2.0 * margin_vox_t
+                if fixed_crop is None:
+                    crop_dims = torch.ceil(crop_extent_vox).to(torch.long).clamp(min=1)
+                else:
+                    crop_dims = torch.tensor(fixed_crop, device=device, dtype=torch.long)
+                crop_x, crop_y, crop_z = [int(v) for v in crop_dims.tolist()]
+                crop_shape_sum = crop_shape_sum + crop_dims.to(dtype=torch.float32)
+                valid_count += 1
+
+                center_grid = 0.5 * (mins + maxs)
+                x_alpha = ((torch.arange(crop_x, device=device, dtype=torch.float32) + 0.5) / float(crop_x)) - 0.5
+                y_alpha = ((torch.arange(crop_y, device=device, dtype=torch.float32) + 0.5) / float(crop_y)) - 0.5
+                z_alpha = ((torch.arange(crop_z, device=device, dtype=torch.float32) + 0.5) / float(crop_z)) - 0.5
+                off_x = x_alpha * crop_extent_vox[0]
+                off_y = y_alpha * crop_extent_vox[1]
+                off_z = z_alpha * crop_extent_vox[2]
+
+                gx = center_grid[0] + off_x
+                gy = center_grid[1] + off_y
+                gz = center_grid[2] + off_z
+                ix = torch.floor(gx).to(torch.long)
+                iy = torch.floor(gy).to(torch.long)
+                iz = torch.floor(gz).to(torch.long)
+                in_x = (ix >= 0) & (ix < int(gt_occ.shape[1]))
+                in_y = (iy >= 0) & (iy < int(gt_occ.shape[2]))
+                in_z = (iz >= 0) & (iz < int(gt_occ.shape[3]))
+                in_zyx = in_z[:, None, None] & in_y[None, :, None] & in_x[None, None, :]
+                if not bool(in_zyx.any().item()):
+                    continue
+
+                ix = ix.clamp(0, int(gt_occ.shape[1]) - 1)
+                iy = iy.clamp(0, int(gt_occ.shape[2]) - 1)
+                iz = iz.clamp(0, int(gt_occ.shape[3]) - 1)
+                gt_crop = (gt_occ[t][ix[None, None, :], iy[None, :, None], iz[:, None, None]] == inst_id).to(torch.float32)
+                gt_crop = gt_crop * in_zyx.to(torch.float32)
+
+                pred_center = centers_world_tq3[t, q_idx].to(torch.float32)
+                pred_x = pred_center[0] + off_x * fine_voxel[0]
+                pred_y = pred_center[1] + off_y * fine_voxel[1]
+                pred_z = pred_center[2] + off_z * fine_voxel[2]
+                zz, yy, xx = torch.meshgrid(pred_z, pred_y, pred_x, indexing="ij")
+
+                if use_mixture:
+                    comp_centers = mixture_centers_world_tqg3[t, q_idx].to(device=device, dtype=torch.float32)
+                    comp_sigmas = mixture_sigmas_world_tqg3[t, q_idx].to(device=device, dtype=torch.float32)
+                    comp_yaw = mixture_yaw_tqg[t, q_idx].to(device=device, dtype=torch.float32)
+                    comp_weights = mixture_weights_tqg[t, q_idx].to(device=device, dtype=torch.float32).clamp_min(0.0)
+                else:
+                    comp_centers = centers_world_tq3[t, q_idx:q_idx + 1].to(torch.float32)
+                    comp_sigmas = sigmas_world_tq3[t, q_idx:q_idx + 1].to(torch.float32)
+                    comp_yaw = comp_centers.new_zeros((1,))
+                    comp_weights = comp_centers.new_ones((1,))
+
+                step_world = (crop_extent_vox / crop_dims.to(torch.float32)) * fine_voxel
+                sigma_floor = (step_world * sigma_floor_vox).clamp_min(float(eps))
+                comp_sigmas = torch.maximum(comp_sigmas, sigma_floor[None])
+                dx = xx[None] - comp_centers[:, 0, None, None, None]
+                dy = yy[None] - comp_centers[:, 1, None, None, None]
+                dz = zz[None] - comp_centers[:, 2, None, None, None]
+                cos_yaw = torch.cos(comp_yaw)[:, None, None, None]
+                sin_yaw = torch.sin(comp_yaw)[:, None, None, None]
+                xr = cos_yaw * dx + sin_yaw * dy
+                yr = -sin_yaw * dx + cos_yaw * dy
+                md2 = (
+                    (xr / comp_sigmas[:, 0, None, None, None]).pow(2)
+                    + (yr / comp_sigmas[:, 1, None, None, None]).pow(2)
+                    + (dz / comp_sigmas[:, 2, None, None, None]).pow(2)
+                )
+                gauss = torch.exp(-0.5 * md2) * (md2 <= trunc2).to(md2.dtype)
+                pred_crop = (-torch.expm1(-(comp_weights[:, None, None, None] * gauss).sum(dim=0))).clamp(0.0, 1.0)
+                if pair_weights_tq is not None:
+                    pred_crop = pred_crop * pair_weights_tq[t, q_idx].clamp(min=0.0)
+                frames.append((t, pred_crop, gt_crop, in_zyx))
+
+            if len(frames) <= 0:
+                continue
+            max_z = max(int(v[1].shape[0]) for v in frames)
+            max_y = max(int(v[1].shape[1]) for v in frames)
+            max_x = max(int(v[1].shape[2]) for v in frames)
+            pred_pair = centers_world_tq3.new_zeros((T, 1, max_z, max_y, max_x), dtype=torch.float32)
+            gt_pair = pred_pair.new_zeros((T, 1, max_z, max_y, max_x))
+            valid_pair = torch.zeros((T, 1, max_z, max_y, max_x), device=device, dtype=torch.bool)
+            for t, pred_crop, gt_crop, valid_crop in frames:
+                z, y, x = [int(v) for v in pred_crop.shape]
+                pred_pair[t, 0, :z, :y, :x] = pred_crop
+                gt_pair[t, 0, :z, :y, :x] = gt_crop
+                valid_pair[t, 0, :z, :y, :x] = valid_crop
+            pred_pairs.append(pred_pair)
+            gt_pairs.append(gt_pair)
+            valid_pairs.append(valid_pair)
+            pair_meta.append({
+                "pair_index": int(k),
+                "query_idx": int(q_idx),
+                "gt_instance_id": int(inst_id),
+                "frames": [int(v[0]) for v in frames],
+            })
+
+        mean_shape = crop_shape_sum / float(max(valid_count, 1))
+        return pred_pairs, gt_pairs, valid_pairs, valid_count, mean_shape, pair_meta
+
+    @torch.no_grad()
+    def _maybe_save_local_aabb_gmo_pair_vis(
+        self,
+        pred_pairs,
+        gt_pairs,
+        valid_pairs,
+        pair_meta,
+        step: int,
+    ) -> None:
+        vis_every = int(getattr(self, "debug_gmo_local_aabb_pair_vis_every", 0))
+        if vis_every <= 0 or (int(step) % vis_every) != 0:
+            return
+        if (not getattr(self, "training", False)) or not self._is_main_process():
+            return
+        if not isinstance(pred_pairs, (list, tuple)) or len(pred_pairs) <= 0:
+            return
+
+        try:
+            from PIL import Image, ImageDraw
+            import numpy as np
+        except Exception:
+            return
+
+        vis_dir = str(getattr(self, "debug_gmo_local_aabb_pair_vis_dir", "./work_dirs/gmo_local_aabb_pair_vis"))
+        max_pairs = max(1, int(getattr(self, "debug_gmo_local_aabb_pair_vis_max_pairs", 8)))
+        out_dir = os.path.join(vis_dir, f"iter_{int(step):06d}")
+        os.makedirs(out_dir, exist_ok=True)
+
+        sidecar = {"step": int(step), "pairs": []}
+        selected = min(max_pairs, len(pred_pairs), len(gt_pairs), len(valid_pairs))
+        for idx in range(selected):
+            pred = pred_pairs[idx].detach().float().cpu()
+            gt = gt_pairs[idx].detach().float().cpu()
+            valid = valid_pairs[idx].detach().bool().cpu()
+            meta = pair_meta[idx] if isinstance(pair_meta, (list, tuple)) and idx < len(pair_meta) else {}
+            sidecar["pairs"].append({"meta": meta, "pred": pred, "gt": gt, "valid": valid})
+
+            pred_bev = (pred[:, 0] * valid[:, 0].float()).amax(dim=1).numpy()
+            gt_bev = (gt[:, 0] * valid[:, 0].float()).amax(dim=1).numpy()
+            valid_bev = valid[:, 0].any(dim=1).numpy()
+            t_count = int(pred_bev.shape[0])
+            if t_count <= 0:
+                continue
+            h, w = int(pred_bev.shape[1]), int(pred_bev.shape[2])
+            scale = max(1, min(8, 256 // max(h, w, 1)))
+            canvas = np.zeros((t_count * h, 3 * w, 3), dtype=np.uint8)
+
+            for t in range(t_count):
+                p = np.clip(pred_bev[t], 0.0, 1.0)
+                g = np.clip(gt_bev[t], 0.0, 1.0)
+                v = valid_bev[t].astype(bool)
+                pred_rgb = np.zeros((h, w, 3), dtype=np.uint8)
+                gt_rgb = np.zeros_like(pred_rgb)
+                overlay = np.zeros_like(pred_rgb)
+                pred_rgb[..., 0] = (p * 255).astype(np.uint8)
+                gt_rgb[..., 1] = (g * 255).astype(np.uint8)
+                overlay[..., 0] = (p * 255).astype(np.uint8)
+                overlay[..., 1] = (g * 255).astype(np.uint8)
+                pred_rgb[~v] = 32
+                gt_rgb[~v] = 32
+                overlay[~v] = 32
+                row = slice(t * h, (t + 1) * h)
+                canvas[row, 0:w] = gt_rgb
+                canvas[row, w:2 * w] = pred_rgb
+                canvas[row, 2 * w:3 * w] = overlay
+
+            img = Image.fromarray(canvas, mode="RGB")
+            if scale > 1:
+                img = img.resize((img.width * scale, img.height * scale), resample=Image.NEAREST)
+            draw = ImageDraw.Draw(img)
+            draw.text(
+                (4, 4),
+                (
+                    f"pair={idx} q={meta.get('query_idx', 'na')} "
+                    f"gt_id={meta.get('gt_instance_id', 'na')} | GT green / pred red / overlay"
+                ),
+                fill=(255, 255, 255),
+            )
+            img.save(
+                os.path.join(
+                    out_dir,
+                    f"pair_{idx:03d}_q{meta.get('query_idx', 'na')}_gt{meta.get('gt_instance_id', 'na')}.png",
+                )
+            )
+
+        torch.save(sidecar, os.path.join(out_dir, "local_aabb_pairs.pt"))
+
     def _compute_matched_query_sequence_iou_scores(
         self,
         centers_world_tq3: torch.Tensor,
@@ -1376,8 +1879,6 @@ class EfficientOCFLossMixin:
         eps: float = 1e-6,
     ) -> torch.Tensor:
         if (not torch.is_tensor(centers_world_tq3)) or centers_world_tq3.dim() != 3:
-            return None
-        if (not torch.is_tensor(sigmas_world_tq3)) or tuple(sigmas_world_tq3.shape) != tuple(centers_world_tq3.shape):
             return None
         if (not torch.is_tensor(gt_instance_occ3d_txyz_pred)) or gt_instance_occ3d_txyz_pred.dim() != 4:
             return None
@@ -1454,6 +1955,9 @@ class EfficientOCFLossMixin:
                     continue
                 iou_t = inter_tk[:, k][valid_iou_tk[:, k]] / (union_tk[:, k][valid_iou_tk[:, k]] + float(eps))
                 iou_q[q_idx] = iou_t.mean().clamp(0.0, 1.0)
+            return iou_q
+
+        if (not torch.is_tensor(sigmas_world_tq3)) or tuple(sigmas_world_tq3.shape) != tuple(centers_world_tq3.shape):
             return iou_q
 
         for k in range(int(mq.numel())):
@@ -1643,6 +2147,10 @@ class EfficientOCFLossMixin:
         inst_match_result: dict = None,
         loss_weight: float = 0.1,
         loss_type: str = "balanced_bce",
+        shape_loss_mode: str = "global",
+        local_crop_size=None,
+        local_crop_scale: float = 1.0,
+        local_crop_margin_vox=(0.0, 0.0, 0.0),
         focal_gamma: float = 2.0,
         focal_alpha: float = 0.25,
         compute_dice: bool = False,
@@ -1662,12 +2170,29 @@ class EfficientOCFLossMixin:
     ) -> dict:
         z = centers_world_tq3.sum() * 0.0
         loss_type = str(loss_type).lower()
+        shape_loss_mode = str(shape_loss_mode).lower()
+        if shape_loss_mode in ("local", "aabb_local"):
+            shape_loss_mode = "local_aabb"
         loss_key = "loss_gmo_focal" if loss_type in ("balanced_focal", "focal") else "loss_gmo_bce"
+        if local_crop_size is None:
+            crop_x, crop_y, crop_z = 0, 0, 0
+        else:
+            crop_x, crop_y, crop_z = [int(v) for v in local_crop_size]
+        margin_vals = tuple(float(v) for v in local_crop_margin_vox)
         out = {
             "dbg_gmo_bce_pair_count": z,
             "dbg_gmo_bce_lowres_x": z,
             "dbg_gmo_bce_lowres_y": z,
             "dbg_gmo_bce_lowres_z": z,
+            "dbg_gmo_shape_loss_mode": z.new_tensor(float(1.0 if shape_loss_mode == "local_aabb" else 0.0)),
+            "dbg_gmo_local_crop_x": z.new_tensor(float(crop_x)),
+            "dbg_gmo_local_crop_y": z.new_tensor(float(crop_y)),
+            "dbg_gmo_local_crop_z": z.new_tensor(float(crop_z)),
+            "dbg_gmo_local_crop_scale": z.new_tensor(float(local_crop_scale)),
+            "dbg_gmo_local_crop_margin_vox_x": z.new_tensor(float(margin_vals[0])),
+            "dbg_gmo_local_crop_margin_vox_y": z.new_tensor(float(margin_vals[1])),
+            "dbg_gmo_local_crop_margin_vox_z": z.new_tensor(float(margin_vals[2])),
+            "dbg_gmo_local_valid_pair_count": z,
             "loss_gmo_dice": z,
             "dbg_gmo_dice_pair_count": z,
             "dbg_gmo_dice_alpha": z.new_tensor(float(tversky_alpha)),
@@ -1686,8 +2211,6 @@ class EfficientOCFLossMixin:
         if loss_key == "loss_gmo_focal":
             out["dbg_gmo_bce_alias"] = z
         if (not torch.is_tensor(centers_world_tq3)) or centers_world_tq3.dim() != 3:
-            return out
-        if (not torch.is_tensor(sigmas_world_tq3)) or tuple(sigmas_world_tq3.shape) != tuple(centers_world_tq3.shape):
             return out
         if (not torch.is_tensor(gt_instance_occ3d_txyz_pred)) or gt_instance_occ3d_txyz_pred.dim() != 4:
             return out
@@ -1775,7 +2298,74 @@ class EfficientOCFLossMixin:
             and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_yaw_tqg.shape)
             and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_weights_tqg.shape)
         )
-        if use_mixture:
+        if (not use_mixture) and (
+            (not torch.is_tensor(sigmas_world_tq3))
+            or tuple(sigmas_world_tq3.shape) != tuple(centers_world_tq3.shape)
+        ):
+            return out
+        if shape_loss_mode == "local_aabb":
+            pred_pairs, gt_pairs, valid_pairs, valid_count, mean_shape, pair_meta = self._prepare_local_aabb_matched_pair_occ_pairs(
+                gt_occ_txyz=gt_occ_txyz,
+                bbox_occ_txyz=bbox_instance_occ3d_txyz,
+                matched_query_idx=mq,
+                pair_gt_ids_k=pair_gt_ids,
+                gt_valid_sel_tk=gt_valid_sel_tk,
+                centers_world_tq3=centers_world_tq3[:T],
+                sigmas_world_tq3=sigmas_world_tq3[:T] if torch.is_tensor(sigmas_world_tq3) else None,
+                mixture_centers_world_tqg3=mixture_centers_world_tqg3[:T] if use_mixture else None,
+                mixture_sigmas_world_tqg3=mixture_sigmas_world_tqg3[:T] if use_mixture else None,
+                mixture_yaw_tqg=mixture_yaw_tqg[:T] if use_mixture else None,
+                mixture_weights_tqg=mixture_weights_tqg[:T] if use_mixture else None,
+                objectness_scores_tq=objectness_scores_tq,
+                crop_size=local_crop_size,
+                crop_scale=float(local_crop_scale),
+                crop_margin_vox=margin_vals,
+                eps=float(eps),
+            )
+            if pred_pairs is None:
+                return out
+            step = self._get_query_train_iteration(advance_if_unsynced=False)
+            self._maybe_save_local_aabb_gmo_pair_vis(
+                pred_pairs=pred_pairs,
+                gt_pairs=gt_pairs,
+                valid_pairs=valid_pairs,
+                pair_meta=pair_meta,
+                step=step,
+            )
+            out["dbg_gmo_local_valid_pair_count"] = centers_world_tq3.new_tensor(float(valid_count))
+            if torch.is_tensor(mean_shape):
+                out["dbg_gmo_local_crop_x"] = mean_shape[0]
+                out["dbg_gmo_local_crop_y"] = mean_shape[1]
+                out["dbg_gmo_local_crop_z"] = mean_shape[2]
+            for p_raw, t_raw, valid_mask in zip(pred_pairs, gt_pairs, valid_pairs):
+                p = p_raw.clamp(float(eps), 1.0 - float(eps))
+                t = t_raw.clamp(0.0, 1.0)
+                pair_loss = self._compute_balanced_binary_pair_loss(
+                    pred_occ=p,
+                    gt_occ=t,
+                    valid_mask=valid_mask,
+                    loss_type=loss_type,
+                    focal_gamma=float(focal_gamma),
+                    focal_alpha=float(focal_alpha),
+                    eps=float(eps),
+                )
+                if pair_loss is not None:
+                    pair_losses.append(pair_loss)
+                if compute_dice:
+                    p_bev = p.amax(dim=2)
+                    t_bev = t.amax(dim=2)
+                    valid_bev = valid_mask.any(dim=2)
+                    dice_loss = self._compute_foreground_tversky_pair_loss(
+                        pred_occ=p_bev,
+                        gt_occ=t_bev,
+                        valid_mask=valid_bev,
+                        alpha=float(tversky_alpha),
+                        beta=float(tversky_beta),
+                        eps=float(eps),
+                    )
+                    if dice_loss is not None:
+                        dice_pair_losses.append(dice_loss)
+        elif use_mixture:
             pred_tk1zyx, gt_tk1zyx, valid_tk = self._prepare_grouped_matched_pair_lowres_occ(
                 gt_occ_txyz=gt_occ_txyz,
                 matched_query_idx=mq,
@@ -1866,7 +2456,12 @@ class EfficientOCFLossMixin:
         if len(pair_losses) <= 0 and len(dice_pair_losses) <= 0:
             return out
 
-        low_x, low_y, low_z = self.query_matched_gmo_bce_occ_size
+        if shape_loss_mode == "local_aabb":
+            low_x = float(out["dbg_gmo_local_crop_x"].detach().item())
+            low_y = float(out["dbg_gmo_local_crop_y"].detach().item())
+            low_z = float(out["dbg_gmo_local_crop_z"].detach().item())
+        else:
+            low_x, low_y, low_z = self.query_matched_gmo_bce_occ_size
         if len(pair_losses) > 0:
             pair_loss = torch.stack(pair_losses, dim=0).mean()
             out[loss_key] = pair_loss * float(loss_weight)
@@ -2082,7 +2677,9 @@ class EfficientOCFLossMixin:
         centers_world_match_tq3,
         centers_world_dt_gt2p_tq3,
         gaussian_sigmas_world_loss,
+        mixture_centers_world_loss,
         mixture_sigmas_world_loss,
+        mixture_yaw_loss,
         mixture_weights_loss,
         # DT loss inputs
         occ_dt,
@@ -2322,8 +2919,10 @@ class EfficientOCFLossMixin:
             else:
                 dt_loss = self.query_head.compute_query_point_dt_loss(
                     points_world=None,
-                    gaussian_centers_world=centers_world_dt_gt2p_tq3,
-                    gaussian_sigmas_world=gaussian_sigmas_world_loss,
+                    mixture_centers_world_tqg3=mixture_centers_world_loss,
+                    mixture_sigmas_world_tqg3=mixture_sigmas_world_loss,
+                    mixture_yaw_tqg=mixture_yaw_loss,
+                    mixture_weights_tqg=mixture_weights_loss,
                     occ_dt=occ_dt, loss_weight=0.1, mode='bilinear',
                 )
             losses.update(dt_loss)
@@ -2335,6 +2934,10 @@ class EfficientOCFLossMixin:
             gt2p_instance_labeled_loss = self.query_head.compute_query_gt2p_instance_labeled_loss(
                 gaussian_centers_world=centers_world_dt_gt2p_tq3,
                 gaussian_sigmas_world=gaussian_sigmas_world_loss,
+                mixture_centers_world_tqg3=mixture_centers_world_loss,
+                mixture_sigmas_world_tqg3=mixture_sigmas_world_loss,
+                mixture_yaw_tqg=mixture_yaw_loss,
+                mixture_weights_tqg=mixture_weights_loss,
                 gt_inst_center_world_tn3=gt_inst_center_world_tn3,
                 gt_inst_center_valid_tn=gt_inst_center_valid_tn,
                 loss_weight=gt2p_inst_weight_eff,

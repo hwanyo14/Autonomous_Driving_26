@@ -79,15 +79,19 @@ class CenterHead(nn.Module):
 class GaussianHead(nn.Module):
     def __init__(self,
                  embed_dim=128,
-                 out_dim=3):
+                 out_dim=3,
+                 num_layers=2):
         super(GaussianHead, self).__init__()
         self.embed_dim = embed_dim
         self.out_dim = out_dim
+        self.num_layers = int(num_layers)
+        if self.num_layers <= 0:
+            raise ValueError(f"num_layers must be positive, got {self.num_layers}")
 
         self.mlp = MLP(in_dim=self.embed_dim,
                        hidden_dim=self.embed_dim,
                        out_dim=self.out_dim,
-                       num_layers=2,
+                       num_layers=self.num_layers,
                        dropout=0.0,
                        use_ln=True)
 
@@ -99,15 +103,19 @@ class GaussianHead(nn.Module):
 class ClassificationHead(nn.Module):
     def __init__(self,
                  embed_dim=128,
-                 out_dim=3):
+                 out_dim=3,
+                 num_layers=2):
         super(ClassificationHead, self).__init__()
         self.embed_dim = embed_dim
         self.out_dim = out_dim
+        self.num_layers = int(num_layers)
+        if self.num_layers <= 0:
+            raise ValueError(f"num_layers must be positive, got {self.num_layers}")
 
         self.mlp = MLP(in_dim=self.embed_dim,
                        hidden_dim=self.embed_dim,
                        out_dim=self.out_dim,
-                       num_layers=2,
+                       num_layers=self.num_layers,
                        dropout=0.0,
                        use_ln=True)
 
@@ -188,10 +196,8 @@ class QueryHead(nn.Module):
                  query_multi_gaussian_sigma_max_m=(4.0, 4.0, 1.5),
                  query_multi_gaussian_sigma_reg_loss_weight=0.0,
                  query_multi_gaussian_sigma_reg_log_eps=1e-6,
-                 query_multi_gaussian_weight_mode="softmax",
-                 query_multi_gaussian_softplus_bias_init=-2.0,
-                 query_multi_gaussian_weight_reg_loss_weight=1e-3,
-                 query_multi_gaussian_weight_reg_target_sum=1.0,
+                 query_gaussian_head_num_layers=2,
+                 query_cls_head_num_layers=2,
                  gaussian_truncate_sigma=3.0,
                  point_cloud_range=None,
                  spatial_extent3d=None,
@@ -295,6 +301,18 @@ class QueryHead(nn.Module):
         self.query_multi_gaussian_sigma_max_m = tuple(float(v) for v in query_multi_gaussian_sigma_max_m)
         self.query_multi_gaussian_sigma_reg_loss_weight = float(query_multi_gaussian_sigma_reg_loss_weight)
         self.query_multi_gaussian_sigma_reg_log_eps = float(query_multi_gaussian_sigma_reg_log_eps)
+        self.query_gaussian_head_num_layers = int(query_gaussian_head_num_layers)
+        if self.query_gaussian_head_num_layers <= 0:
+            raise ValueError(
+                "query_gaussian_head_num_layers must be positive, "
+                f"got {self.query_gaussian_head_num_layers}"
+            )
+        self.query_cls_head_num_layers = int(query_cls_head_num_layers)
+        if self.query_cls_head_num_layers <= 0:
+            raise ValueError(
+                "query_cls_head_num_layers must be positive, "
+                f"got {self.query_cls_head_num_layers}"
+            )
         if len(self.query_multi_gaussian_offset_max_m) != 3:
             raise ValueError(
                 "query_multi_gaussian_offset_max_m must be xyz tuple, "
@@ -314,25 +332,6 @@ class QueryHead(nn.Module):
             raise ValueError(
                 "query_multi_gaussian_sigma_reg_log_eps must be > 0, "
                 f"got {self.query_multi_gaussian_sigma_reg_log_eps}"
-            )
-        self.query_multi_gaussian_weight_mode = str(query_multi_gaussian_weight_mode).lower()
-        if self.query_multi_gaussian_weight_mode not in ("softmax", "softplus"):
-            raise ValueError(
-                "query_multi_gaussian_weight_mode must be one of {'softmax','softplus'}, "
-                f"got {self.query_multi_gaussian_weight_mode!r}"
-            )
-        self.query_multi_gaussian_softplus_bias_init = float(query_multi_gaussian_softplus_bias_init)
-        self.query_multi_gaussian_weight_reg_loss_weight = float(query_multi_gaussian_weight_reg_loss_weight)
-        if self.query_multi_gaussian_weight_reg_loss_weight < 0.0:
-            raise ValueError(
-                "query_multi_gaussian_weight_reg_loss_weight must be >= 0, "
-                f"got {self.query_multi_gaussian_weight_reg_loss_weight}"
-            )
-        self.query_multi_gaussian_weight_reg_target_sum = float(query_multi_gaussian_weight_reg_target_sum)
-        if self.query_multi_gaussian_weight_reg_target_sum <= 0.0:
-            raise ValueError(
-                "query_multi_gaussian_weight_reg_target_sum must be > 0, "
-                f"got {self.query_multi_gaussian_weight_reg_target_sum}"
             )
         self.gaussian_truncate_sigma = float(gaussian_truncate_sigma)
         self.query_feat_cosine_threshold = float(query_feat_cosine_threshold)
@@ -397,17 +396,33 @@ class QueryHead(nn.Module):
         self.gaussian_weight_head = None
         if not self.center_only_mode:
             g = int(self.query_num_gaussians)
-            self.gaussian_offset_head = GaussianHead(embed_dim=self.embed_dim, out_dim=g * 3)
-            self.gaussian_sigma_head = GaussianHead(embed_dim=self.embed_dim, out_dim=g * 3)
-            self.gaussian_yaw_head = GaussianHead(embed_dim=self.embed_dim, out_dim=g * 2)
-            self.gaussian_weight_head = GaussianHead(embed_dim=self.embed_dim, out_dim=g)
-            if self.query_multi_gaussian_weight_mode == "softplus":
-                last_layer = self.gaussian_weight_head.mlp.net[-1]
-                if isinstance(last_layer, nn.Linear) and last_layer.bias is not None:
-                    nn.init.constant_(last_layer.bias, self.query_multi_gaussian_softplus_bias_init)
+            self.gaussian_offset_head = GaussianHead(
+                embed_dim=self.embed_dim,
+                out_dim=g * 3,
+                num_layers=self.query_gaussian_head_num_layers,
+            )
+            self.gaussian_sigma_head = GaussianHead(
+                embed_dim=self.embed_dim,
+                out_dim=g * 3,
+                num_layers=self.query_gaussian_head_num_layers,
+            )
+            self.gaussian_yaw_head = GaussianHead(
+                embed_dim=self.embed_dim,
+                out_dim=g * 2,
+                num_layers=self.query_gaussian_head_num_layers,
+            )
+            self.gaussian_weight_head = GaussianHead(
+                embed_dim=self.embed_dim,
+                out_dim=g,
+                num_layers=self.query_gaussian_head_num_layers,
+            )
             # Backward-compat alias used by debug grad logger.
             self.gaussian_head = self.gaussian_sigma_head
-        self.cls_head = ClassificationHead(embed_dim=self.embed_dim, out_dim=self.num_query_classes)
+        self.cls_head = ClassificationHead(
+            embed_dim=self.embed_dim,
+            out_dim=self.num_query_classes,
+            num_layers=self.query_cls_head_num_layers,
+        )
         self.query_depth_head = QueryDepthHead(
             embed_dim=self.embed_dim,
             out_dim=self.query_depth_num_bins,
@@ -591,11 +606,11 @@ class QueryHead(nn.Module):
                 same Gaussian shape located at its own anchor.
 
         Returns:
-            query_sigma_world_tq3:        [T, Q, 3]
+            query_sigma_world_tq3:        None (summary Gaussian disabled)
             mixture_centers_world_tqg3:   [T, Q, G, 3]   (per-frame placement)
             mixture_sigmas_world_tqg3:    [T, Q, G, 3]   (shared across T)
             mixture_yaw_tqg:              [T, Q, G]      (shared across T)
-            mixture_weights_tqg:          [T, Q, G]      (shared across T)
+            mixture_weights_tqg:          [T, Q, G]      (independent sigmoid alpha)
         """
         query_sigma_world_tq3 = None
         mixture_centers_world_tqg3 = None
@@ -644,18 +659,7 @@ class QueryHead(nn.Module):
         yaw_basis_qg2 = F.normalize(yaw_basis_logits_qg2, dim=-1, eps=1e-6)
         yaw_qg = torch.atan2(yaw_basis_qg2[..., 0], yaw_basis_qg2[..., 1])
 
-        if self.query_multi_gaussian_weight_mode == "softmax":
-            weights_qg = torch.softmax(weight_logits_qg, dim=-1)
-            weights_surrogate_qg = weights_qg
-        elif self.query_multi_gaussian_weight_mode == "softplus":
-            weights_qg = F.softplus(weight_logits_qg)
-            weights_surrogate_qg = weights_qg / weights_qg.sum(
-                dim=-1, keepdim=True
-            ).clamp_min(1e-6)
-        else:
-            raise RuntimeError(
-                f"Unsupported query_multi_gaussian_weight_mode={self.query_multi_gaussian_weight_mode!r}"
-            )
+        weights_qg = torch.sigmoid(weight_logits_qg).to(dtype=centers_world.dtype)
 
         # Broadcast the shared mixture to each frame:
         # - mixture centers move with the per-frame anchor (lifted center).
@@ -668,14 +672,6 @@ class QueryHead(nn.Module):
         mixture_sigmas_world_tqg3 = sigmas_world_qg3.unsqueeze(0).expand(t_count, -1, -1, -1).contiguous()
         mixture_yaw_tqg = yaw_qg.unsqueeze(0).expand(t_count, -1, -1).contiguous()
         mixture_weights_tqg = weights_qg.unsqueeze(0).expand(t_count, -1, -1).contiguous()
-        weights_surrogate_tqg = weights_surrogate_qg.unsqueeze(0).expand(t_count, -1, -1).contiguous()
-
-        effective_offset_tqg3 = mixture_centers_world_tqg3 - centers_world.unsqueeze(2)
-        moment2_tq3 = (
-            weights_surrogate_tqg.unsqueeze(-1)
-            * (mixture_sigmas_world_tqg3.pow(2) + effective_offset_tqg3.pow(2))
-        ).sum(dim=2)
-        query_sigma_world_tq3 = torch.sqrt(moment2_tq3.clamp_min(1e-8))
 
         return (
             query_sigma_world_tq3,
@@ -1501,7 +1497,6 @@ class QueryHead(nn.Module):
         z = ref_tensor.sum() * 0.0
         out = {
             "loss_query_sigma_reg": z,
-            "loss_query_weight_reg": z,
             "dbg_query_sigma_reg_raw": z,
             "dbg_query_sigma_mean_m": z,
             "dbg_query_sigma_log_abs_mean": z,
@@ -1510,19 +1505,6 @@ class QueryHead(nn.Module):
                 float(1.0 if self.query_multi_gaussian_sigma_reg_loss_weight > 0.0 else 0.0)
             ),
             "dbg_query_weight_sum_mean": z,
-            "dbg_query_weight_reg_raw": z,
-            "dbg_query_weight_reg_weight": z.new_tensor(float(self.query_multi_gaussian_weight_reg_loss_weight)),
-            "dbg_query_weight_reg_target_sum": z.new_tensor(float(self.query_multi_gaussian_weight_reg_target_sum)),
-            "dbg_query_weight_reg_enabled": z.new_tensor(
-                float(
-                    1.0
-                    if (
-                        self.query_multi_gaussian_weight_mode == "softplus"
-                        and self.query_multi_gaussian_weight_reg_loss_weight > 0.0
-                    )
-                    else 0.0
-                )
-            ),
         }
         if mixture_sigmas_world_tqg3 is not None:
             if not torch.is_tensor(mixture_sigmas_world_tqg3):
@@ -1555,10 +1537,6 @@ class QueryHead(nn.Module):
                 weights = mixture_weights_tqg.to(torch.float32).clamp_min(0.0)
                 weight_sum_tq = weights.sum(dim=-1)
                 out["dbg_query_weight_sum_mean"] = weight_sum_tq.mean().detach()
-                if self.query_multi_gaussian_weight_mode == "softplus":
-                    raw_w = (weight_sum_tq - float(self.query_multi_gaussian_weight_reg_target_sum)).pow(2).mean()
-                    out["dbg_query_weight_reg_raw"] = raw_w.detach()
-                    out["loss_query_weight_reg"] = raw_w * float(self.query_multi_gaussian_weight_reg_loss_weight)
         return out
 
     def _is_main_process(self) -> bool:
@@ -3333,6 +3311,10 @@ class QueryHead(nn.Module):
         align_corners: bool = True,
         gaussian_centers_world: torch.Tensor = None,
         gaussian_sigmas_world: torch.Tensor = None,
+        mixture_centers_world_tqg3: torch.Tensor = None,
+        mixture_sigmas_world_tqg3: torch.Tensor = None,
+        mixture_yaw_tqg: torch.Tensor = None,
+        mixture_weights_tqg: torch.Tensor = None,
         gaussian_truncate_sigma: float = None,
         gaussian_sigma_floor_vox: float = 0.35,
     ):
@@ -3341,13 +3323,99 @@ class QueryHead(nn.Module):
         - gaussian 입력 시: E_{x~N(mu,sigma)}[DT(x)]를 근사 계산
         - legacy points 입력 시: point 샘플링 기반 DT loss
         """
-        base_tensor = gaussian_centers_world if gaussian_centers_world is not None else points_world
+        base_tensor = mixture_centers_world_tqg3 if mixture_centers_world_tqg3 is not None else gaussian_centers_world
+        if base_tensor is None:
+            base_tensor = points_world
         if occ_dt is None:
             if base_tensor is None:
                 z = self.center_head.mlp.net[-1].weight.sum() * 0.0
                 return {"loss_query_dt": z}
             z = base_tensor.sum() * 0.0
             return {"loss_query_dt": z}
+
+        use_mixture = (
+            (not self.center_only_mode)
+            and torch.is_tensor(mixture_centers_world_tqg3)
+            and torch.is_tensor(mixture_sigmas_world_tqg3)
+            and torch.is_tensor(mixture_yaw_tqg)
+            and torch.is_tensor(mixture_weights_tqg)
+            and mixture_centers_world_tqg3.dim() == 4
+            and tuple(mixture_centers_world_tqg3.shape) == tuple(mixture_sigmas_world_tqg3.shape)
+            and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_yaw_tqg.shape)
+            and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_weights_tqg.shape)
+        )
+        if use_mixture:
+            centers = mixture_centers_world_tqg3.to(torch.float32)
+            sigmas = mixture_sigmas_world_tqg3.to(torch.float32)
+            yaws = mixture_yaw_tqg.to(torch.float32)
+            weights = mixture_weights_tqg.to(torch.float32).clamp(0.0, 1.0)
+            T_pred, Q, G, _ = centers.shape
+
+            occ_dt_t = self._prepare_occ_dt(occ_dt, T_pred, centers.device)
+            if dt_clip_max is not None:
+                occ_dt_t = occ_dt_t.clamp(max=float(dt_clip_max))
+
+            X = int(occ_dt_t.shape[1])
+            Y = int(occ_dt_t.shape[2])
+            Z = int(occ_dt_t.shape[3])
+            pc_min = centers.new_tensor(self.point_cloud_range[:3])
+            extent = centers.new_tensor(self.spatial_extent3d)
+            voxel_size = extent / centers.new_tensor([float(X), float(Y), float(Z)]).clamp_min(1.0)
+            off = float(voxel_center_offset)
+            c = centers.clone()
+            c[..., 0] = (c[..., 0] - pc_min[0]) / voxel_size[0] - off
+            c[..., 1] = (c[..., 1] - pc_min[1]) / voxel_size[1] - off
+            c[..., 2] = (c[..., 2] - pc_min[2]) / voxel_size[2] - off
+            s = sigmas.clone()
+            s[..., 0] = (s[..., 0] / voxel_size[0]).clamp(min=float(gaussian_sigma_floor_vox))
+            s[..., 1] = (s[..., 1] / voxel_size[1]).clamp(min=float(gaussian_sigma_floor_vox))
+            s[..., 2] = (s[..., 2] / voxel_size[2]).clamp(min=float(gaussian_sigma_floor_vox))
+
+            trunc = self.gaussian_truncate_sigma if gaussian_truncate_sigma is None else float(gaussian_truncate_sigma)
+            trunc = max(1.0, float(trunc))
+            trunc2 = trunc * trunc
+            loss_acc = centers.new_tensor(0.0)
+            weight_acc = centers.new_tensor(0.0)
+
+            for t in range(T_pred):
+                dt_t = occ_dt_t[t]
+                for q in range(Q):
+                    for g in range(G):
+                        cxi, cyi, czi = c[t, q, g]
+                        sxi, syi, szi = s[t, q, g]
+                        rx = max(1, int(torch.ceil(trunc * sxi).item()))
+                        ry = max(1, int(torch.ceil(trunc * syi).item()))
+                        rz = max(1, int(torch.ceil(trunc * szi).item()))
+                        x0 = max(0, int(torch.floor(cxi).item()) - rx)
+                        x1 = min(X - 1, int(torch.floor(cxi).item()) + rx)
+                        y0 = max(0, int(torch.floor(cyi).item()) - ry)
+                        y1 = min(Y - 1, int(torch.floor(cyi).item()) + ry)
+                        z0 = max(0, int(torch.floor(czi).item()) - rz)
+                        z1 = min(Z - 1, int(torch.floor(czi).item()) + rz)
+                        if (x1 < x0) or (y1 < y0) or (z1 < z0):
+                            continue
+                        xs = torch.arange(x0, x1 + 1, device=centers.device, dtype=torch.float32)
+                        ys = torch.arange(y0, y1 + 1, device=centers.device, dtype=torch.float32)
+                        zs = torch.arange(z0, z1 + 1, device=centers.device, dtype=torch.float32)
+                        xx, yy, zz = torch.meshgrid(xs, ys, zs, indexing="ij")
+                        dx = xx - cxi
+                        dy = yy - cyi
+                        yaw = yaws[t, q, g]
+                        xr = torch.cos(yaw) * dx + torch.sin(yaw) * dy
+                        yr = -torch.sin(yaw) * dx + torch.cos(yaw) * dy
+                        md2 = (xr / sxi).pow(2) + (yr / syi).pow(2) + ((zz - czi) / szi).pow(2)
+                        w = torch.exp(-0.5 * md2) * (md2 <= trunc2).to(md2.dtype)
+                        xx_i, yy_i, zz_i = torch.meshgrid(
+                            xs.to(torch.long), ys.to(torch.long), zs.to(torch.long), indexing="ij"
+                        )
+                        comp_dt = (w * dt_t[xx_i, yy_i, zz_i]).sum() / w.sum().clamp(min=1e-6)
+                        alpha = weights[t, q, g]
+                        loss_acc = loss_acc + alpha * comp_dt
+                        weight_acc = weight_acc + alpha
+
+            if float(weight_acc.detach().item()) <= 0.0:
+                return {"loss_query_dt": centers.sum() * 0.0}
+            return {"loss_query_dt": (loss_acc / weight_acc.clamp(min=1e-6)) * float(loss_weight)}
 
         if self.center_only_mode and (gaussian_centers_world is not None) and (points_world is None):
             points_world = gaussian_centers_world
@@ -3838,6 +3906,10 @@ class QueryHead(nn.Module):
         self,
         gaussian_centers_world: torch.Tensor,
         gaussian_sigmas_world: torch.Tensor = None,
+        mixture_centers_world_tqg3: torch.Tensor = None,
+        mixture_sigmas_world_tqg3: torch.Tensor = None,
+        mixture_yaw_tqg: torch.Tensor = None,
+        mixture_weights_tqg: torch.Tensor = None,
         gt_inst_center_world_tn3: torch.Tensor = None,
         gt_inst_center_valid_tn: torch.Tensor = None,
         loss_weight: float = 0.1,
@@ -3892,6 +3964,17 @@ class QueryHead(nn.Module):
             gt_centers_tn3 = self._select_temporal_gt_for_prediction(gt_centers_tn3, T_pred)
             gt_valid_tn = self._select_temporal_gt_for_prediction(gt_valid_tn, T_pred)
 
+        use_mixture = (
+            (not self.center_only_mode)
+            and torch.is_tensor(mixture_centers_world_tqg3)
+            and torch.is_tensor(mixture_sigmas_world_tqg3)
+            and torch.is_tensor(mixture_weights_tqg)
+            and mixture_centers_world_tqg3.dim() == 4
+            and tuple(mixture_centers_world_tqg3.shape) == tuple(mixture_sigmas_world_tqg3.shape)
+            and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_weights_tqg.shape)
+            and int(mixture_centers_world_tqg3.shape[0]) >= T_pred
+            and int(mixture_centers_world_tqg3.shape[1]) == Q
+        )
         fixed_sigma = None
         pred_sigma_tq3 = None
         if not self.center_only_mode:
@@ -3906,7 +3989,7 @@ class QueryHead(nn.Module):
                     f"got {sigma_policy!r}"
                 )
 
-            if sigma_policy == "pred_cov_q_only":
+            if sigma_policy == "pred_cov_q_only" and not use_mixture:
                 if (not torch.is_tensor(gaussian_sigmas_world)) or gaussian_sigmas_world.dim() != 3:
                     raise ValueError(
                         "gaussian_sigmas_world must be [T,Q,3] when sigma_policy='pred_cov_q_only'"
@@ -3923,6 +4006,80 @@ class QueryHead(nn.Module):
 
         eps = float(coverage_eps)
         tau_v = max(float(coverage_eps), float(tau))
+        if use_mixture:
+            comp_mu_tqg3 = mixture_centers_world_tqg3[:T_pred].to(device=pred_mu_tq3.device, dtype=torch.float32)
+            comp_sigma_tqg3 = mixture_sigmas_world_tqg3[:T_pred].to(device=pred_mu_tq3.device, dtype=torch.float32).clamp(min=1e-3)
+            comp_weight_tqg = mixture_weights_tqg[:T_pred].to(device=pred_mu_tq3.device, dtype=torch.float32).clamp(0.0, 1.0)
+            loss_cov_gt_acc = pred_mu_tq3.new_tensor(0.0)
+            loss_cov_q_acc = pred_mu_tq3.new_tensor(0.0)
+            loss_balance_acc = pred_mu_tq3.new_tensor(0.0)
+            cov_frame_cnt = 0
+            balance_frame_cnt = 0
+
+            for t in range(T_pred):
+                valid_n = gt_valid_tn[t]
+                if not bool(valid_n.any().item()):
+                    continue
+                gt_k3 = gt_centers_tn3[t, valid_n, :]
+                comp_m3 = comp_mu_tqg3[t].reshape(-1, 3)
+                sigma_m3 = comp_sigma_tqg3[t].reshape(-1, 3)
+                weight_m = comp_weight_tqg[t].reshape(-1)
+                if comp_m3.numel() == 0:
+                    continue
+
+                diff_mk3 = comp_m3[:, None, :] - gt_k3[None, :, :]
+                d_mk_m = diff_mk3.pow(2).sum(dim=-1).clamp(min=eps).sqrt()
+                d2_mk = (diff_mk3 / sigma_m3[:, None, :]).pow(2).sum(dim=-1)
+                aff_mk = weight_m[:, None] * torch.exp(-0.5 * d2_mk / tau_v)
+                lam_k = aff_mk.sum(dim=0)
+                p_hit_k = (-torch.expm1(-lam_k)).clamp(min=eps, max=1.0)
+                loss_cov_gt_t = -torch.log(p_hit_k).mean()
+
+                lam_m = aff_mk.sum(dim=1)
+                p_hit_m = (-torch.expm1(-lam_m)).clamp(min=eps, max=1.0)
+                weight_den = weight_m.sum().clamp(min=eps)
+                loss_cov_q_t = (-torch.log(p_hit_m) * weight_m).sum() / weight_den
+
+                loss_cov_gt_acc = loss_cov_gt_acc + loss_cov_gt_t
+                loss_cov_q_acc = loss_cov_q_acc + loss_cov_q_t
+                cov_frame_cnt += 1
+
+                if float(balance_weight) > 0.0:
+                    resp_mk = aff_mk / aff_mk.sum(dim=1, keepdim=True).clamp(min=eps)
+                    mass_k = (resp_mk * weight_m[:, None]).sum(dim=0)
+                    target_mass = weight_m.sum() / float(max(1, int(gt_k3.shape[0])))
+                    target_k = mass_k.new_full((int(gt_k3.shape[0]),), float(target_mass.detach().item()))
+                    loss_balance_acc = loss_balance_acc + F.smooth_l1_loss(
+                        mass_k / weight_den,
+                        target_k / weight_den,
+                        reduction="mean",
+                        beta=0.1,
+                    )
+                    balance_frame_cnt += 1
+
+            if cov_frame_cnt == 0:
+                z = pred_mu_tq3.sum() * 0.0
+                return {
+                    "loss_query_gt2p_instance_labeled": z,
+                    "dbg_query_gt2p_inst_cov_gt": z,
+                    "dbg_query_gt2p_inst_cov_q": z,
+                    "dbg_query_gt2p_inst_balance": z,
+                }
+
+            loss_cov_gt = loss_cov_gt_acc / float(cov_frame_cnt)
+            loss_cov_q = loss_cov_q_acc / float(cov_frame_cnt)
+            loss_cov = 0.5 * (loss_cov_gt + loss_cov_q)
+            if (balance_frame_cnt > 0) and (float(balance_weight) > 0.0):
+                loss_balance = loss_balance_acc / float(balance_frame_cnt)
+            else:
+                loss_balance = pred_mu_tq3.sum() * 0.0
+            total = (loss_cov + float(balance_weight) * loss_balance) * float(loss_weight)
+            return {
+                "loss_query_gt2p_instance_labeled": total,
+                "dbg_query_gt2p_inst_cov_gt": loss_cov_gt.detach(),
+                "dbg_query_gt2p_inst_cov_q": loss_cov_q.detach(),
+                "dbg_query_gt2p_inst_balance": loss_balance.detach(),
+            }
 
         loss_cov_gt_acc = pred_mu_tq3.new_tensor(0.0)
         loss_cov_q_acc = pred_mu_tq3.new_tensor(0.0)
@@ -4285,7 +4442,7 @@ if __name__ == "__main__":
 
     print(out["centers_world_tq3"].shape)         # [T, Q, 3]
     print(out["center_logits_tq3"].shape)         # [T, Q, 3]
-    print(out["query_sigma_world_tq3"].shape)     # [T, Q, 3]
+    print(out["query_sigma_world_tq3"])           # None (summary Gaussian disabled)
     print(out["mixture_centers_world_tqg3"].shape)  # [T, Q, G, 3]
     print(out["mixture_sigmas_world_tqg3"].shape)   # [T, Q, G, 3]
     print(out["mixture_yaw_tqg"].shape)             # [T, Q, G]

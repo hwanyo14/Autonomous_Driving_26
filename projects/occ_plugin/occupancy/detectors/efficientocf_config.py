@@ -3,6 +3,11 @@ MODEL_CFG_DEFAULTS = {
     "use_segmentation_as_query_gt": False,
     "use_gmo_bce_loss": False,
     "query_gmo_loss_type": "balanced_bce",
+    "query_gmo_loss_weight": 0.1,
+    "query_gmo_shape_loss_mode": "global",
+    "query_gmo_local_crop_size": None,
+    "query_gmo_local_crop_scale": 1.0,
+    "query_gmo_local_crop_margin_vox": (0.0, 0.0, 0.0),
     "query_gmo_focal_gamma": 2.0,
     "query_gmo_focal_alpha": 0.25,
     "query_gmo_dice_loss_weight": 0.5,
@@ -64,10 +69,8 @@ MODEL_CFG_DEFAULTS = {
     "query_multi_gaussian_sigma_reg_loss_weight": 0.0,
     "query_multi_gaussian_sigma_reg_log_eps": 1e-6,
     "query_multi_gaussian_pair_chunk": 8,
-    "query_multi_gaussian_weight_mode": "softmax",
-    "query_multi_gaussian_softplus_bias_init": -2.0,
-    "query_multi_gaussian_weight_reg_loss_weight": 1e-3,
-    "query_multi_gaussian_weight_reg_target_sum": 1.0,
+    "query_gaussian_head_num_layers": 2,
+    "query_cls_head_num_layers": 2,
     "query_embed_dim": 256,
     "query_num_queries": 100,
     "query_transformer_num_layers": 3,
@@ -117,6 +120,7 @@ DEBUG_CFG_DEFAULTS = {
     "debug_query_cam_gaussian_vis_every": 0,
     "debug_gt_alignment_vis_every": 0,
     "debug_gmo_quality_alignment_vis_every": 0,
+    "debug_gmo_local_aabb_pair_vis_every": 0,
     "debug_query_inst_depth_lift_vis_every": 0,
     "debug_query_attn_softargmax_vis_every": 0,
 }
@@ -146,6 +150,8 @@ VISUALIZATION_CFG_DEFAULTS = {
     "debug_gt_alignment_vis_dir": "./work_dirs/gt_alignment_vis",
     "debug_gt_alignment_vis_max_frames": 7,
     "debug_gmo_quality_alignment_vis_dir": "./work_dirs/gmo_quality_alignment_vis",
+    "debug_gmo_local_aabb_pair_vis_dir": "./work_dirs/gmo_local_aabb_pair_vis",
+    "debug_gmo_local_aabb_pair_vis_max_pairs": 8,
     "debug_query_inst_depth_lift_vis_dir": "./work_dirs/query_inst_depth_lift_vis",
     "debug_query_inst_depth_lift_vis_max_frames": 3,
     "debug_query_inst_depth_lift_vis_max_cams": 2,
@@ -172,6 +178,35 @@ def apply_model_cfg(self, cfg):
     self.use_segmentation_as_query_gt = bool(cfg["use_segmentation_as_query_gt"])
     self.use_gmo_bce_loss = bool(cfg["use_gmo_bce_loss"])
     self.query_gmo_loss_type = str(cfg["query_gmo_loss_type"]).lower()
+    self.query_gmo_loss_weight = float(cfg["query_gmo_loss_weight"])
+    self.query_gmo_shape_loss_mode = str(cfg["query_gmo_shape_loss_mode"]).lower()
+    if self.query_gmo_shape_loss_mode in ("local", "aabb_local"):
+        self.query_gmo_shape_loss_mode = "local_aabb"
+    if self.query_gmo_shape_loss_mode not in ("global", "local_aabb"):
+        raise ValueError(
+            "query_gmo_shape_loss_mode must be 'global' or 'local_aabb', "
+            f"got {self.query_gmo_shape_loss_mode}"
+        )
+    crop_size = cfg["query_gmo_local_crop_size"]
+    if crop_size is None or str(crop_size).lower() == "auto":
+        self.query_gmo_local_crop_size = None
+    else:
+        self.query_gmo_local_crop_size = tuple(int(v) for v in crop_size)
+        if len(self.query_gmo_local_crop_size) != 3:
+            raise ValueError(
+                "query_gmo_local_crop_size must have 3 values or None, "
+                f"got {self.query_gmo_local_crop_size}"
+            )
+    margin_vox = cfg["query_gmo_local_crop_margin_vox"]
+    if isinstance(margin_vox, (int, float)):
+        margin_vox = (float(margin_vox), float(margin_vox), float(margin_vox))
+    self.query_gmo_local_crop_margin_vox = tuple(float(v) for v in margin_vox)
+    if len(self.query_gmo_local_crop_margin_vox) != 3:
+        raise ValueError(
+            "query_gmo_local_crop_margin_vox must have 3 values, "
+            f"got {self.query_gmo_local_crop_margin_vox}"
+        )
+    self.query_gmo_local_crop_scale = float(cfg["query_gmo_local_crop_scale"])
     self.query_gmo_focal_gamma = float(cfg["query_gmo_focal_gamma"])
     self.query_gmo_focal_alpha = float(cfg["query_gmo_focal_alpha"])
     self.query_gmo_dice_loss_weight = float(cfg["query_gmo_dice_loss_weight"])
@@ -256,10 +291,8 @@ def apply_model_cfg(self, cfg):
     self.query_multi_gaussian_sigma_reg_loss_weight = float(cfg["query_multi_gaussian_sigma_reg_loss_weight"])
     self.query_multi_gaussian_sigma_reg_log_eps = float(cfg["query_multi_gaussian_sigma_reg_log_eps"])
     self.query_multi_gaussian_pair_chunk = max(1, int(cfg["query_multi_gaussian_pair_chunk"]))
-    self.query_multi_gaussian_weight_mode = str(cfg["query_multi_gaussian_weight_mode"]).lower()
-    self.query_multi_gaussian_softplus_bias_init = float(cfg["query_multi_gaussian_softplus_bias_init"])
-    self.query_multi_gaussian_weight_reg_loss_weight = float(cfg["query_multi_gaussian_weight_reg_loss_weight"])
-    self.query_multi_gaussian_weight_reg_target_sum = float(cfg["query_multi_gaussian_weight_reg_target_sum"])
+    self.query_gaussian_head_num_layers = int(cfg["query_gaussian_head_num_layers"])
+    self.query_cls_head_num_layers = int(cfg["query_cls_head_num_layers"])
     self.query_embed_dim = int(cfg["query_embed_dim"])
     self.query_num_queries = int(cfg["query_num_queries"])
     self.query_transformer_num_layers = int(cfg["query_transformer_num_layers"])
@@ -321,6 +354,7 @@ def apply_debug_cfg(self, cfg):
     self.debug_query_cam_gaussian_vis_every = int(cfg["debug_query_cam_gaussian_vis_every"])
     self.debug_gt_alignment_vis_every = int(cfg["debug_gt_alignment_vis_every"])
     self.debug_gmo_quality_alignment_vis_every = int(cfg["debug_gmo_quality_alignment_vis_every"])
+    self.debug_gmo_local_aabb_pair_vis_every = int(cfg["debug_gmo_local_aabb_pair_vis_every"])
     self.debug_query_inst_depth_lift_vis_every = int(cfg["debug_query_inst_depth_lift_vis_every"])
     self.debug_query_attn_softargmax_vis_every = int(cfg["debug_query_attn_softargmax_vis_every"])
 
@@ -356,6 +390,8 @@ def apply_visualization_cfg(self, cfg):
     self.debug_gt_alignment_vis_dir = str(cfg["debug_gt_alignment_vis_dir"])
     self.debug_gt_alignment_vis_max_frames = max(1, int(cfg["debug_gt_alignment_vis_max_frames"]))
     self.debug_gmo_quality_alignment_vis_dir = str(cfg["debug_gmo_quality_alignment_vis_dir"])
+    self.debug_gmo_local_aabb_pair_vis_dir = str(cfg["debug_gmo_local_aabb_pair_vis_dir"])
+    self.debug_gmo_local_aabb_pair_vis_max_pairs = max(1, int(cfg["debug_gmo_local_aabb_pair_vis_max_pairs"]))
     self.debug_query_inst_depth_lift_vis_dir = str(cfg["debug_query_inst_depth_lift_vis_dir"])
     self.debug_query_inst_depth_lift_vis_max_frames = max(1, int(cfg["debug_query_inst_depth_lift_vis_max_frames"]))
     self.debug_query_inst_depth_lift_vis_max_cams = max(1, int(cfg["debug_query_inst_depth_lift_vis_max_cams"]))

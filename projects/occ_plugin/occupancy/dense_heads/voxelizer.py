@@ -419,7 +419,7 @@ class SoftVoxelizerOneAdd(nn.Module):
         Args:
             mixture_centers_world_tkg3: [T,K,G,3]
             mixture_sigmas_world_tkg3: [T,K,G,3]
-            mixture_weights_tkg: [T,K,G] (typically softmax-normalized over G)
+            mixture_weights_tkg: [T,K,G] independent per-component alpha in [0,1]
             mixture_yaw_tkg: [T,K,G] (z-axis yaw, radians)
             pair_weights_tk: optional [T,K] scalar weight per pair
             pair_chunk_size: chunk size over K for memory control

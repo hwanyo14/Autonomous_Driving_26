@@ -1,5 +1,19 @@
 # NOTES
 
+## 2026-06-26 KST — Independent Gaussian alpha 검증 메모
+
+- `QueryHead` dummy forward/backward smoke는 현재 shell Python에 `torch`가 없어 `ModuleNotFoundError: No module named 'torch'`로 실행하지 못함.
+- 변경 파일 `py_compile`과 `git diff --check`는 통과.
+
+## 2026-06-26 KST — Main training config
+
+- 사용자가 현재 메인으로 사용하는 config는 `projects/configs/baselines/test_traj_large_adj_lr_crop_margin.py`이다. 학습 인자 변경이 필요하면 이 config를 우선 반영할 것.
+
+## 2026-06-25 KST — Matched GMO local AABB loss 검증 메모
+
+- `_compute_matched_pair_gmo_losses(shape_loss_mode='local_aabb')` 더미 torch smoke는 현재 shell Python에 `torch`가 없어 `ModuleNotFoundError: No module named 'torch'`로 실행하지 못함.
+- 변경 파일 `py_compile`과 `git diff --check`는 통과.
+
 ## 2026-06-23 KST — QueryDepthHead soft depth CE 검증 메모
 
 - `tools/misc/smoke_past_frame_matching.py` 실행은 현재 shell Python에 `torch`가 없어 `ModuleNotFoundError: No module named 'torch'`로 중단됨. 변경 파일 `py_compile`과 `git diff --check`는 통과.
@@ -17,6 +31,12 @@
 ## 2026-06-21 KST — Trajectory DDP log key 안정성
 
 - rank별 유효 trajectory pair 유무가 달라도 `_aggregate_training_losses()`가 `loss_query_traj`와 6개 `dbg_query_traj_*` key를 항상 반환해야 함. 새 trajectory diagnostic key를 추가할 때도 zero prefill 목록을 함께 갱신할 것.
+
+## 2026-06-26 KST — Local AABB GMO pair visualization
+
+- `debug_gmo_local_aabb_pair_vis_every > 0`이어도 `query_gmo_shape_loss_mode='local_aabb'`인 학습 branch에서만 pair PNG/sidecar가 저장된다.
+- `EfficientOCF_V1.1_1gpu.py`에는 저장 주기/경로만 추가했으며, 기존 `query_gmo_shape_loss_mode` 값은 변경하지 않았다. 실제 crop supervision 검증 시 사용하는 config가 local AABB 모드인지 먼저 확인할 것.
+- 저장 경로 기본값은 `work_dirs/gmo_local_aabb_pair_vis*`; PNG는 BEV max-Z projection이고 원본 crop tensor는 `local_aabb_pairs.pt`에 들어 있다.
 
 ## 2026-06-21 KST — tf-traj-cost 단일 trajectory 경로 적용 범위
 
