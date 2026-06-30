@@ -71,6 +71,7 @@ MODEL_CFG_DEFAULTS = {
     "query_multi_gaussian_pair_chunk": 8,
     "query_gaussian_head_num_layers": 2,
     "query_cls_head_num_layers": 2,
+    "query_cls_use_gaussian_params": False,
     "query_embed_dim": 256,
     "query_num_queries": 100,
     "query_transformer_num_layers": 3,
@@ -293,6 +294,7 @@ def apply_model_cfg(self, cfg):
     self.query_multi_gaussian_pair_chunk = max(1, int(cfg["query_multi_gaussian_pair_chunk"]))
     self.query_gaussian_head_num_layers = int(cfg["query_gaussian_head_num_layers"])
     self.query_cls_head_num_layers = int(cfg["query_cls_head_num_layers"])
+    self.query_cls_use_gaussian_params = bool(cfg["query_cls_use_gaussian_params"])
     self.query_embed_dim = int(cfg["query_embed_dim"])
     self.query_num_queries = int(cfg["query_num_queries"])
     self.query_transformer_num_layers = int(cfg["query_transformer_num_layers"])

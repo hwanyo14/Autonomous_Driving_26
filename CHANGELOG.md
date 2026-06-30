@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-06-29 11:31 KST
+
+### Query Classification Gaussian Params Concat
+
+**핵심 내용**: query classification head가 선택적으로 query feature와 예측 Gaussian mixture 파라미터를 concat해 class logits를 예측하도록 변경.
+
+**주요 변경사항**:
+- `query_head.py`: `query_cls_use_gaussian_params` 옵션 추가. 활성화 시 cls 입력에 per-Gaussian `offset xyz + sigma xyz + yaw(sin,cos) + weight`를 detach 후 concat.
+- `query_head.py`: lifted center 기반 Gaussian 계산 이후 `query_cls_logits_qc`, `query_cls_scores_qc`, `query_cls_scores_tqc`를 재계산하도록 `apply_lifted_centers_to_outputs` 경로 갱신.
+- `efficientocf.py`: detector가 `apply_lifted_centers_to_outputs` 이후 갱신된 cls 출력을 사용하도록 로컬 변수 추출 위치 조정.
+- `efficientocf_config.py`, `base_config.py`: 기본값은 기존 동작 유지(`False`), 현재 baseline에서는 `query_cls_use_gaussian_params=True` 활성화.
+
 ## 2026-06-29 10:39 KST
 
 ### Query Gaussian/Class Head Layer Config

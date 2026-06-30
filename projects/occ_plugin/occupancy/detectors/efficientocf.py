@@ -176,6 +176,7 @@ class EfficientOCF(
             query_multi_gaussian_sigma_reg_log_eps=self.query_multi_gaussian_sigma_reg_log_eps,
             query_gaussian_head_num_layers=self.query_gaussian_head_num_layers,
             query_cls_head_num_layers=self.query_cls_head_num_layers,
+            query_cls_use_gaussian_params=self.query_cls_use_gaussian_params,
             point_cloud_range=point_cloud_range,
             spatial_extent3d=self.spatial_extent3d,
             query_feat_cosine_threshold=self.query_feat_cosine_threshold,
@@ -944,9 +945,6 @@ class EfficientOCF(
             detach_query_for_center=self.query_center_loss_detach_query_feat,
             compute_direct_center=False,
         )
-        query_cls_logits_qc = query_head_outputs["query_cls_logits_qc"]
-        query_cls_scores_qc = query_head_outputs["query_cls_scores_qc"]
-        query_cls_scores_tqc = query_head_outputs["query_cls_scores_tqc"]
         query_depth_logits_tqd = query_head_outputs["query_depth_logits_tqd"]
         query_depth_probs_tqd = query_head_outputs["query_depth_probs_tqd"]
         query_future_feat_tqd = query_head_outputs["query_feat_tqd"]
@@ -976,6 +974,9 @@ class EfficientOCF(
         )
         centers_world = query_head_outputs["centers_world_tq3"]
         center_logits = query_head_outputs["center_logits_tq3"]
+        query_cls_logits_qc = query_head_outputs["query_cls_logits_qc"]
+        query_cls_scores_qc = query_head_outputs["query_cls_scores_qc"]
+        query_cls_scores_tqc = query_head_outputs["query_cls_scores_tqc"]
         gaussian_sigmas_world = None
         mixture_centers_world_tqg3 = query_head_outputs["mixture_centers_world_tqg3"]
         mixture_sigmas_world_tqg3 = query_head_outputs["mixture_sigmas_world_tqg3"]
