@@ -126,10 +126,25 @@ MODEL_CFG_DEFAULTS = {
     # occ_combine_mode 적용, yaw 살림). False면 16개를 평균낸 단일 ellipsoid로 찍음.
     # mixture 텐서가 없는 모델은 simple_test의 use_mix 가드가 자동으로 단일 ellipsoid로 fallback.
     "query_eval_occ_use_mixture": True,
-    # occupancy 확률을 점유/비점유로 가르는 단일 threshold (= 평가 metric 기준).
-    # 이 값 하나가 (1)평가 metric 이진화, (2)2D query_debug_vis occ-grid, (3)3D mixture3d occ,
-    # (4)가우시안 footprint outline 등고선을 모두 결정한다. 런타임 override: EOCF_EVAL_OCC_THR (eval 시에만).
-    "eval_occ_threshold": 0.5,
+    # ============================================================================
+    # [Thresholds — 자주 바꾸는 값] 선택/metric 임계값. config 값=학습·추론 공통,
+    #   추론에서만 바꾸려면 env. (둘 다 selection/metric 본 로직 — viz 아님)
+    #   occ 점유(=metric) :  occ_score_threshold  (metric 이진화 + 2D occ-grid + 3D mixture3d)
+    #                        env override: EOCF_EVAL_OCC_THR
+    #   query(fg) 선택 컷  :  fg_score_threshold   (query 선택 + 2D 표시 + 3D 필터)
+    #                        env override: EOCF_EVAL_FG_THR
+    #
+    # [Oracle eval] EOCF_EVAL_ORACLE_MATCH=1 → query score 선택을 끄고 GT에 Hungarian 매칭(학습 동일).
+    #   구현: efficientocf.py `_eval_train_faithful_inst_match`. metric만 영향, 학습/loss 무관.
+    # ============================================================================
+    "occ_score_threshold": 0.5,
+    "fg_score_threshold": 0.5,
+    # fg score 합성 가중치: score = (w_iou*iou + w_cls*cls + w_cam*cam) / (w_iou+w_cls + w_cam)
+    "fg_score_iou_weight": 0.5,
+    "fg_score_cls_weight": 0.5,
+    "fg_score_cam_attn_weight": 0.0,
+    "fg_score_topk": 50,
+    "fg_score_distance_nms_radius_m": 3.0,
     "query_embed_dim": 256,
     "query_num_queries": 100,
     "query_transformer_num_layers": 1,
@@ -186,23 +201,9 @@ DEBUG_CFG_DEFAULTS = {
 VISUALIZATION_CFG_DEFAULTS = {
     "debug_query_vis_dir": "./work_dirs/query_debug_vis",
     "debug_query_center_marker_radius": 3,
-    # ============================================================================
-    # [임계값 한눈에] 학습/추론 viz·metric에 공통 적용되는 임계값 (config가 학습·추론 모두 좌우,
-    #                env가 있으면 추론에서만 override). occ는 MODEL_CFG_DEFAULTS의 eval_occ_threshold.
-    #   occ 점유 :  eval_occ_threshold (model cfg, 기본 0.5)        env override: EOCF_EVAL_OCC_THR
-    #   query score(선택/표시/3D) :  debug_query_score_threshold (아래, 기본 0.5)  env override: EOCF_EVAL_FG_THR
-    # → config 값 = 학습·추론 공통. 추론에서만 바꾸려면 env. 둘 다 같게 하려면 config만 쓰고 env 빼면 됨.
-    # ============================================================================
+    # (fg score 선택 임계값/가중치는 selection 로직이라 MODEL_CFG_DEFAULTS로 이동 — fg_score_* 참조)
     "debug_query_gaussian_vis_mode": "ellipse",
     "debug_query_gaussian_prob_alpha_scale": 4.0,
-    "debug_query_score_topk": 50,
-    # ★ query score 단일 임계값: 2D 선택(3행 hi) + 2D footprint 표시 + 3D mixture3d 필터 모두 이 값 사용.
-    #   학습·추론 공통. 추론 override: 환경변수 EOCF_EVAL_FG_THR.
-    "debug_query_score_threshold": 0.5,
-    "debug_query_score_iou_weight": 0.5,
-    "debug_query_score_cls_weight": 0.5,
-    "debug_query_score_cam_attn_weight": 0.0,
-    "debug_query_distance_nms_radius_m": 3.0,
     "debug_instance_img_vis_dir": "./work_dirs/instance_img_debug_vis",
     "debug_instance_img_vis_max_frames": 3,
     "debug_instance_img_vis_max_instances": 24,
@@ -225,7 +226,7 @@ VISUALIZATION_CFG_DEFAULTS = {
     "debug_query_mixture3d_vis_dir": "./work_dirs/query_mixture3d_vis",
     "debug_query_mixture3d_vis_max_queries": 50,
     "debug_query_mixture3d_vis_max_gt_points": 40000,
-    # (deprecated) mixture3d occ threshold는 이제 eval_occ_threshold로 통일됨 → 키 제거.
+    # (deprecated) mixture3d occ threshold는 이제 occ_score_threshold로 통일됨 → 키 제거.
     "debug_query_mixture3d_vis_occ_max_voxels_per_query": 4000,
     # eval 전용 3D mixture vis 해상도. train 중 eval을 얹기 쉽게 기본은 lightweight 128x128x10.
     "debug_query_mixture3d_vis_eval_occ_size": (128, 128, 10),
@@ -381,7 +382,13 @@ def apply_model_cfg(self, cfg):
     self.query_multi_gaussian_weight_reg_target_sum = float(cfg["query_multi_gaussian_weight_reg_target_sum"])
     self.query_multi_gaussian_occ_combine_mode = str(cfg["query_multi_gaussian_occ_combine_mode"]).lower()
     self.query_eval_occ_use_mixture = bool(cfg["query_eval_occ_use_mixture"])
-    self.eval_occ_threshold = float(cfg["eval_occ_threshold"])
+    self.occ_score_threshold = float(cfg["occ_score_threshold"])
+    self.fg_score_threshold = float(cfg["fg_score_threshold"])
+    self.fg_score_iou_weight = float(cfg["fg_score_iou_weight"])
+    self.fg_score_cls_weight = float(cfg["fg_score_cls_weight"])
+    self.fg_score_cam_attn_weight = float(cfg["fg_score_cam_attn_weight"])
+    self.fg_score_topk = max(0, int(cfg["fg_score_topk"]))
+    self.fg_score_distance_nms_radius_m = max(0.0, float(cfg["fg_score_distance_nms_radius_m"]))
     self.query_embed_dim = int(cfg["query_embed_dim"])
     self.query_num_queries = int(cfg["query_num_queries"])
     self.query_transformer_num_layers = int(cfg["query_transformer_num_layers"])
@@ -454,12 +461,6 @@ def apply_visualization_cfg(self, cfg):
     self.debug_query_center_marker_radius = max(0, int(cfg["debug_query_center_marker_radius"]))
     self.debug_query_gaussian_vis_mode = str(cfg["debug_query_gaussian_vis_mode"]).lower()
     self.debug_query_gaussian_prob_alpha_scale = float(cfg["debug_query_gaussian_prob_alpha_scale"])
-    self.debug_query_score_topk = max(0, int(cfg["debug_query_score_topk"]))
-    self.debug_query_score_threshold = float(cfg["debug_query_score_threshold"])
-    self.debug_query_score_iou_weight = float(cfg["debug_query_score_iou_weight"])
-    self.debug_query_score_cls_weight = float(cfg["debug_query_score_cls_weight"])
-    self.debug_query_score_cam_attn_weight = float(cfg["debug_query_score_cam_attn_weight"])
-    self.debug_query_distance_nms_radius_m = max(0.0, float(cfg["debug_query_distance_nms_radius_m"]))
     self.debug_instance_img_vis_dir = str(cfg["debug_instance_img_vis_dir"])
     self.debug_instance_img_vis_max_frames = max(1, int(cfg["debug_instance_img_vis_max_frames"]))
     self.debug_instance_img_vis_max_instances = max(1, int(cfg["debug_instance_img_vis_max_instances"]))

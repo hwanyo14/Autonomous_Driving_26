@@ -114,8 +114,8 @@ bda_aug_conf = dict(
     flip_dy_ratio=0.5,
 )
 
-# train_capacity = 23930  # default: use all sequences
-train_capacity = 4000  # 3880
+train_capacity = 23930  # default: use all sequences
+# train_capacity = 4000  # 3880
 # train_capacity = 7  # 3880
 
 test_capacity = 5119  # default: use all sequences
@@ -369,7 +369,6 @@ model_cfg = dict(
     # 단일 변수 실험: 이번엔 weight_mode='ones'→'sigmoid'(opacity)만 바꿈. 나머지 dice/tversky 설정과
     #   제한값(offset_max=12/sigma_max=3)은 dice run과 동일하게 유지.
     use_query_gmo_dice_loss=True,
-    query_gmo_dice_3d=True,   # dice/Tversky를 3D로: z 과확장을 FP로 벌함 (σ_z=0.6 force와 콤보)
     query_gmo_dice_loss_weight=0.5,
     query_gmo_tversky_alpha=0.7,   # FP(over-coverage) 가중
     query_gmo_tversky_beta=0.3,    # FN(under-coverage) 가중
@@ -478,7 +477,7 @@ model_cfg = dict(
     # ===== [임계값 1/2] occ 점유 판정 =====================================
     # metric + 2D occ-grid + 3D mixture3d 에 공통 적용. config 값=학습·추론 공통.
     # 추론에서만 env EOCF_EVAL_OCC_THR 주면 그때 override. (fg score는 visualization_cfg)
-    occ_score_threshold=0.5, # occ 임계값 학습/추론/시각화 공통
+    occ_score_threshold=0.75, # occ 임계값 학습/추론/시각화 공통
     # ===== [임계값 2/2] query(fg) score =================================
     # query 선택 + 2D 표시 + 3D 필터 에 공통 적용. config 값=학습·추론 공통.
     # 추론에서만 env EOCF_EVAL_FG_THR 주면 그때 override. (occ는 model_cfg의 occ_score_threshold)

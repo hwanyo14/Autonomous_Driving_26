@@ -8,5 +8,5 @@ USE_MPS=0 \
 ./run.sh \
 ./projects/configs/baselines/shape_guide_128_dice_weight_fl25_sz06.py \
 8 \
-# --resume /NHNHOME/WORKSPACE/0526040009_A/hwanhee/Autonomous_Driving_26_ksh_occ_shape_codeonly/work_dirs/shape_guide_128_dice_weight_24/latest.pth
+--resume /NHNHOME/WORKSPACE/0526040009_A/hwanhee/Autonomous_Driving_26_ksh_occ_shape_codeonly/work_dirs/shape_guide_128_dice_weight_fl25_sz06/latest.pth
 # --cfg-options load_from=/home/hwanhee/Autonomous_Driving_26_0528/epoch_15_lss_only.pth

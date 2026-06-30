@@ -14,6 +14,7 @@
 ├── run_eval.sh  # 평가용 진입 스크립트; config/checkpoint 확인 후 tools/dist_test.sh 호출
 ├── train_total.sh  # 8GPU 학습 원클릭 래퍼; CUDA_VISIBLE_DEVICES 지정 후 dist_train.sh 호출
 ├── eval_total.sh  # 단일 eval 원클릭 래퍼; CONFIG/checkpoint/GPU 값만 수정 후 dist_test.sh 호출
+├── eval_oracle.sh  # Oracle(GT 치팅) eval 래퍼; EOCF_EVAL_ORACLE_MATCH=1로 query↔GT center Hungarian 선택 → 스코어링 병목 진단
 ├── data/  # 외부 데이터와 전처리 캐시를 가리키는 심볼릭 링크 모음
 │   ├── efficientocf -> /home/user/jhh/Projects/EfficientOCF/data/efficientocf  # OCF instance/flow 전처리 캐시
 │   ├── efficientocf_bboxcls -> /home/user/jhh/Projects/EOCF_qg_distil_dev/data/efficientocf_bboxcls  # bbox/class 기반 segmentation 캐시

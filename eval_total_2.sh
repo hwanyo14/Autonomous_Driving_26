@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # ----- 대상 config / checkpoint / GPU -----
-CONFIG=./projects/configs/baselines/shape_guide_128_dice_weight.py
-CHECKPOINT=./work_dirs/shape_guide_128_dice_weight/latest.pth
+CONFIG=./projects/configs/baselines/shape_guide_128_dice_weight_fl25_sz06.py
+CHECKPOINT=./work_dirs/shape_guide_128_dice_weight_fl25_sz06/latest.pth
 GPUS=8
 export PORT=20014
 

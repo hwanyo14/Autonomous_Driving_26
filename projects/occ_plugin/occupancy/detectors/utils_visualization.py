@@ -1332,10 +1332,10 @@ class EfficientOCFVisualizationMixin:
             mix_weights = mw_t.cpu().numpy()
 
         # Common score gate (shared by both rows): keep queries with score >= threshold.
-        # 2D query 선택과 동일한 단일 임계값(config debug_query_score_threshold) + env(EOCF_EVAL_FG_THR)
+        # 2D query 선택과 동일한 단일 임계값(config fg_score_threshold) + env(EOCF_EVAL_FG_THR)
         # 사용 → 학습/추론, 2D/3D 모두 같은 score 임계값으로 일관.
         import os as _os
-        score_thr = float(_os.environ.get("EOCF_EVAL_FG_THR", getattr(self, "debug_query_score_threshold", 0.5)))
+        score_thr = float(_os.environ.get("EOCF_EVAL_FG_THR", getattr(self, "fg_score_threshold", 0.5)))
         keep = sel_score >= score_thr
         n_before = int(sel_pts.shape[0])
         sel_pts = sel_pts[keep]
@@ -1372,12 +1372,12 @@ class EfficientOCFVisualizationMixin:
 
         # Bottom-row GMM occupancy: voxelize each kept query's mixture with the model's
         # own voxelizer and keep voxels with p = 1 - exp(-sum_g w_g * G_g(x)) >= occ_thr.
-        # occ threshold는 평가 metric과 동일한 단일 키(eval_occ_threshold)로 통일.
+        # occ threshold는 평가 metric과 동일한 단일 키(occ_score_threshold)로 통일.
         # eval에서는 env(EOCF_EVAL_OCC_THR)로 해석된 값을 occ_threshold 인자로 직접 받는다.
         occ_thr = (
             float(occ_threshold)
             if occ_threshold is not None
-            else float(getattr(self, "eval_occ_threshold", 0.5))
+            else float(getattr(self, "occ_score_threshold", 0.5))
         )
         # 예측 occ를 '예측 해상도'(query_matched_gmo_bce_occ_size, 예: 64x64x20)로 복셀화한 뒤,
         # 각 점유 복셀을 실제 스케일 큐브로 그린다(큐브 크기=range/res 자동 추종).
@@ -1640,9 +1640,9 @@ class EfficientOCFVisualizationMixin:
             iou_q = centers_world_tq3.new_zeros((q_count,), dtype=torch.float32)
         iou_q = iou_q.to(dtype=torch.float32).clamp(0.0, 1.0)
 
-        w_iou = float(self.debug_query_score_iou_weight)
-        w_cls = float(self.debug_query_score_cls_weight)
-        w_cam = float(self.debug_query_score_cam_attn_weight)
+        w_iou = float(self.fg_score_iou_weight)
+        w_cls = float(self.fg_score_cls_weight)
+        w_cam = float(self.fg_score_cam_attn_weight)
         cam_attn_score_q = centers_world_tq3.new_zeros((q_count,), dtype=torch.float32)
         cam_attn_score_valid_q = torch.zeros((q_count,), device=centers_world_tq3.device, dtype=torch.bool)
         if isinstance(query_attn_cam_score_pack, dict):
@@ -1669,15 +1669,15 @@ class EfficientOCFVisualizationMixin:
         if int(selected_candidate_idx.numel()) > 0:
             candidate_scores = score_q.index_select(0, selected_candidate_idx)
             import os as _os
-            _fg_thr = float(_os.environ.get("EOCF_EVAL_FG_THR", self.debug_query_score_threshold))
+            _fg_thr = float(_os.environ.get("EOCF_EVAL_FG_THR", self.fg_score_threshold))
             keep_thr = candidate_scores >= _fg_thr
             selected_candidate_idx = selected_candidate_idx[keep_thr]
 
-        if int(selected_candidate_idx.numel()) > 0 and int(self.debug_query_score_topk) > 0:
+        if int(selected_candidate_idx.numel()) > 0 and int(self.fg_score_topk) > 0:
             cand_scores = score_q.index_select(0, selected_candidate_idx)
             order = torch.argsort(cand_scores, descending=True)
             selected_candidate_idx = selected_candidate_idx.index_select(0, order)
-            nms_radius = max(0.0, float(getattr(self, "debug_query_distance_nms_radius_m", 0.0)))
+            nms_radius = max(0.0, float(getattr(self, "fg_score_distance_nms_radius_m", 0.0)))
             if nms_radius > 0.0 and int(selected_candidate_idx.numel()) > 0:
                 center_frame_idx = min(
                     max(0, int(getattr(self, "time_receptive_field", 1)) - 1),
@@ -1699,7 +1699,7 @@ class EfficientOCFVisualizationMixin:
                     device=selected_candidate_idx.device,
                     dtype=torch.long,
                 )
-            topk = min(int(self.debug_query_score_topk), int(selected_candidate_idx.numel()))
+            topk = min(int(self.fg_score_topk), int(selected_candidate_idx.numel()))
             selected_idx = selected_candidate_idx[:topk]
         else:
             selected_idx = selected_candidate_idx.new_empty((0,), dtype=torch.long)
@@ -1922,9 +1922,9 @@ class EfficientOCFVisualizationMixin:
             "matched_mixture_yaw_tqg": matched_mix_yaw.detach() if matched_mix_yaw is not None else None,
             "matched_mixture_weights_tqg": matched_mix_weights.detach() if matched_mix_weights is not None else None,
             "traj_mode_idx_q": traj_mode_idx_q.detach() if torch.is_tensor(traj_mode_idx_q) else None,
-            "top_k": int(self.debug_query_score_topk),
-            "score_thr": float(self.debug_query_score_threshold),
-            "distance_nms_radius_m": float(getattr(self, "debug_query_distance_nms_radius_m", 0.0)),
+            "top_k": int(self.fg_score_topk),
+            "score_thr": float(self.fg_score_threshold),
+            "distance_nms_radius_m": float(getattr(self, "fg_score_distance_nms_radius_m", 0.0)),
             "w_iou": float(w_iou),
             "w_cls": float(w_cls),
             "w_cam": float(w_cam),

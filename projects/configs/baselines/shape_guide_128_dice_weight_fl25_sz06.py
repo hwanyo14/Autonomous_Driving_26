@@ -477,7 +477,17 @@ model_cfg = dict(
     # ===== [임계값 1/2] occ 점유 판정 =====================================
     # metric + 2D occ-grid + 3D mixture3d 에 공통 적용. config 값=학습·추론 공통.
     # 추론에서만 env EOCF_EVAL_OCC_THR 주면 그때 override. (fg score는 visualization_cfg)
-    eval_occ_threshold=0.5, # occ 임계값 학습/추론/시각화 공통
+    occ_score_threshold=0.5, # occ 임계값 학습/추론/시각화 공통
+    # ===== [임계값 2/2] query(fg) score =================================
+    # query 선택 + 2D 표시 + 3D 필터 에 공통 적용. config 값=학습·추론 공통.
+    # 추론에서만 env EOCF_EVAL_FG_THR 주면 그때 override. (occ는 model_cfg의 occ_score_threshold)
+    fg_score_threshold=0.75, # fg 임계값 학습/추론/시각화 공통
+    # fg score '합성' 가중치 (무엇으로 점수를 매길지 결정 → 위 임계값으로 컷).
+    # 이 config는 cls 확률만 사용(iou/cam off). utils_visualization.py:1655
+    #   score = (w_iou*iou + w_cls*cls + w_cam*cam) / (w_iou+w_cls + w_cam)
+    fg_score_iou_weight=0.0,
+    fg_score_cls_weight=1.0,
+    fg_score_cam_attn_weight=0.0,
 )
 
 debug_cfg = dict(
@@ -489,16 +499,6 @@ debug_cfg = dict(
 )
 
 visualization_cfg = dict(
-    # ===== [임계값 2/2] query(fg) score =================================
-    # query 선택 + 2D 표시 + 3D 필터 에 공통 적용. config 값=학습·추론 공통.
-    # 추론에서만 env EOCF_EVAL_FG_THR 주면 그때 override. (occ는 model_cfg의 eval_occ_threshold)
-    debug_query_score_threshold=0.75, # fg 임계값 학습/추론/시각화 공통
-    # fg score '합성' 가중치 (무엇으로 점수를 매길지 결정 → 위 임계값으로 컷).
-    # 이 config는 cls 확률만 사용(iou/cam off). utils_visualization.py:1655
-    #   score = (w_iou*iou + w_cls*cls + w_cam*cam) / (w_iou+w_cls + w_cam)
-    debug_query_score_iou_weight=0.0,
-    debug_query_score_cls_weight=1.0,
-    debug_query_score_cam_attn_weight=0.0,
     # ── 2D query_debug_vis ─────────────────────────────────────────────
     debug_query_vis_dir="./work_dirs/query_debug_vis_no_pretrain",
     debug_query_gaussian_vis_mode='prob',     # footprint 렌더 외형(prob heatmap)

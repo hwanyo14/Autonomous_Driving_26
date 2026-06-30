@@ -1,5 +1,18 @@
 # NOTES
 
+## 2026-06-30 KST — ⚠️ Oracle 매칭 train-faithful 복제 유지보수 주의
+- `_eval_train_faithful_inst_match`는 `forward_train`의 매칭 orchestration을 **복제**한 것(공유 메서드 아님 — 사용자가 학습 forward 무수정을 선택). 따라서 **`forward_train`의 매칭 준비 로직이 바뀌면 이 메서드도 손으로 동기화**해야 함. 동기화 안 하면 oracle이 학습과 달라짐.
+- 동기화 체크포인트: GT prep(intersection/history_all_valid 필터), trajectory/vis slice, full center pack, ego-align(`_align_geom_pack`)·`_prepend_past_frames`, `use_full7_temporal_sup` 분기, `pool_gt_instance_context_features`+id reindex, `_select_matching_feature_frames`, `_match_queries_to_gt_instances` 인자/가중치, 그리고 `extract_feat_query` 반환 tuple 인덱스(feat_out[2,4,5,6,7,12,14,15,17,23~32]).
+- attn cost(0.3) 재현 위해 `simple_test`가 oracle-train일 때만 `extract_feat_query`에 attn GT를 넘김 → attn target 생성. 이게 학습 경로와 동일 입력(primary+fallback).
+
+## 2026-06-30 KST — ⚠️ Oracle eval(`EOCF_EVAL_ORACLE_MATCH=1`) 해석/주의
+- **무엇**: query를 confidence score 대신 GT instance center에 Hungarian 매칭해 선택(GT 치팅). `eval_oracle.sh`로 실행. baseline(eval_total_2.sh)과 **반드시 같은 ckpt/occ_thr/mode**로 비교 (현재 `latest.pth`→`epoch_12_lss_only.pth` 심볼릭이라 동일 ckpt 보장).
+- **해석**: oracle ≫ baseline → confidence **스코어링이 병목**(좋은 query를 못 고름). oracle ≈ baseline → 선택은 문제 아님 → **query shape/σ/trajectory 또는 매칭**이 한계.
+- ⚠️ **oracle = 선택 상한선일 뿐**: 매칭된 query도 **예측 shape 그대로** 렌더 → shape 오차는 oracle로도 안 고쳐짐. "oracle인데도 낮음" = shape 문제로 읽으면 됨.
+- ⚠️ **매칭은 min(Q,N_gt)개만**: 어떤 query도 안 잡은 GT는 oracle로도 못 살림(=query coverage 자체 부족 신호).
+- ⚠️ **cost = 학습과 동일**(`EOCF_EVAL_ORACLE_MATCH=1`): center(10·L1/diag) + cls(0.2) + attn soft-IoU(0.3), full7 temporal, feature 게이트. `_eval_train_faithful_inst_match`가 `forward_train` 매칭을 복제(위 항목 참조). (옛 center-거리 기하 근사 oracle은 제거됨 — 학습-동일 경로만 존재.)
+- ⚠️ viz(`EOCF_EVAL_VIS`)는 여전히 **score 선택** 기준 bundle을 그림 → oracle run에선 metric과 불일치하므로 `eval_oracle.sh`에서 VIS=0으로 끔.
+
 ## 2026-06-25 KST — ✅ [해소] sigma_min_m → (0.4,0.4,0.2)로 train/eval 최소 σ 통일
 - 배경: `floor_vox=0.5`는 **voxel 단위**라 grid마다 물리 floor가 다름: matched 128(0.8m)→**0.4m**, eval/scene 512(0.2m)→**0.1m**. 옛 `sigma_min_m=(0.2,0.2,0.2)`에선 matched 0.4m(floor 지배)/eval 0.2m(sigma_min 지배)로 같은 σ가 train·eval에서 달라지는 미세 불일치가 있었음.
 - **조치**: `sigma_min_m`을 `0.5×coarsest(matched) voxel = (0.4,0.4,0.2)`로 상향(`shape_guide_128.py`·`shape_guide_128_dice.py` 둘 다). → σ가 항상 floor 이상이라 **floor_vox가 양 격자에서 비활성**, 네트워크 σ가 train·eval에 동일하게 흐름 = **완전 일치**.

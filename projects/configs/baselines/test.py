@@ -358,6 +358,9 @@ numC_Trans = bev_feat_dim
 
 gn_cfg = dict(type='GN', num_groups=16, requires_grad=True)
 model_cfg = dict(
+    fg_score_iou_weight=0.0,
+    fg_score_cls_weight=0.3,
+    fg_score_cam_attn_weight=0.7,
     use_segmentation_as_query_gt=True,
     use_gmo_bce_loss=True,
     query_gmo_loss_type='focal',
@@ -413,9 +416,6 @@ debug_cfg = dict(
 visualization_cfg = dict(
     debug_query_vis_dir="./work_dirs/query_debug_vis_no_pretrain",
     debug_query_gaussian_vis_mode='prob',
-    debug_query_score_iou_weight=0.0,
-    debug_query_score_cls_weight=0.3,
-    debug_query_score_cam_attn_weight=0.7,
     debug_instance_img_vis_dir="./work_dirs/instance_img_debug_vis_no_pretrain",
     debug_instance_img_vis_max_frames=n_future_frames_plus,
     debug_query_cam_gaussian_vis_dir="./work_dirs/query_cam_gaussian_vis_no_pretrain",

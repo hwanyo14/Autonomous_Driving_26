@@ -1,5 +1,53 @@
 # Changelog
 
+## 2026-06-30 KST — oracle viz = normal viz로 통일 + footprint 복구 (두 레포)
+
+- **footprint 복구**: footprint 시각화(그리기)는 occ threshold 통일이 목적이었지 제거 대상이 아니었음(오해). `query_head.py`를 HEAD에서 복구 + rename(occ_score/fg_score) 재적용 → footprint 그림 그대로, 이진화는 `occ_score_threshold`로 통일. 검증: 1-GPU VIS smoke로 png 정상 렌더 확인. (앞서 footprint 메서드 제거 때 고아로 남은 `@staticmethod`가 `_get_query_vis_palette`를 깨뜨렸던 버그도 fix.)
+- **oracle viz = normal viz**: oracle은 이제 `sel_idx`(=metric 점유 렌더)만 바꾸고, viz bundle은 override 안 함 → oracle eval의 query_debug_vis가 normal eval(eval_total.sh)과 **완전 동일**. `_apply_oracle_selection_to_bundle`(call + method) 제거. metric은 그대로 oracle(GT Hungarian 매칭) 사용.
+
+## 2026-06-30 KST — footprint inert 잔여 제거 + 고아 데코레이터 버그 fix (두 레포, VIS smoke-test 검증)
+
+- footprint **그리기 제거 후 dead로 남은 잔여**까지 정리: `query_head._maybe_save_prob_grid_vis`의 `_project_gaussians` + gpts/sig/yaw/w 투영 setup + `bundle_has_gaussian`/`gaussian_desc` + 헤더 suffix + dead local(gaussian_vis_mode/prob_threshold/prob_alpha_scale) 7블록 제거. `_apply_oracle_selection_to_bundle`의 selected_sigmas/mixture + 관련 인자 제거(footprint 전용이라 dead). center 마커(pts/`_project_points`)·dense occ·GT viz는 유지.
+- **⚠️ 버그 fix (VIS smoke-test가 잡음)**: 앞서 `_draw_gaussian_bev_footprints`(@staticmethod) 메서드를 `def`부터 지우면서 위의 `@staticmethod` 데코레이터가 **고아로 남아 바로 아래 `_get_query_vis_palette`를 잘못 staticmethod로** 만듦 → `self._get_query_vis_palette()`가 "missing self"로 viz 전체가 try/except에 먹혀 skip됐었음. 고아 데코레이터 제거로 해결. (metric엔 영향 없었음 — viz만 깨졌었고 try/except가 삼킴.)
+- 검증: 1-GPU VIS=1 eval smoke → png 30장 생성, viz skip/error 0. 두 레포 동일.
+
+## 2026-06-30 KST — threshold rename + fg_score를 model_cfg로 + footprint 그리기 제거 + gs oracle 이식 (두 레포 lockstep)
+
+**모든 변경을 codeonly·gs 두 레포에 동일 적용. 검증: 4개 핵심코드 py_compile OK + sz06 config 로드 두 레포 동일(occ=0.5/fg=0.75/viz_has_fg=False).**
+
+- **Rename (가족 전체)**: `eval_occ_threshold`→`occ_score_threshold`, `debug_query_score_*`→`fg_score_*`(threshold/iou_weight/cls_weight/cam_attn_weight/topk), `debug_query_distance_nms_radius_m`→`fg_score_distance_nms_radius_m`. config 28파일 + 코드(efficientocf_config/utils_visualization/utils_loss/query_head/efficientocf). 이유: `debug_` 접두사가 viz-전용처럼 보이나 실제론 baseline 선택(=metric)을 좌우하는 진짜 임계값.
+- **fg_score 가족을 visualization_cfg → model_cfg 이동**: occ_score_threshold 옆에 "Thresholds" 블록으로 모음(자주 바꾸는 값 한곳 관리). selection 로직이 "visualization"에서 빠져나옴. `_merge_cfg`가 lenient라 config 11개+ defaults/apply 모두 일관 이동 필수 — 전 config 로드로 값 유지 검증.
+- **footprint 그리기 제거**: `query_head.py`에서 `_draw_gaussian_bev_footprints` 메서드 + 5개 호출 블록(각 363줄) 제거. footprint는 viz-전용(metric/selection 무관, iou_q는 eval에서 0)이라 안전. dense 예측 occ 오버레이·center 마커·GT viz는 유지. **남은 inert**: 그리기 떼낸 뒤 안 쓰이는 gaussian 투영 setup(`_project_gaussians`+g* ~120줄) + bundle mixture 출력 필드 — 두 레포 동일하게 잔존(무해, 후속 정리 대상).
+- **gs oracle 이식**: gs `efficientocf.py`에 `_eval_train_faithful_inst_match`+`_apply_oracle_selection_to_bundle` 삽입 + simple_test 배선(attn GT + oracle 블록) + `eval_oracle.sh`. main과 동일 동작.
+
+## 2026-06-30 KST — viz 범례에서 redundant "Gaussian footprint" 회색 스와치 제거 (codeonly + _gs)
+
+- `query_head.py` `_draw_generic_vis_legend`에서 `((140,140,140), "Gaussian footprint")` 범례 항목 + 안 쓰이는 `gaussian_label` 파라미터/호출 인자 제거. 실제 footprint는 행 색(cyan=conf≥thr / red=conf<thr)으로 그려지고 범례에 이미 그 항목이 있어 회색 스와치는 중복·혼동성 라벨이었음.
+- footprint **렌더링 자체와 `gaussian_desc`(이미지 헤더 "Gaussian vis: ...")는 유지** — 그림은 안 바뀜.
+- 이 viz 렌더러는 **train·eval 공유**라 학습/eval/시각화 범례가 자동으로 동일하게 정렬됨(따로 손댈 것 없음). 선택/metric 로직(`debug_query_score_*`)은 무수정.
+- 동일 변경을 `_gs` 레포(`Autonomous_Driving_26_ksh_occ_shape_gs`, 해당 코드 byte-identical)에도 적용.
+
+## 2026-06-30 KST — Oracle 매칭을 학습과 100% 동일하게(train-faithful) 재구현
+
+- **배경**: 직전 oracle은 center 거리(기하) 근사라 학습 cost matrix와 불일치. 학습 매칭은 이 config 기준 **center(10·L1/diag) + cls(0.2) + attn soft-IoU(0.3)**, sim(0)은 feature **게이트**, 그리고 **full7 temporal**(`match_temporal_cost_frame_indices=range(time_receptive_field)`, `match_center_frame_idx=None`). 이를 그대로 재현.
+- `efficientocf.py` 신규 `_eval_train_faithful_inst_match(...)`: `forward_train`의 매칭 orchestration(GT prep → intersection/history 필터 → trajectory/vis slice → cls prep → full center pack → ego-align(`_align_geom_pack`)/`_prepend_past_frames` → full7 분기 → `pool_gt_instance_context_features` + id reindex → `_select_matching_feature_frames` → 동일 가중치로 `_match_queries_to_gt_instances`)을 **동일 helper로 복제**. `forward_train`은 무수정(학습 안전). feat_out 인덱스는 학습 언패킹과 동일.
+- `simple_test`: `EOCF_EVAL_ORACLE_MATCH=1`이면 학습-동일 매칭으로 선택 override. attn cost(0.3)용 attn target 생성을 위해 `extract_feat_query`에 `gt_segmentation_instance3d_txyz_for_attn`(=primary)·fallback 전달.
+- matcher의 `matched_query_idx`를 `sel_idx`로 사용(중복 제거·정렬), viz bundle도 `_apply_oracle_selection_to_bundle`로 일치.
+- 런타임 검증: 8GPU eval에서 첫 수십 샘플 크래시 없이 통과(학습-동일 경로 정상 동작).
+- **옛 center-거리 기하 근사 oracle 완전 제거**: `_eval_oracle_match_select_queries` 메서드, `simple_test`의 `=center` 분기, env `EOCF_EVAL_ORACLE_DIST`/`EOCF_EVAL_ORACLE_MAX_DIST_M` 삭제 → oracle은 **학습-동일 경로 단일**(혼동 방지). (`_apply_oracle_selection_to_bundle`은 학습-동일 경로도 쓰므로 유지.)
+- ⚠️ 한계: `forward_train` 공유가 아니라 **복제**라, 학습 코드가 바뀌면 이 메서드도 같이 갱신 필요(NOTES 참조).
+
+## 2026-06-30 KST — Oracle(GT 치팅) eval 추가: query↔GT center Hungarian 선택으로 스코어링 병목 진단
+
+- **목적**: 기존 eval은 query를 **confidence score**로 선택(`_build_query_visualization_bundle`→`selected_query_idx_q`). 이 선택을 GT instance center에 **Hungarian 매칭**한 결과로 override해 "스코어링이 병목인지" 진단. oracle ≫ baseline → 스코어링 문제 / 비슷 → query shape·trajectory·매칭 문제. (oracle도 선택만 완벽하게 해주는 상한선 — shape는 여전히 예측값으로 렌더되므로 shape 오차는 안 고쳐짐.)
+- `efficientocf.py`:
+  - 신규 메서드 `_eval_oracle_match_select_queries(...)`: GT instance center(present 프레임=traj timeline idx 0)와 query center를 `torch.cdist`로 cost 만들고 `utils_matcher._solve_unique_assignment`(Hungarian)로 매칭 → 매칭된 query만 `sel_idx`로 반환. matcher 본체(`_match_queries_to_gt_instances`)는 feature-sim base cost라 query/GT feature 없으면 early-return → 재사용 대신 기하 cost만 직접 구성.
+  - `simple_test`: score 기반 `sel_idx/selected_score` 산출 직후 `EOCF_EVAL_ORACLE_MATCH=1`이면 oracle 결과로 override. metric만 영향, 학습/loss 무관.
+  - 신규 `_apply_oracle_selection_to_bundle(...)`: oracle일 때 viz bundle의 `selected_*`(idx/score/cls/points/mixture)도 oracle 선택으로 덮어, 2D `query_debug_vis`·3D `query_mixture3d_vis`가 oracle-렌더 occ와 일치. (viz는 try/except라 실패해도 metric 안전.)
+- 데이터: test pipeline이 이미 `gt_instance_centers_world/valid/ids`를 Collect3D로 로드 → `forward_test(**kwargs)`→`simple_test(**kwargs)`로 전달됨(추가 전처리 불필요).
+- 신규 env flag(EOCF_EVAL_* 컨벤션): `EOCF_EVAL_ORACLE_MATCH`(0/1), `EOCF_EVAL_ORACLE_DIST`(xy|xyz), `EOCF_EVAL_ORACLE_MAX_DIST_M`(>0 매칭 거리 게이트). `efficientocf_config.py` env-doc 블록에 주석만 추가(설정값 아님, env 전용이라 config 키 미추가).
+- 신규 스크립트 `eval_oracle.sh`: config `shape_guide_128_dice_weight_fl25_sz06`, ckpt `epoch_12_lss_only.pth`(=현재 `latest.pth` 심볼릭 타깃), MODE=1(future)·OCC_THR=0.75(baseline 동일), PORT=20025(충돌 회피), `EOCF_EVAL_ORACLE_MATCH=1`. VIS on(VIS_EVERY=48, baseline 동일)이되 결과는 baseline과 섞이지 않게 `eval_oracle/<timestamp>/` 별도 폴더에 저장.
+
 ## 2026-06-29 13:44 KST — dice/Tversky 3D 옵션(`query_gmo_dice_3d`) 추가 + fl25_sz06_dice3d config
 
 - **배경/정정**: 직전 fl25_z(focal 가중 0.1→0.5)는 shape 조임에 부적합으로 판단. focal은 (a) `p.clamp(eps,1-eps)`(utils_loss.py:2634)로 포화 시 gradient 死, (b) FP를 전 격자(≈327k)로 평균(utils_loss.py:2664)해 per-cell FP gradient ≈0 → **over-coverage를 못 벌함**. 반면 Tversky(utils_loss.py:2684-2697)는 clamp 없음 + FP를 foreground 크기로 정규화 → **퍼짐을 실제로 벌하는 항**. 따라서 z 과확장 억제는 focal↑가 아니라 **dice를 3D로**가 맞음.

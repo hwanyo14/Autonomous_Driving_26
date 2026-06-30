@@ -1449,6 +1449,300 @@ class EfficientOCF(
             segmentation=segmentation, segmentation_instance3d=segmentation_instance3d,
             segmentation_cls_instance3d=segmentation_cls_instance3d, **kwargs)
 
+    def _eval_train_faithful_inst_match(
+        self,
+        feat_out,
+        future_egomotion=None,
+        segmentation_instance3d=None,
+        segmentation_cls_instance3d=None,
+        gt_occ_inst=None,
+        gt_instance_centers_world=None,
+        gt_instance_centers_valid=None,
+        gt_instance_ids=None,
+    ):
+        """Reproduce the EXACT training Hungarian matching at eval time.
+
+        Mirrors ``forward_train``'s matcher orchestration (GT prep -> ego-align
+        -> full7 temporal centers -> GT-context feature pooling -> the same
+        ``_match_queries_to_gt_instances`` call with the same cost weights),
+        reusing the identical helper methods so the cost matrix matches training
+        (center + cls + attn, feature-gated). ``forward_train`` is left untouched;
+        this is an eval-only duplicate (opt-in via EOCF_EVAL_ORACLE_MATCH=1).
+
+        Returns the ``inst_match_result`` dict (or None if matching can't run).
+        """
+        # ---- unpack extract_feat_query outputs (same tuple order as training) ----
+        gaussian_sigmas_world = feat_out[2]
+        centers_world = feat_out[4]
+        centers_world_traj_tq3 = feat_out[5]
+        traj_frame_indices_t = feat_out[6]
+        query_cls_logits_qc = feat_out[7]
+        query_img_feat_pooled_tqd = feat_out[12]
+        _query_attn_weights_tqnhw = feat_out[14]
+        _query_attn_bbox_targets = feat_out[15]
+        query_match_inputs = feat_out[17]
+        present_local_idx = feat_out[23]
+        mixture_centers_world_tqg3 = feat_out[24]
+        mixture_sigmas_world_tqg3 = feat_out[25]
+        mixture_yaw_tqg = feat_out[26]
+        mixture_weights_tqg = feat_out[27]
+        gaussian_sigmas_world_traj_tq3 = feat_out[28] if len(feat_out) > 28 else None
+        mixture_centers_world_traj_tqg3 = feat_out[29] if len(feat_out) > 29 else None
+        mixture_sigmas_world_traj_tqg3 = feat_out[30] if len(feat_out) > 30 else None
+        mixture_yaw_traj_tqg = feat_out[31] if len(feat_out) > 31 else None
+        mixture_weights_traj_tqg = feat_out[32] if len(feat_out) > 32 else None
+        if not torch.is_tensor(centers_world):
+            return None
+
+        # ---- GT preparation (mirror of forward_train) ----
+        gt_segmentation_cls_instance3d_tcxyz = self._prepare_segmentation_cls_instance3d(
+            segmentation_cls_instance3d=segmentation_cls_instance3d)
+        gt_segmentation_instance3d_txyz = self._prepare_segmentation_instance3d(
+            segmentation_instance3d=segmentation_instance3d)
+        gt_occ_inst_bundle = self._prepare_gt_occ_inst_primary_targets(
+            gt_occ_inst=gt_occ_inst,
+            fallback_segmentation_instance3d_txyz=gt_segmentation_instance3d_txyz)
+        gt_instance_occ3d_txyz_primary = (
+            gt_occ_inst_bundle["dense_inst_txyz"]
+            if (isinstance(gt_occ_inst_bundle, dict)
+                and torch.is_tensor(gt_occ_inst_bundle.get("dense_inst_txyz", None)))
+            else gt_segmentation_instance3d_txyz)
+        gt_segmentation_cls_instance3d_for_match = (
+            gt_occ_inst_bundle["seg_cls_inst_tcxzy"]
+            if (isinstance(gt_occ_inst_bundle, dict)
+                and torch.is_tensor(gt_occ_inst_bundle.get("seg_cls_inst_tcxzy", None)))
+            else gt_segmentation_cls_instance3d_tcxyz)
+
+        gt_inst_center_world_tn3, gt_inst_center_valid_tn, gt_inst_ids_n = \
+            self._prepare_gt_instance_centers_for_trajectory_matching(
+                gt_instance_centers_world=gt_instance_centers_world,
+                gt_instance_centers_valid=gt_instance_centers_valid,
+                gt_instance_ids=gt_instance_ids)
+        if gt_inst_center_world_tn3 is None and isinstance(gt_occ_inst_bundle, dict):
+            gt_inst_center_world_tn3, gt_inst_center_valid_tn, gt_inst_ids_n = \
+                self._prepare_gt_instance_centers_for_trajectory_matching(
+                    gt_instance_centers_world=gt_occ_inst_bundle.get("centers_world_tn3", None),
+                    gt_instance_centers_valid=gt_occ_inst_bundle.get("centers_valid_tn", None),
+                    gt_instance_ids=gt_occ_inst_bundle.get("instance_ids_n", None))
+        gt_inst_center_world_hist_tn3, gt_inst_center_valid_hist_tn, gt_inst_ids_hist_n = \
+            self._prepare_gt_instance_centers_for_history(
+                gt_instance_centers_world=gt_instance_centers_world,
+                gt_instance_centers_valid=gt_instance_centers_valid,
+                gt_instance_ids=gt_instance_ids)
+        inst_ids_intersection_n = self._build_intersection_instance_ids_from_dense_pair(
+            primary_instance3d_txyz=gt_instance_occ3d_txyz_primary,
+            secondary_instance3d_txyz=gt_segmentation_instance3d_txyz)
+        if torch.is_tensor(inst_ids_intersection_n):
+            gt_inst_center_world_tn3, gt_inst_center_valid_tn, gt_inst_ids_n = \
+                self._filter_instance_targets_by_intersection_ids(
+                    centers_world_tn3=gt_inst_center_world_tn3, centers_valid_tn=gt_inst_center_valid_tn,
+                    instance_ids_n=gt_inst_ids_n, intersection_ids_n=inst_ids_intersection_n)
+            gt_inst_center_world_hist_tn3, gt_inst_center_valid_hist_tn, gt_inst_ids_hist_n = \
+                self._filter_instance_targets_by_intersection_ids(
+                    centers_world_tn3=gt_inst_center_world_hist_tn3, centers_valid_tn=gt_inst_center_valid_hist_tn,
+                    instance_ids_n=gt_inst_ids_hist_n, intersection_ids_n=inst_ids_intersection_n)
+        if bool(getattr(self, "query_require_history_all_valid", False)):
+            history_all_valid_ids_n = self._build_history_all_valid_instance_ids(
+                gt_instance_centers_valid=gt_inst_center_valid_hist_tn,
+                gt_instance_ids=gt_inst_ids_hist_n,
+                time_receptive_field=int(self.time_receptive_field))
+            if torch.is_tensor(history_all_valid_ids_n):
+                gt_inst_center_world_tn3, gt_inst_center_valid_tn, gt_inst_ids_n = \
+                    self._filter_instance_targets_by_intersection_ids(
+                        centers_world_tn3=gt_inst_center_world_tn3, centers_valid_tn=gt_inst_center_valid_tn,
+                        instance_ids_n=gt_inst_ids_n, intersection_ids_n=history_all_valid_ids_n)
+                gt_inst_center_world_hist_tn3, gt_inst_center_valid_hist_tn, gt_inst_ids_hist_n = \
+                    self._filter_instance_targets_by_intersection_ids(
+                        centers_world_tn3=gt_inst_center_world_hist_tn3, centers_valid_tn=gt_inst_center_valid_hist_tn,
+                        instance_ids_n=gt_inst_ids_hist_n, intersection_ids_n=history_all_valid_ids_n)
+                gt_instance_occ3d_txyz_primary = self._filter_dense_instance_ids(
+                    dense_gt=gt_instance_occ3d_txyz_primary, keep_instance_ids=history_all_valid_ids_n)
+                gt_segmentation_instance3d_txyz = self._filter_dense_instance_ids(
+                    dense_gt=gt_segmentation_instance3d_txyz, keep_instance_ids=history_all_valid_ids_n)
+                gt_segmentation_cls_instance3d_for_match = self._filter_dense_instance_ids(
+                    dense_gt=gt_segmentation_cls_instance3d_for_match, keep_instance_ids=history_all_valid_ids_n)
+        gt_instance_occ3d_txyz_query, _, _ = self._select_query_trajectory_gt_slice(gt_instance_occ3d_txyz_primary)
+        gt_instance_occ3d_txyz_query_vis, _, _ = self._select_query_visualization_gt_slice(gt_instance_occ3d_txyz_primary)
+        gt_inst_cls_n, gt_inst_cls_valid_n = self._prepare_gt_instance_classes_for_matching(
+            segmentation_cls_instance3d=gt_segmentation_cls_instance3d_for_match, gt_instance_ids_n=gt_inst_ids_n)
+        if (gt_inst_cls_n is None) and torch.is_tensor(gt_segmentation_cls_instance3d_tcxyz):
+            gt_inst_cls_n, gt_inst_cls_valid_n = self._prepare_gt_instance_classes_for_matching(
+                segmentation_cls_instance3d=gt_segmentation_cls_instance3d_tcxyz, gt_instance_ids_n=gt_inst_ids_n)
+        gt_inst_center_world_full_tn3 = gt_inst_center_world_tn3
+        gt_inst_center_valid_full_tn = gt_inst_center_valid_tn
+        gt_inst_ids_full_n = gt_inst_ids_n
+        gt_inst_cls_full_n = gt_inst_cls_n
+        gt_inst_cls_valid_full_n = gt_inst_cls_valid_n
+        full_center_pack = self._build_full_query_instance_centers_from_history_and_traj(
+            history_centers_tn3=gt_inst_center_world_hist_tn3, history_valid_tn=gt_inst_center_valid_hist_tn,
+            history_ids_n=gt_inst_ids_hist_n, traj_centers_tn3=gt_inst_center_world_tn3,
+            traj_valid_tn=gt_inst_center_valid_tn, traj_ids_n=gt_inst_ids_n)
+        if (torch.is_tensor(full_center_pack[0]) and torch.is_tensor(full_center_pack[1])
+                and torch.is_tensor(full_center_pack[2])):
+            gt_inst_center_world_full_tn3 = full_center_pack[0]
+            gt_inst_center_valid_full_tn = full_center_pack[1]
+            gt_inst_ids_full_n = full_center_pack[2]
+            gt_inst_cls_full_n = self._reindex_vector_by_instance_ids(
+                values_n=gt_inst_cls_n, instance_ids_n=gt_inst_ids_n, target_ids_n=gt_inst_ids_full_n)
+            gt_inst_cls_valid_full_n = self._reindex_vector_by_instance_ids(
+                values_n=gt_inst_cls_valid_n, instance_ids_n=gt_inst_ids_n, target_ids_n=gt_inst_ids_full_n)
+
+        # ---- query geometry alignment + full7 temporal centers (mirror of forward_train) ----
+        _pick = self._pick_tensor
+        centers_world_loss = _pick(centers_world_traj_tq3, centers_world)
+        gaussian_sigmas_world_loss = _pick(gaussian_sigmas_world_traj_tq3, gaussian_sigmas_world)
+        mixture_centers_world_loss = _pick(mixture_centers_world_traj_tqg3, mixture_centers_world_tqg3)
+        mixture_sigmas_world_loss = _pick(mixture_sigmas_world_traj_tqg3, mixture_sigmas_world_tqg3)
+        mixture_yaw_loss = _pick(mixture_yaw_traj_tqg, mixture_yaw_tqg)
+        mixture_weights_loss = _pick(mixture_weights_traj_tqg, mixture_weights_tqg)
+        expected_traj_horizon = int(self.n_future_frames) + 1
+        centers_world_temporal_sup_tq3 = centers_world_loss
+        traj_centers_are_present_aligned = bool(
+            torch.is_tensor(centers_world_loss) and centers_world_loss.dim() == 3
+            and int(centers_world_loss.shape[0]) == expected_traj_horizon)
+        if ((bool(self.use_query_inst_center_match_loss) or float(self.query_traj_loss_weight) > 0.0)
+                and torch.is_tensor(centers_world_loss) and centers_world_loss.dim() == 3
+                and int(centers_world_loss.shape[0]) > 1 and (not traj_centers_are_present_aligned)):
+            centers_world_temporal_sup_tq3 = self._align_query_centers_to_present_frame(
+                centers_world_tq3=centers_world_loss, future_egomotion=future_egomotion,
+                traj_frame_indices_t=traj_frame_indices_t)
+        centers_world_loss_aligned_tq3 = centers_world_temporal_sup_tq3
+        gaussian_sigmas_world_loss_aligned_tq3 = gaussian_sigmas_world_loss
+        mixture_centers_world_loss_aligned_tqg3 = mixture_centers_world_loss
+        mixture_sigmas_world_loss_aligned_tqg3 = mixture_sigmas_world_loss
+        mixture_yaw_loss_aligned_tqg = mixture_yaw_loss
+        mixture_weights_loss_aligned_tqg = mixture_weights_loss
+        _needs_ego_align = (
+            torch.is_tensor(centers_world_loss) and centers_world_loss.dim() == 3
+            and int(centers_world_loss.shape[0]) > 1 and torch.is_tensor(traj_frame_indices_t)
+            and torch.is_tensor(future_egomotion) and (not traj_centers_are_present_aligned))
+        if _needs_ego_align:
+            loss_geom_pack = self._align_geom_pack(
+                centers_world_loss, traj_frame_indices_t, future_egomotion,
+                gaussian_sigmas_world_loss, mixture_centers_world_loss,
+                mixture_sigmas_world_loss, mixture_yaw_loss, mixture_weights_loss)
+            centers_world_loss_aligned_tq3 = loss_geom_pack.get("centers_world_tq3", centers_world_loss_aligned_tq3)
+            gaussian_sigmas_world_loss_aligned_tq3 = loss_geom_pack.get("gaussian_sigmas_world_tq3", gaussian_sigmas_world_loss_aligned_tq3)
+            mixture_centers_world_loss_aligned_tqg3 = loss_geom_pack.get("mixture_centers_world_tqg3", mixture_centers_world_loss_aligned_tqg3)
+            mixture_sigmas_world_loss_aligned_tqg3 = loss_geom_pack.get("mixture_sigmas_world_tqg3", mixture_sigmas_world_loss_aligned_tqg3)
+            mixture_yaw_loss_aligned_tqg = loss_geom_pack.get("mixture_yaw_tqg", mixture_yaw_loss_aligned_tqg)
+            mixture_weights_loss_aligned_tqg = loss_geom_pack.get("mixture_weights_tqg", mixture_weights_loss_aligned_tqg)
+        centers_world_loss_full_tq3 = centers_world_loss_aligned_tq3
+        gaussian_sigmas_world_loss_full_tq3 = gaussian_sigmas_world_loss_aligned_tq3
+        mixture_centers_world_loss_full_tqg3 = mixture_centers_world_loss_aligned_tqg3
+        mixture_sigmas_world_loss_full_tqg3 = mixture_sigmas_world_loss_aligned_tqg3
+        mixture_yaw_loss_full_tqg = mixture_yaw_loss_aligned_tqg
+        mixture_weights_loss_full_tqg = mixture_weights_loss_aligned_tqg
+        past_only_count = int(present_local_idx) if present_local_idx is not None else 0
+        traj_loss_has_present_anchor = (
+            torch.is_tensor(centers_world_loss_aligned_tq3) and centers_world_loss_aligned_tq3.dim() == 3
+            and int(centers_world_loss_aligned_tq3.shape[0]) == expected_traj_horizon
+            and torch.is_tensor(centers_world) and centers_world.dim() == 3
+            and int(centers_world.shape[0]) > past_only_count and past_only_count > 0)
+        if traj_loss_has_present_anchor:
+            _pp = lambda p, t: self._prepend_past_frames(p, past_only_count, t)
+            centers_world_loss_full_tq3 = _pp(centers_world, centers_world_loss_aligned_tq3)
+            gaussian_sigmas_world_loss_full_tq3 = _pp(gaussian_sigmas_world, gaussian_sigmas_world_loss_aligned_tq3)
+            mixture_centers_world_loss_full_tqg3 = _pp(mixture_centers_world_tqg3, mixture_centers_world_loss_aligned_tqg3)
+            mixture_sigmas_world_loss_full_tqg3 = _pp(mixture_sigmas_world_tqg3, mixture_sigmas_world_loss_aligned_tqg3)
+            mixture_yaw_loss_full_tqg = _pp(mixture_yaw_tqg, mixture_yaw_loss_aligned_tqg)
+            mixture_weights_loss_full_tqg = _pp(mixture_weights_tqg, mixture_weights_loss_aligned_tqg)
+        use_full7_temporal_sup = bool(
+            traj_loss_has_present_anchor and torch.is_tensor(centers_world_loss_full_tq3)
+            and torch.is_tensor(gt_inst_center_world_full_tn3)
+            and int(gt_inst_center_world_full_tn3.shape[0]) == int(centers_world_loss_full_tq3.shape[0]))
+        centers_world_match_tq3 = centers_world_temporal_sup_tq3
+        gaussian_sigmas_world_match_tq3 = gaussian_sigmas_world_loss
+        mixture_centers_world_match_tqg3 = mixture_centers_world_loss
+        mixture_sigmas_world_match_tqg3 = mixture_sigmas_world_loss
+        mixture_yaw_match_tqg = mixture_yaw_loss
+        mixture_weights_match_tqg = mixture_weights_loss
+        match_gt_instance_occ3d_txyz = gt_instance_occ3d_txyz_query
+        match_gt_centers_tn3 = gt_inst_center_world_tn3
+        match_gt_valid_tn = gt_inst_center_valid_tn
+        match_gt_ids_n = gt_inst_ids_n
+        match_gt_cls_n = gt_inst_cls_n
+        match_gt_cls_valid_n = gt_inst_cls_valid_n
+        match_temporal_cost_frame_indices = None
+        match_center_frame_idx = 0
+        if use_full7_temporal_sup:
+            centers_world_match_tq3 = centers_world_loss_full_tq3
+            gaussian_sigmas_world_match_tq3 = gaussian_sigmas_world_loss_full_tq3
+            mixture_centers_world_match_tqg3 = mixture_centers_world_loss_full_tqg3
+            mixture_sigmas_world_match_tqg3 = mixture_sigmas_world_loss_full_tqg3
+            mixture_yaw_match_tqg = mixture_yaw_loss_full_tqg
+            mixture_weights_match_tqg = mixture_weights_loss_full_tqg
+            match_gt_instance_occ3d_txyz = gt_instance_occ3d_txyz_query_vis
+            match_gt_centers_tn3 = gt_inst_center_world_full_tn3
+            match_gt_valid_tn = gt_inst_center_valid_full_tn
+            match_gt_ids_n = gt_inst_ids_full_n
+            match_gt_cls_n = gt_inst_cls_full_n
+            match_gt_cls_valid_n = gt_inst_cls_valid_full_n
+            match_temporal_cost_frame_indices = list(range(int(self.time_receptive_field)))
+            match_center_frame_idx = None
+        if not torch.is_tensor(centers_world_match_tq3):
+            return None
+
+        # ---- GT-context feature pooling (mirror of forward_train) ----
+        gt_inst_img_feat_tnd, gt_inst_img_feat_valid_tn, gt_inst_img_feat_ids_n = \
+            self.pool_gt_instance_context_features(
+                segmentation_instance3d_txyz=gt_instance_occ3d_txyz_primary,
+                future_egomotion=future_egomotion, gt_inst_ids_n=gt_inst_ids_n,
+                query_match_inputs=query_match_inputs,
+                fallback_segmentation_instance3d_txyz=gt_segmentation_instance3d_txyz)
+        if (torch.is_tensor(gt_inst_ids_full_n) and torch.is_tensor(gt_inst_img_feat_ids_n)
+                and torch.is_tensor(gt_inst_img_feat_tnd) and torch.is_tensor(gt_inst_img_feat_valid_tn)):
+            feat_full_tnd = self._reindex_temporal_tensor_by_instance_ids(
+                values_tn=gt_inst_img_feat_tnd, instance_ids_n=gt_inst_img_feat_ids_n, target_ids_n=gt_inst_ids_full_n)
+            feat_valid_full_tn = self._reindex_temporal_tensor_by_instance_ids(
+                values_tn=gt_inst_img_feat_valid_tn, instance_ids_n=gt_inst_img_feat_ids_n, target_ids_n=gt_inst_ids_full_n)
+            if torch.is_tensor(feat_full_tnd) and torch.is_tensor(feat_valid_full_tn):
+                gt_inst_img_feat_tnd = feat_full_tnd
+                gt_inst_img_feat_valid_tn = feat_valid_full_tn
+                gt_inst_img_feat_ids_n = gt_inst_ids_full_n
+
+        match_query_feat_tqd = None
+        if self.query_match_feature_source == "query_img_feat_pooled":
+            match_query_feat_tqd = query_img_feat_pooled_tqd
+        q_sel_tqd, g_sel_tnd, g_sel_valid_tn = self._select_matching_feature_frames(
+            query_feat_tqd=match_query_feat_tqd, gt_feat_tnd=gt_inst_img_feat_tnd,
+            gt_valid_tn=gt_inst_img_feat_valid_tn)
+
+        # ---- the SAME matcher call as training (identical cost weights) ----
+        return self._match_queries_to_gt_instances(
+            centers_world=centers_world_match_tq3,
+            query_sigmas_world_tq3=gaussian_sigmas_world_match_tq3,
+            query_mixture_centers_world_tqg3=mixture_centers_world_match_tqg3,
+            query_mixture_sigmas_world_tqg3=mixture_sigmas_world_match_tqg3,
+            query_mixture_yaw_tqg=mixture_yaw_match_tqg,
+            query_mixture_weights_tqg=mixture_weights_match_tqg,
+            gt_instance_occ3d_txyz=match_gt_instance_occ3d_txyz,
+            gt_inst_center_world_tn3=match_gt_centers_tn3,
+            gt_inst_center_valid_tn=match_gt_valid_tn,
+            gt_inst_ids_n=match_gt_ids_n,
+            gt_inst_cls_n=match_gt_cls_n,
+            gt_inst_cls_valid_n=match_gt_cls_valid_n,
+            query_img_feat_tqd=q_sel_tqd,
+            query_cls_logits_qc=query_cls_logits_qc,
+            gt_inst_bev_feat_tnd=g_sel_tnd,
+            gt_inst_bev_feat_valid_tn=g_sel_valid_tn,
+            gt_inst_bev_feat_ids_n=gt_inst_img_feat_ids_n,
+            query_attn_weights_tqnhw=_query_attn_weights_tqnhw,
+            gt_attn_targets=_query_attn_bbox_targets,
+            query_sim_cost_weight=self.query_sim_match_cost_weight,
+            query_cls_cost_weight=self.query_cls_match_cost_weight,
+            query_soft_assign_temp=self.query_soft_assign_temp,
+            query_soft_assign_cost_weight=self.query_soft_assign_cost_weight,
+            query_bev_dice_cost_weight=self.query_bev_dice_match_cost_weight,
+            query_attn_match_cost_weight=self.query_attn_match_cost_weight,
+            query_attn_match_metric=self.query_attn_match_metric,
+            query_attn_match_pred_norm=self.query_attn_match_pred_norm,
+            query_attn_match_eps=self.query_attn_match_eps,
+            query_center_match_frame_idx=match_center_frame_idx,
+            query_temporal_cost_frame_indices=match_temporal_cost_frame_indices,
+            query_temporal_offset_match_cost_weight=self.query_temporal_offset_match_cost_weight,
+        )
+
     @torch.no_grad()
     def simple_test(self, img_inputs_seq=None, img_metas=None, future_egomotion=None,
                     segmentation=None, segmentation_bev=None, gt_occ=None, gt_occ_inst=None,
@@ -1465,12 +1759,27 @@ class EfficientOCF(
 
         # eval 시각화(EOCF_EVAL_VIS=1)일 때만 attn/cam-gaussian용 디버그 산출물도 함께 반환.
         _eval_vis_on = os.environ.get("EOCF_EVAL_VIS", "0") == "1"
+        # oracle(GT 치팅): 학습과 100% 동일한 cost로 query를 GT에 Hungarian 매칭해 선택.
+        _oracle_on = os.environ.get("EOCF_EVAL_ORACLE_MATCH", "0") == "1"
+        # 학습-동일 매칭은 attn cost(0.3)에 attn target이 필요 → extract에 attn용 GT를 넘긴다.
+        _attn_gt_primary, _attn_gt_fallback = None, None
+        if _oracle_on:
+            _attn_gt_fallback = self._prepare_segmentation_instance3d(
+                segmentation_instance3d=segmentation_instance3d)
+            _ob = self._prepare_gt_occ_inst_primary_targets(
+                gt_occ_inst=gt_occ_inst, fallback_segmentation_instance3d_txyz=_attn_gt_fallback)
+            _attn_gt_primary = (
+                _ob["dense_inst_txyz"]
+                if (isinstance(_ob, dict) and torch.is_tensor(_ob.get("dense_inst_txyz", None)))
+                else _attn_gt_fallback)
         feat_out = self.extract_feat_query(
             img_inputs_seq, img_metas, future_egomotion, voxelize=False,
             return_query_match_inputs=True,
             return_instance_img_debug=_eval_vis_on,
             return_instance_img_debug_fullseq=True,
-            return_query_cam_gaussian_vis_debug=_eval_vis_on)
+            return_query_cam_gaussian_vis_debug=_eval_vis_on,
+            gt_segmentation_instance3d_txyz_for_attn=_attn_gt_primary,
+            fallback_segmentation_instance3d_txyz_for_attn=_attn_gt_fallback)
         centers_world = feat_out[4]          # [T,Q,3] (voxelizer space)
         centers_world_traj = feat_out[5]     # [F,Q,3] future trajectory geometry when available
         sigmas_world = feat_out[2]           # [T,Q,3]
@@ -1521,8 +1830,32 @@ class EfficientOCF(
             sel_idx = bundle.get("selected_query_idx_q", None)
             selected_score = bundle.get("selected_score_q", None)
 
-        # occ 이진화 threshold: config 단일 키(eval_occ_threshold)가 기본, env로 override.
-        thr = float(os.environ.get("EOCF_EVAL_OCC_THR", getattr(self, "eval_occ_threshold", 0.5)))
+        # ---- oracle (GT Hungarian) selection override (opt-in EOCF_EVAL_ORACLE_MATCH=1) ----
+        # Bypass confidence scoring: keep only queries Hungarian-matched to GT using the
+        # SAME cost as training (center+cls+attn, full7 temporal, feature-gated).
+        # 진단: oracle ≫ baseline → 스코어링 병목 / 비슷 → shape·매칭 문제.
+        if _oracle_on:
+            _imr = self._eval_train_faithful_inst_match(
+                feat_out=feat_out, future_egomotion=future_egomotion,
+                segmentation_instance3d=segmentation_instance3d,
+                segmentation_cls_instance3d=segmentation_cls_instance3d,
+                gt_occ_inst=gt_occ_inst,
+                gt_instance_centers_world=kwargs.get("gt_instance_centers_world", None),
+                gt_instance_centers_valid=kwargs.get("gt_instance_centers_valid", None),
+                gt_instance_ids=kwargs.get("gt_instance_ids", None))
+            _mqi = _imr.get("matched_query_idx", None) if isinstance(_imr, dict) else None
+            if torch.is_tensor(_mqi) and int(_mqi.numel()) > 0:
+                sel_idx = torch.unique(
+                    _mqi.to(device=centers_world.device, dtype=torch.long), sorted=True)
+                selected_score = torch.ones(
+                    (int(sel_idx.numel()),), device=centers_world.device, dtype=torch.float32)
+            else:
+                sel_idx, selected_score = None, None
+            # viz는 normal(eval_total.sh)과 동일 — oracle은 sel_idx(=metric)만 바꾸고
+            # bundle(viz 선택)은 그대로 둔다. (oracle viz == normal viz)
+
+        # occ 이진화 threshold: config 단일 키(occ_score_threshold)가 기본, env로 override.
+        thr = float(os.environ.get("EOCF_EVAL_OCC_THR", getattr(self, "occ_score_threshold", 0.5)))
         # eval 기준 프레임: present(현재 1프레임) / future(미래 n_future프레임). metric·viz 공통.
         eval_mode = "present" if self._eval_mode_is_present() else "future"
         H, W, D = int(self.voxelizer.H), int(self.voxelizer.W), int(self.voxelizer.D)
@@ -2772,7 +3105,7 @@ class EfficientOCF(
             bg_index=int(self.query_bg_class),
             class_weights=self.query_cls_loss_class_weights,
             centers_world_tq3=centers_world_match_tq3,
-            nms_radius_m=float(self.debug_query_distance_nms_radius_m),
+            nms_radius_m=float(self.fg_score_distance_nms_radius_m),
         )
         query_depth_loss = self._compute_query_depth_loss_from_match(
             query_depth_logits_tqd=query_depth_logits_tqd,
@@ -3135,7 +3468,7 @@ class EfficientOCF(
                 # 7 frames: time_receptive_field (past+present) + n_future_frames.
                 max_frames=int(self.time_receptive_field) + int(self.n_future_frames),
                 voxel_center_offset=0.5,
-                prob_threshold=float(getattr(self, "eval_occ_threshold", 0.5)),
+                prob_threshold=float(getattr(self, "occ_score_threshold", 0.5)),
                 pred_layout="zyx",
                 pred_occ_prob_pos_obj=None,
                 pred_occ_prob_all_obj=pred_occ.detach() if pred_occ is not None else None,

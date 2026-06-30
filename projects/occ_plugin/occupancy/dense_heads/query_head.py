@@ -3130,7 +3130,7 @@ class QueryHead(nn.Module):
         use_score_bundle = isinstance(query_vis_bundle, dict)
         skip_traj_rows = bool(query_vis_bundle.get("_skip_traj_rows", False)) if use_score_bundle else False
         bundle_top_k = 0
-        bundle_score_thr = float(getattr(self, "debug_query_score_threshold", 0.5))
+        bundle_score_thr = float(getattr(self, "fg_score_threshold", 0.5))
         bundle_w_iou = 0.5
         bundle_w_cls = 0.5
         bundle_w_cam = 0.0
@@ -3287,9 +3287,9 @@ class QueryHead(nn.Module):
         stats_lo = []
         stats_matched = []
 
-        # 센터 점 마커 색칠도 단일 score 임계값으로 통일 (config debug_query_score_threshold + EOCF_EVAL_FG_THR).
+        # 센터 점 마커 색칠도 단일 score 임계값으로 통일 (config fg_score_threshold + EOCF_EVAL_FG_THR).
         import os as _os
-        conf_thr = float(_os.environ.get("EOCF_EVAL_FG_THR", getattr(self, "debug_query_score_threshold", 0.5)))
+        conf_thr = float(_os.environ.get("EOCF_EVAL_FG_THR", getattr(self, "fg_score_threshold", 0.5)))
         marker_radius = int(getattr(self, "debug_query_center_marker_radius", 3))
         gt_color = np.array([40, 180, 40], dtype=np.uint8)
         hi_color = np.array([30, 255, 255], dtype=np.uint8)
@@ -3316,7 +3316,7 @@ class QueryHead(nn.Module):
             class_palette.get(int(rid), hi_color) for rid in self.query_class_ids
         ]
         gaussian_vis_mode = str(getattr(self, "debug_query_gaussian_vis_mode", "ellipse")).lower()
-        # 가우시안 footprint outline 등고선도 occ 임계값으로 통일 (eval_occ_threshold + EOCF_EVAL_OCC_THR).
+        # 가우시안 footprint outline 등고선도 occ 임계값으로 통일 (occ_score_threshold + EOCF_EVAL_OCC_THR).
         gaussian_prob_threshold = float(prob_threshold)
         gaussian_prob_alpha_scale = float(getattr(self, "debug_query_gaussian_prob_alpha_scale", 4.0))
         traj_points_tq3 = None
