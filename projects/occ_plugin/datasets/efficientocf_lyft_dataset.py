@@ -489,6 +489,7 @@ class EfficientOCFLyftDataset(Dataset):
         
         input_seq_data.update(
             dict(
+                global_idx=int(index),
                 time_receptive_field=self.time_receptive_field,
                 sequence_length=self.sequence_length,
                 egopose_list=self.egopose_list,
@@ -508,30 +509,41 @@ class EfficientOCFLyftDataset(Dataset):
         '''
         eval_results = {}
         
-        ''' calculate IOU '''
+        ''' calculate IOU 2D (nusocc occupancy GT) '''
         hist_for_iou = sum(results['hist_for_iou'])
         ious = cm_to_ious(hist_for_iou)
         res_table, res_dic = format_iou_results(ious, return_dic=True)
         for key, val in res_dic.items():
             eval_results['IOU_{}'.format(key)] = val
         if logger is not None:
-            logger.info('IOU Evaluation')
+            logger.info('IOU (nusocc) 2D Evaluation')
             logger.info(res_table)  
 
-        ''' calculate height metric '''          
-        height_l1 = sum(results['height_l1'])
-        eval_results['Height_L1'] = height_l1/ len(results['height_l1'])
+        ''' calculate IOU 2D (bbox-AABB GT) '''
+        if results.get('hist_for_iou_bbox'):
+            hist_bbox = sum(results['hist_for_iou_bbox'])
+            ious_bbox = cm_to_ious(hist_bbox)
+            res_table_b, res_dic_b = format_iou_results(ious_bbox, return_dic=True)
+            for key, val in res_dic_b.items():
+                eval_results['IOU_bbox_{}'.format(key)] = val
+            if logger is not None:
+                logger.info('IOU (bbox-AABB) 2D Evaluation')
+                logger.info(res_table_b)
+
+        ''' calculate height metric '''
+        if results.get('height_l1'):
+            height_l1 = sum(results['height_l1'])
+            eval_results['Height_L1'] = height_l1 / len(results['height_l1'])
 
         ''' calculate VPQ '''
         if 'vpq_metric' in results.keys() and 'vpq_len' in results.keys():
             vpq_sum = sum(results['vpq_metric'])
             eval_results['VPQ'] = vpq_sum/results['vpq_len']
 
-        '''calculate 3d height metric'''
-        iou_3d = sum(results['iou_3d'])
-        eval_results['IOU_3d'] = iou_3d/ len(results['iou_3d'])
-        
-        recall_3d = sum(results['recall_3d'])
-        eval_results['Recall_3d'] = recall_3d/ len(results['recall_3d'])
+        '''calculate 3d metric (nusocc occupancy GT)'''
+        if results.get('iou_3d'):
+            eval_results['IOU_3d'] = sum(results['iou_3d']) / len(results['iou_3d'])
+        if results.get('recall_3d'):
+            eval_results['Recall_3d'] = sum(results['recall_3d']) / len(results['recall_3d'])
 
         return eval_results

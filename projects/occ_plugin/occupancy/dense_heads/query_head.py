@@ -3,6 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import numpy as np
+import os
+
+from projects.occ_plugin.occupancy.dense_heads.voxelizer import (
+    normalize_quat_wxyz,
+    quat_to_rotmat_wxyz,
+)
 
 def sigmoid_to_world_from_range(logits: torch.Tensor,
                                 point_cloud_range,
@@ -398,29 +404,12 @@ class QueryHead(nn.Module):
         self.gaussian_weight_head = None
         if not self.center_only_mode:
             g = int(self.query_num_gaussians)
-            self.gaussian_offset_head = GaussianHead(
+            self.gaussian_head = GaussianHead(
                 embed_dim=self.embed_dim,
-                out_dim=g * 3,
+                out_dim=g * 11,
                 num_layers=self.query_gaussian_head_num_layers,
             )
-            self.gaussian_sigma_head = GaussianHead(
-                embed_dim=self.embed_dim,
-                out_dim=g * 3,
-                num_layers=self.query_gaussian_head_num_layers,
-            )
-            self.gaussian_yaw_head = GaussianHead(
-                embed_dim=self.embed_dim,
-                out_dim=g * 2,
-                num_layers=self.query_gaussian_head_num_layers,
-            )
-            self.gaussian_weight_head = GaussianHead(
-                embed_dim=self.embed_dim,
-                out_dim=g,
-                num_layers=self.query_gaussian_head_num_layers,
-            )
-            # Backward-compat alias used by debug grad logger.
-            self.gaussian_head = self.gaussian_sigma_head
-        self.query_cls_gaussian_param_dim = int(self.query_num_gaussians) * 9
+        self.query_cls_gaussian_param_dim = int(self.query_num_gaussians) * 11
         self.query_cls_input_dim = self.embed_dim + (
             self.query_cls_gaussian_param_dim if self.query_cls_use_gaussian_params else 0
         )
@@ -615,21 +604,21 @@ class QueryHead(nn.Module):
             query_sigma_world_tq3:        None (summary Gaussian disabled)
             mixture_centers_world_tqg3:   [T, Q, G, 3]   (per-frame placement)
             mixture_sigmas_world_tqg3:    [T, Q, G, 3]   (shared across T)
-            mixture_yaw_tqg:              [T, Q, G]      (shared across T)
+            mixture_quat_tqg4:              [T, Q, G, 4]   (shared across T, wxyz)
             mixture_weights_tqg:          [T, Q, G]      (independent sigmoid alpha)
         """
         query_sigma_world_tq3 = None
         mixture_centers_world_tqg3 = None
         mixture_sigmas_world_tqg3 = None
-        mixture_yaw_tqg = None
+        mixture_quat_tqg4 = None
         mixture_weights_tqg = None
 
-        if self.gaussian_sigma_head is None:
+        if self.gaussian_head is None:
             return (
                 query_sigma_world_tq3,
                 mixture_centers_world_tqg3,
                 mixture_sigmas_world_tqg3,
-                mixture_yaw_tqg,
+                mixture_quat_tqg4,
                 mixture_weights_tqg,
             )
 
@@ -639,19 +628,20 @@ class QueryHead(nn.Module):
                 query_sigma_world_tq3,
                 mixture_centers_world_tqg3,
                 mixture_sigmas_world_tqg3,
-                mixture_yaw_tqg,
+                mixture_quat_tqg4,
                 mixture_weights_tqg,
             )
         g_count = int(self.query_num_gaussians)
 
-        # Run the four Gaussian heads on the present-frame feature only.
+        # Run the unified Gaussian head on the present-frame feature only.
         present_local_idx = self._resolve_present_query_local_idx(t_count)
         center_input_qd = center_input_tqd[present_local_idx]  # [Q, D]
 
-        offset_logits_qg3 = self.gaussian_offset_head(center_input_qd).reshape(q_count, g_count, 3)
-        sigma_logits_qg3 = self.gaussian_sigma_head(center_input_qd).reshape(q_count, g_count, 3)
-        yaw_basis_logits_qg2 = self.gaussian_yaw_head(center_input_qd).reshape(q_count, g_count, 2)
-        weight_logits_qg = self.gaussian_weight_head(center_input_qd).reshape(q_count, g_count)
+        gaussian_logits_qg11 = self.gaussian_head(center_input_qd).reshape(q_count, g_count, 11)
+        offset_logits_qg3 = gaussian_logits_qg11[..., 0:3]
+        sigma_logits_qg3 = gaussian_logits_qg11[..., 3:6]
+        quat_logits_qg4 = gaussian_logits_qg11[..., 6:10]
+        weight_logits_qg = gaussian_logits_qg11[..., 10]
 
         off_max = centers_world.new_tensor(self.query_multi_gaussian_offset_max_m).view(1, 1, 3)
         offsets_world_qg3 = torch.tanh(offset_logits_qg3) * off_max
@@ -662,28 +652,27 @@ class QueryHead(nn.Module):
             sigma_max=self.query_multi_gaussian_sigma_max_m,
         )
 
-        yaw_basis_qg2 = F.normalize(yaw_basis_logits_qg2, dim=-1, eps=1e-6)
-        yaw_qg = torch.atan2(yaw_basis_qg2[..., 0], yaw_basis_qg2[..., 1])
+        quat_qg4 = normalize_quat_wxyz(quat_logits_qg4)
 
         weights_qg = torch.sigmoid(weight_logits_qg).to(dtype=centers_world.dtype)
 
         # Broadcast the shared mixture to each frame:
         # - mixture centers move with the per-frame anchor (lifted center).
-        # - sigmas/yaw/weights are identical across the T frames.
+        # - sigmas/quaternion/weights are identical across the T frames.
         mixture_centers_world_tqg3 = centers_world.unsqueeze(2) + offsets_world_qg3.unsqueeze(0)
         pc_min_g = centers_world.new_tensor(self.point_cloud_range[:3]).view(1, 1, 1, 3)
         pc_max_g = centers_world.new_tensor(self.point_cloud_range[3:]).view(1, 1, 1, 3)
         mixture_centers_world_tqg3 = torch.max(torch.min(mixture_centers_world_tqg3, pc_max_g), pc_min_g)
 
         mixture_sigmas_world_tqg3 = sigmas_world_qg3.unsqueeze(0).expand(t_count, -1, -1, -1).contiguous()
-        mixture_yaw_tqg = yaw_qg.unsqueeze(0).expand(t_count, -1, -1).contiguous()
+        mixture_quat_tqg4 = quat_qg4.unsqueeze(0).expand(t_count, -1, -1, -1).contiguous()
         mixture_weights_tqg = weights_qg.unsqueeze(0).expand(t_count, -1, -1).contiguous()
 
         return (
             query_sigma_world_tq3,
             mixture_centers_world_tqg3,
             mixture_sigmas_world_tqg3,
-            mixture_yaw_tqg,
+            mixture_quat_tqg4,
             mixture_weights_tqg,
         )
 
@@ -722,7 +711,7 @@ class QueryHead(nn.Module):
             query_sigma_world_tq3,
             mixture_centers_world_tqg3,
             mixture_sigmas_world_tqg3,
-            mixture_yaw_tqg,
+            mixture_quat_tqg4,
             mixture_weights_tqg,
         ) = self._compute_gaussian_outputs(center_input_tqd, centers_world)
         query_cls_logits_qc = outputs.get("query_cls_logits_qc", None)
@@ -740,7 +729,7 @@ class QueryHead(nn.Module):
                 centers_world_tq3=centers_world,
                 mixture_centers_world_tqg3=mixture_centers_world_tqg3,
                 mixture_sigmas_world_tqg3=mixture_sigmas_world_tqg3,
-                mixture_yaw_tqg=mixture_yaw_tqg,
+                mixture_quat_tqg4=mixture_quat_tqg4,
                 mixture_weights_tqg=mixture_weights_tqg,
             )
 
@@ -765,7 +754,7 @@ class QueryHead(nn.Module):
             "query_sigma_world_tq3": query_sigma_world_tq3,
             "mixture_centers_world_tqg3": mixture_centers_world_tqg3,
             "mixture_sigmas_world_tqg3": mixture_sigmas_world_tqg3,
-            "mixture_yaw_tqg": mixture_yaw_tqg,
+            "mixture_quat_tqg4": mixture_quat_tqg4,
             "mixture_weights_tqg": mixture_weights_tqg,
             "query_cls_logits_qc": query_cls_logits_qc,
             "query_cls_scores_qc": query_cls_scores_qc,
@@ -825,7 +814,7 @@ class QueryHead(nn.Module):
         centers_world_tq3: torch.Tensor = None,
         mixture_centers_world_tqg3: torch.Tensor = None,
         mixture_sigmas_world_tqg3: torch.Tensor = None,
-        mixture_yaw_tqg: torch.Tensor = None,
+        mixture_quat_tqg4: torch.Tensor = None,
         mixture_weights_tqg: torch.Tensor = None,
         q_count: int = None,
         device=None,
@@ -837,7 +826,7 @@ class QueryHead(nn.Module):
                 centers_world_tq3,
                 mixture_centers_world_tqg3,
                 mixture_sigmas_world_tqg3,
-                mixture_yaw_tqg,
+                mixture_quat_tqg4,
                 mixture_weights_tqg,
             ):
                 if torch.is_tensor(tensor) and tensor.dim() >= 2:
@@ -849,7 +838,7 @@ class QueryHead(nn.Module):
                 centers_world_tq3,
                 mixture_centers_world_tqg3,
                 mixture_sigmas_world_tqg3,
-                mixture_yaw_tqg,
+                mixture_quat_tqg4,
                 mixture_weights_tqg,
             ):
                 if torch.is_tensor(tensor):
@@ -862,13 +851,15 @@ class QueryHead(nn.Module):
             torch.is_tensor(centers_world_tq3)
             and torch.is_tensor(mixture_centers_world_tqg3)
             and torch.is_tensor(mixture_sigmas_world_tqg3)
-            and torch.is_tensor(mixture_yaw_tqg)
+            and torch.is_tensor(mixture_quat_tqg4)
             and torch.is_tensor(mixture_weights_tqg)
             and centers_world_tq3.dim() == 3
             and mixture_centers_world_tqg3.dim() == 4
             and centers_world_tq3.shape[:2] == mixture_centers_world_tqg3.shape[:2]
             and mixture_sigmas_world_tqg3.shape == mixture_centers_world_tqg3.shape
-            and mixture_yaw_tqg.shape[:3] == mixture_centers_world_tqg3.shape[:3]
+            and mixture_quat_tqg4.dim() == 4
+            and int(mixture_quat_tqg4.shape[-1]) == 4
+            and mixture_quat_tqg4.shape[:3] == mixture_centers_world_tqg3.shape[:3]
             and mixture_weights_tqg.shape[:3] == mixture_centers_world_tqg3.shape[:3]
             and int(mixture_centers_world_tqg3.shape[1]) == q_count
             and int(mixture_centers_world_tqg3.shape[2]) == g_count
@@ -884,19 +875,18 @@ class QueryHead(nn.Module):
         center_q13 = centers_world_tq3[present_idx].unsqueeze(1)
         offset_qg3 = mixture_centers_world_tqg3[present_idx] - center_q13
         sigma_qg3 = mixture_sigmas_world_tqg3[present_idx]
-        yaw_qg = mixture_yaw_tqg[present_idx]
+        quat_qg4 = mixture_quat_tqg4[present_idx]
         weight_qg1 = mixture_weights_tqg[present_idx].unsqueeze(-1)
-        params_qg9 = torch.cat(
+        params_qg11 = torch.cat(
             [
                 offset_qg3,
                 sigma_qg3,
-                torch.sin(yaw_qg).unsqueeze(-1),
-                torch.cos(yaw_qg).unsqueeze(-1),
+                quat_qg4,
                 weight_qg1,
             ],
             dim=-1,
         )
-        return params_qg9.detach().to(device=device, dtype=dtype).reshape(q_count, g_count * 9)
+        return params_qg11.detach().to(device=device, dtype=dtype).reshape(q_count, g_count * 11)
 
     def _compute_query_cls_outputs(
         self,
@@ -905,7 +895,7 @@ class QueryHead(nn.Module):
         centers_world_tq3: torch.Tensor = None,
         mixture_centers_world_tqg3: torch.Tensor = None,
         mixture_sigmas_world_tqg3: torch.Tensor = None,
-        mixture_yaw_tqg: torch.Tensor = None,
+        mixture_quat_tqg4: torch.Tensor = None,
         mixture_weights_tqg: torch.Tensor = None,
     ):
         cls_feat_qd = self._build_query_cls_feature_qd(query_inst_tqd, query_future_feat_tqd)
@@ -914,7 +904,7 @@ class QueryHead(nn.Module):
                 centers_world_tq3=centers_world_tq3,
                 mixture_centers_world_tqg3=mixture_centers_world_tqg3,
                 mixture_sigmas_world_tqg3=mixture_sigmas_world_tqg3,
-                mixture_yaw_tqg=mixture_yaw_tqg,
+                mixture_quat_tqg4=mixture_quat_tqg4,
                 mixture_weights_tqg=mixture_weights_tqg,
                 q_count=int(cls_feat_qd.shape[0]),
                 device=cls_feat_qd.device,
@@ -1563,7 +1553,7 @@ class QueryHead(nn.Module):
         query_sigma_world_tq3 = None
         mixture_centers_world_tqg3 = None
         mixture_sigmas_world_tqg3 = None
-        mixture_yaw_tqg = None
+        mixture_quat_tqg4 = None
         mixture_weights_tqg = None
         if bool(compute_direct_center):
             center_logits = self.center_head(center_input_tqd)  # [T, Q, 3]
@@ -1577,7 +1567,7 @@ class QueryHead(nn.Module):
                 query_sigma_world_tq3,
                 mixture_centers_world_tqg3,
                 mixture_sigmas_world_tqg3,
-                mixture_yaw_tqg,
+                mixture_quat_tqg4,
                 mixture_weights_tqg,
             ) = self._compute_gaussian_outputs(center_input_tqd, centers_world)
             (
@@ -1590,7 +1580,7 @@ class QueryHead(nn.Module):
                 centers_world_tq3=centers_world,
                 mixture_centers_world_tqg3=mixture_centers_world_tqg3,
                 mixture_sigmas_world_tqg3=mixture_sigmas_world_tqg3,
-                mixture_yaw_tqg=mixture_yaw_tqg,
+                mixture_quat_tqg4=mixture_quat_tqg4,
                 mixture_weights_tqg=mixture_weights_tqg,
             )
             if self.query_traj_head is not None:
@@ -1609,7 +1599,7 @@ class QueryHead(nn.Module):
             "query_sigma_world_tq3": query_sigma_world_tq3,
             "mixture_centers_world_tqg3": mixture_centers_world_tqg3,
             "mixture_sigmas_world_tqg3": mixture_sigmas_world_tqg3,
-            "mixture_yaw_tqg": mixture_yaw_tqg,
+            "mixture_quat_tqg4": mixture_quat_tqg4,
             "mixture_weights_tqg": mixture_weights_tqg,
             "query_cls_logits_qc": query_cls_logits_qc,
             "query_cls_scores_qc": query_cls_scores_qc,
@@ -1696,6 +1686,9 @@ class QueryHead(nn.Module):
         if not dist.is_initialized():
             return True
         return dist.get_rank() == 0
+
+    def _eval_vis_enabled_this_rank(self) -> bool:
+        return self._is_main_process() or bool(getattr(self, "_eval_vis_all_ranks", False))
 
     @torch.no_grad()
     def _maybe_save_points_gt_vis(
@@ -1880,7 +1873,7 @@ class QueryHead(nn.Module):
             return
         if (step % vis_every) != 0:
             return
-        if not self._is_main_process():
+        if not self._eval_vis_enabled_this_rank():
             return
         if pred_occ_prob is None or points_world is None:
             return
@@ -2086,9 +2079,9 @@ class QueryHead(nn.Module):
             sig_candidate = _normalize_sigmas(query_vis_bundle.get("candidate_mixture_sigmas_tqg3", None), gpts_candidate)
             sig_selected = _normalize_sigmas(query_vis_bundle.get("selected_mixture_sigmas_tqg3", None), gpts_selected)
             sig_matched = _normalize_sigmas(query_vis_bundle.get("matched_mixture_sigmas_tqg3", None), gpts_matched)
-            yaw_candidate = _normalize_scalar_attr(query_vis_bundle.get("candidate_mixture_yaw_tqg", None), gpts_candidate)
-            yaw_selected = _normalize_scalar_attr(query_vis_bundle.get("selected_mixture_yaw_tqg", None), gpts_selected)
-            yaw_matched = _normalize_scalar_attr(query_vis_bundle.get("matched_mixture_yaw_tqg", None), gpts_matched)
+            yaw_candidate = _normalize_scalar_attr(query_vis_bundle.get("candidate_mixture_quat_tqg4", None), gpts_candidate)
+            yaw_selected = _normalize_scalar_attr(query_vis_bundle.get("selected_mixture_quat_tqg4", None), gpts_selected)
+            yaw_matched = _normalize_scalar_attr(query_vis_bundle.get("matched_mixture_quat_tqg4", None), gpts_matched)
             w_candidate = _normalize_scalar_attr(query_vis_bundle.get("candidate_mixture_weights_tqg", None), gpts_candidate)
             w_selected = _normalize_scalar_attr(query_vis_bundle.get("selected_mixture_weights_tqg", None), gpts_selected)
             w_matched = _normalize_scalar_attr(query_vis_bundle.get("matched_mixture_weights_tqg", None), gpts_matched)
@@ -2196,7 +2189,10 @@ class QueryHead(nn.Module):
         stats_lo = []
         stats_matched = []
 
-        conf_thr = float(getattr(self, "debug_query_confidence_vis_threshold", 0.5))
+        conf_thr = float(os.environ.get(
+            "EOCF_EVAL_FG_THR",
+            getattr(self, "debug_query_score_threshold", getattr(self, "debug_query_confidence_vis_threshold", 0.5)),
+        ))
         marker_radius = int(getattr(self, "debug_query_center_marker_radius", 3))
         gt_color = np.array([40, 180, 40], dtype=np.uint8)
         hi_color = np.array([30, 255, 255], dtype=np.uint8)
@@ -2221,7 +2217,7 @@ class QueryHead(nn.Module):
         class_palette = self._get_query_vis_palette()
         pred_cls_palette = self._get_query_pred_palette()
         gaussian_vis_mode = str(getattr(self, "debug_query_gaussian_vis_mode", "ellipse")).lower()
-        gaussian_prob_threshold = float(getattr(self, "debug_query_gaussian_prob_threshold", 0.5))
+        gaussian_prob_threshold = float(prob_threshold)
         gaussian_prob_alpha_scale = float(getattr(self, "debug_query_gaussian_prob_alpha_scale", 4.0))
         traj_points_tq3 = None
         base_traj_points_tq3 = None
@@ -3180,7 +3176,7 @@ class QueryHead(nn.Module):
 
         if (
             isinstance(query_vis_bundle, dict)
-            and self._is_main_process()
+            and self._eval_vis_enabled_this_rank()
         ):
             try:
                 import os
@@ -3200,15 +3196,15 @@ class QueryHead(nn.Module):
                     "matched_sigmas_tq3",
                     "candidate_mixture_centers_tqg3",
                     "candidate_mixture_sigmas_tqg3",
-                    "candidate_mixture_yaw_tqg",
+                    "candidate_mixture_quat_tqg4",
                     "candidate_mixture_weights_tqg",
                     "selected_mixture_centers_tqg3",
                     "selected_mixture_sigmas_tqg3",
-                    "selected_mixture_yaw_tqg",
+                    "selected_mixture_quat_tqg4",
                     "selected_mixture_weights_tqg",
                     "matched_mixture_centers_tqg3",
                     "matched_mixture_sigmas_tqg3",
-                    "matched_mixture_yaw_tqg",
+                    "matched_mixture_quat_tqg4",
                     "matched_mixture_weights_tqg",
                     "selected_query_idx_q",
                     "base_points_tq3",
@@ -3464,7 +3460,7 @@ class QueryHead(nn.Module):
         gaussian_sigmas_world: torch.Tensor = None,
         mixture_centers_world_tqg3: torch.Tensor = None,
         mixture_sigmas_world_tqg3: torch.Tensor = None,
-        mixture_yaw_tqg: torch.Tensor = None,
+        mixture_quat_tqg4: torch.Tensor = None,
         mixture_weights_tqg: torch.Tensor = None,
         gaussian_truncate_sigma: float = None,
         gaussian_sigma_floor_vox: float = 0.35,
@@ -3488,17 +3484,19 @@ class QueryHead(nn.Module):
             (not self.center_only_mode)
             and torch.is_tensor(mixture_centers_world_tqg3)
             and torch.is_tensor(mixture_sigmas_world_tqg3)
-            and torch.is_tensor(mixture_yaw_tqg)
+            and torch.is_tensor(mixture_quat_tqg4)
             and torch.is_tensor(mixture_weights_tqg)
             and mixture_centers_world_tqg3.dim() == 4
             and tuple(mixture_centers_world_tqg3.shape) == tuple(mixture_sigmas_world_tqg3.shape)
-            and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_yaw_tqg.shape)
+            and mixture_quat_tqg4.dim() == 4
+            and int(mixture_quat_tqg4.shape[-1]) == 4
+            and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_quat_tqg4.shape[:3])
             and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_weights_tqg.shape)
         )
         if use_mixture:
             centers = mixture_centers_world_tqg3.to(torch.float32)
             sigmas = mixture_sigmas_world_tqg3.to(torch.float32)
-            yaws = mixture_yaw_tqg.to(torch.float32)
+            rot = quat_to_rotmat_wxyz(mixture_quat_tqg4.to(torch.float32))
             weights = mixture_weights_tqg.to(torch.float32).clamp(0.0, 1.0)
             T_pred, Q, G, _ = centers.shape
 
@@ -3521,6 +3519,7 @@ class QueryHead(nn.Module):
             s[..., 0] = (s[..., 0] / voxel_size[0]).clamp(min=float(gaussian_sigma_floor_vox))
             s[..., 1] = (s[..., 1] / voxel_size[1]).clamp(min=float(gaussian_sigma_floor_vox))
             s[..., 2] = (s[..., 2] / voxel_size[2]).clamp(min=float(gaussian_sigma_floor_vox))
+            std_vox = torch.sqrt((rot.pow(2) * s.pow(2).unsqueeze(-2)).sum(dim=-1).clamp_min(1e-12))
 
             trunc = self.gaussian_truncate_sigma if gaussian_truncate_sigma is None else float(gaussian_truncate_sigma)
             trunc = max(1.0, float(trunc))
@@ -3534,9 +3533,9 @@ class QueryHead(nn.Module):
                     for g in range(G):
                         cxi, cyi, czi = c[t, q, g]
                         sxi, syi, szi = s[t, q, g]
-                        rx = max(1, int(torch.ceil(trunc * sxi).item()))
-                        ry = max(1, int(torch.ceil(trunc * syi).item()))
-                        rz = max(1, int(torch.ceil(trunc * szi).item()))
+                        rx = max(1, int(torch.ceil(trunc * std_vox[t, q, g, 0]).item()))
+                        ry = max(1, int(torch.ceil(trunc * std_vox[t, q, g, 1]).item()))
+                        rz = max(1, int(torch.ceil(trunc * std_vox[t, q, g, 2]).item()))
                         x0 = max(0, int(torch.floor(cxi).item()) - rx)
                         x1 = min(X - 1, int(torch.floor(cxi).item()) + rx)
                         y0 = max(0, int(torch.floor(cyi).item()) - ry)
@@ -3551,10 +3550,12 @@ class QueryHead(nn.Module):
                         xx, yy, zz = torch.meshgrid(xs, ys, zs, indexing="ij")
                         dx = xx - cxi
                         dy = yy - cyi
-                        yaw = yaws[t, q, g]
-                        xr = torch.cos(yaw) * dx + torch.sin(yaw) * dy
-                        yr = -torch.sin(yaw) * dx + torch.cos(yaw) * dy
-                        md2 = (xr / sxi).pow(2) + (yr / syi).pow(2) + ((zz - czi) / szi).pow(2)
+                        dz = zz - czi
+                        r = rot[t, q, g]
+                        xr = r[0, 0] * dx + r[1, 0] * dy + r[2, 0] * dz
+                        yr = r[0, 1] * dx + r[1, 1] * dy + r[2, 1] * dz
+                        zr = r[0, 2] * dx + r[1, 2] * dy + r[2, 2] * dz
+                        md2 = (xr / sxi).pow(2) + (yr / syi).pow(2) + (zr / szi).pow(2)
                         w = torch.exp(-0.5 * md2) * (md2 <= trunc2).to(md2.dtype)
                         xx_i, yy_i, zz_i = torch.meshgrid(
                             xs.to(torch.long), ys.to(torch.long), zs.to(torch.long), indexing="ij"
@@ -4059,7 +4060,7 @@ class QueryHead(nn.Module):
         gaussian_sigmas_world: torch.Tensor = None,
         mixture_centers_world_tqg3: torch.Tensor = None,
         mixture_sigmas_world_tqg3: torch.Tensor = None,
-        mixture_yaw_tqg: torch.Tensor = None,
+        mixture_quat_tqg4: torch.Tensor = None,
         mixture_weights_tqg: torch.Tensor = None,
         gt_inst_center_world_tn3: torch.Tensor = None,
         gt_inst_center_valid_tn: torch.Tensor = None,
@@ -4596,6 +4597,6 @@ if __name__ == "__main__":
     print(out["query_sigma_world_tq3"])           # None (summary Gaussian disabled)
     print(out["mixture_centers_world_tqg3"].shape)  # [T, Q, G, 3]
     print(out["mixture_sigmas_world_tqg3"].shape)   # [T, Q, G, 3]
-    print(out["mixture_yaw_tqg"].shape)             # [T, Q, G]
+    print(out["mixture_quat_tqg4"].shape)             # [T, Q, G]
     print(out["mixture_weights_tqg"].shape)         # [T, Q, G]
     print(out["query_cls_logits_qc"].shape)         # [Q, C]

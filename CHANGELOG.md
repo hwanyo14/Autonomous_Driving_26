@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-06-30 11:52 KST
+
+### Evaluation / Inference Visualization 구현
+
+**핵심 내용**: `/home/hwanhee/EOCF_ksh_0626`의 평가·추론 시각화 경로를 현재 repo 구조에 맞춰 이식.
+
+**주요 변경사항**:
+- `efficientocf.py`: 현재 `extract_feat_query` 반환 인덱스에 맞춘 `forward_test`/`simple_test` 추가. query selection 기반 2D IoU, bbox-AABB IoU, 3D IoU/Recall 계산 및 eval 시각화 저장 경로 연결.
+- `voxelizer.py`, `utils_visualization.py`, `query_head.py`: eval full-scene Gaussian mixture voxelization, 3D mixture 시각화, eval all-rank query debug 저장, `EOCF_EVAL_*` threshold/vis env 지원 추가.
+- `occupancy/apis/test.py`, dataset evaluate: single/multi GPU 평가 누적, live metric log, bbox/3D metric optional 집계 추가.
+- `tools/test.py`, `tools/dist_test.sh`: eval vis 디렉터리/env 설정, `global_idx` meta key 보장, 평가 로그 파일 저장 및 NCCL timeout/MPS 설정 추가.
+- `efficientocf_config.py`, `base_config.py`: eval occ threshold, mixture eval 사용, mixture3d vis 설정 기본값 추가.
+- 검증: 대상 Python 파일 `py_compile`, `tools/dist_test.sh`/`run_eval.sh` `bash -n`, `git diff --check` 통과. config print/runtime smoke는 현재 shell에 `mmcv`/`torch`가 없어 실행하지 못함.
+
 ## 2026-06-29 11:31 KST
 
 ### Query Classification Gaussian Params Concat
@@ -336,6 +350,16 @@
 - `projects/occ_plugin/occupancy/detectors/utils_loss.py`: `_aggregate_training_losses()`에서 조건부로 생성되던 `dbg_query_match_cost_*` 키 전체를 모든 rank에서 항상 0으로 선생성하도록 수정 → rank별 `log_vars` 키 불일치로 인한 `loss log variables are different across GPUs!` assert 방지
 
 **실행기**: 별도 `train_total.sh`는 만들지 않음. 기존 `run.sh` → `tools/dist_train.sh`가 이미 config/GPU 수/PORT를 인자·환경변수로 받는 구조라 그대로 사용 (`PORT=24560 bash run.sh <config> 8`).
+
+## 2026-06-30 12:13 KST
+
+### Unified Gaussian Head Quaternion Rotation
+
+- `query_head.py`: offset/sigma/rotation/weight Gaussian head 4개를 `GaussianHead(out_dim=query_num_gaussians * 11)` 단일 head로 통합.
+- Gaussian component 출력을 `offset(3) + sigma(3) + quat(4, wxyz) + weight(1)`로 분해하고, downstream key를 `mixture_quat_tqg4`로 변경.
+- `voxelizer.py`: Gaussian mixture grouped/scene voxelization을 yaw 기반 XY 회전에서 quaternion 기반 3D 회전으로 변경.
+- matcher/loss/geometry/visualization 경로의 `mixture_yaw_*` key를 `mixture_quat_*` key로 교체하고, BEV matching은 quaternion으로부터 XY covariance를 투영해 rasterize하도록 변경.
+- 검증: 대상 Python 파일 `py_compile` 통과. 현재 shell Python에 `torch`가 없어 dummy tensor smoke test는 실행하지 못함.
 
 ## 2026-06-11 10:20 KST
 

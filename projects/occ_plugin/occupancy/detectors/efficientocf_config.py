@@ -69,6 +69,9 @@ MODEL_CFG_DEFAULTS = {
     "query_multi_gaussian_sigma_reg_loss_weight": 0.0,
     "query_multi_gaussian_sigma_reg_log_eps": 1e-6,
     "query_multi_gaussian_pair_chunk": 8,
+    "query_multi_gaussian_occ_combine_mode": "poisson",
+    "query_eval_occ_use_mixture": True,
+    "eval_occ_threshold": 0.5,
     "query_gaussian_head_num_layers": 2,
     "query_cls_head_num_layers": 2,
     "query_cls_use_gaussian_params": False,
@@ -124,6 +127,7 @@ DEBUG_CFG_DEFAULTS = {
     "debug_gmo_local_aabb_pair_vis_every": 0,
     "debug_query_inst_depth_lift_vis_every": 0,
     "debug_query_attn_softargmax_vis_every": 0,
+    "debug_query_mixture3d_vis_every": 0,
 }
 
 VISUALIZATION_CFG_DEFAULTS = {
@@ -162,6 +166,11 @@ VISUALIZATION_CFG_DEFAULTS = {
     "debug_query_attn_softargmax_vis_max_cams": 3,
     "debug_query_attn_softargmax_vis_max_queries": 16,
     "query_attn_vis_dir": "./work_dirs/query_attn_vis",
+    "debug_query_mixture3d_vis_dir": "./work_dirs/query_mixture3d_vis",
+    "debug_query_mixture3d_vis_max_queries": 50,
+    "debug_query_mixture3d_vis_max_gt_points": 40000,
+    "debug_query_mixture3d_vis_occ_max_voxels_per_query": 4000,
+    "debug_query_mixture3d_vis_eval_occ_size": (512, 512, 40),
 }
 
 
@@ -292,6 +301,9 @@ def apply_model_cfg(self, cfg):
     self.query_multi_gaussian_sigma_reg_loss_weight = float(cfg["query_multi_gaussian_sigma_reg_loss_weight"])
     self.query_multi_gaussian_sigma_reg_log_eps = float(cfg["query_multi_gaussian_sigma_reg_log_eps"])
     self.query_multi_gaussian_pair_chunk = max(1, int(cfg["query_multi_gaussian_pair_chunk"]))
+    self.query_multi_gaussian_occ_combine_mode = str(cfg["query_multi_gaussian_occ_combine_mode"]).lower()
+    self.query_eval_occ_use_mixture = bool(cfg["query_eval_occ_use_mixture"])
+    self.eval_occ_threshold = float(cfg["eval_occ_threshold"])
     self.query_gaussian_head_num_layers = int(cfg["query_gaussian_head_num_layers"])
     self.query_cls_head_num_layers = int(cfg["query_cls_head_num_layers"])
     self.query_cls_use_gaussian_params = bool(cfg["query_cls_use_gaussian_params"])
@@ -359,6 +371,7 @@ def apply_debug_cfg(self, cfg):
     self.debug_gmo_local_aabb_pair_vis_every = int(cfg["debug_gmo_local_aabb_pair_vis_every"])
     self.debug_query_inst_depth_lift_vis_every = int(cfg["debug_query_inst_depth_lift_vis_every"])
     self.debug_query_attn_softargmax_vis_every = int(cfg["debug_query_attn_softargmax_vis_every"])
+    self.debug_query_mixture3d_vis_every = int(cfg["debug_query_mixture3d_vis_every"])
 
     return cfg
 
@@ -403,5 +416,14 @@ def apply_visualization_cfg(self, cfg):
     self.debug_query_attn_softargmax_vis_max_cams = max(1, int(cfg["debug_query_attn_softargmax_vis_max_cams"]))
     self.debug_query_attn_softargmax_vis_max_queries = max(1, int(cfg["debug_query_attn_softargmax_vis_max_queries"]))
     self.query_attn_vis_dir = str(cfg["query_attn_vis_dir"])
+    self.debug_query_mixture3d_vis_dir = str(cfg["debug_query_mixture3d_vis_dir"])
+    self.debug_query_mixture3d_vis_max_queries = max(1, int(cfg["debug_query_mixture3d_vis_max_queries"]))
+    self.debug_query_mixture3d_vis_max_gt_points = max(1000, int(cfg["debug_query_mixture3d_vis_max_gt_points"]))
+    self.debug_query_mixture3d_vis_occ_max_voxels_per_query = max(
+        100, int(cfg["debug_query_mixture3d_vis_occ_max_voxels_per_query"])
+    )
+    self.debug_query_mixture3d_vis_eval_occ_size = tuple(
+        int(v) for v in cfg["debug_query_mixture3d_vis_eval_occ_size"]
+    )
 
     return cfg

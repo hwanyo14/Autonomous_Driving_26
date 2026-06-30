@@ -425,6 +425,9 @@ model_cfg = dict(
     query_multi_gaussian_sigma_min_m=(0.15, 0.15, 0.15),
     query_multi_gaussian_sigma_max_m=(3.0, 3.0, 0.5),
     query_multi_gaussian_sigma_reg_loss_weight=0.0,
+    query_multi_gaussian_occ_combine_mode='poisson',
+    query_eval_occ_use_mixture=True,
+    eval_occ_threshold=0.5,
     query_gaussian_head_num_layers=3,
     query_cls_head_num_layers=3,
     query_cls_use_gaussian_params=True,
@@ -442,6 +445,7 @@ debug_cfg = dict(
     debug_query_attn_softargmax_vis_every=(
         48
     ),
+    debug_query_mixture3d_vis_every=0,
 )
 
 visualization_cfg = dict(
@@ -465,6 +469,11 @@ visualization_cfg = dict(
     debug_query_inst_depth_lift_vis_max_instances=12,
     debug_query_attn_softargmax_vis_dir="./work_dirs/query_attn_softargmax_vis_no_pretrain",
     query_attn_vis_dir="./work_dirs/query_attn_vis_no_pretrain",
+    debug_query_mixture3d_vis_dir="./work_dirs/query_mixture3d_vis_no_pretrain",
+    debug_query_mixture3d_vis_max_queries=50,
+    debug_query_mixture3d_vis_max_gt_points=40000,
+    debug_query_mixture3d_vis_occ_max_voxels_per_query=4000,
+    debug_query_mixture3d_vis_eval_occ_size=(512, 512, 40),
 )
 
 model = dict(

@@ -1,5 +1,17 @@
 # NOTES
 
+## 2026-06-30 KST — Eval/visualization 이식 검증 메모
+
+## 2026-06-30 KST — Unified Gaussian quaternion rotation 검증 메모
+
+- `mixture_quat_tqg4`는 wxyz 순서이며 shape은 `[T,Q,G,4]`이다. 기존 yaw scalar shape `[T,Q,G]`를 기대하는 신규 코드가 생기면 shape mismatch를 먼저 의심할 것.
+- `QueryHead` dummy forward와 voxelizer smoke는 현재 shell Python에 `torch`가 없어 `ModuleNotFoundError: No module named 'torch'`로 실행하지 못함.
+- 변경 파일 `py_compile`과 yaw key 잔여 검색은 통과.
+
+- `tools/misc/print_config.py projects/configs/baselines/base_config.py`는 현재 shell Python에 `mmcv`가 없어 `ModuleNotFoundError: No module named 'mmcv'`로 실행하지 못함.
+- `SoftVoxelizerOneAdd.forward_gaussian_mixture_scene` torch smoke는 현재 shell Python에 `torch`가 없어 `ModuleNotFoundError: No module named 'torch'`로 실행하지 못함.
+- 변경 파일 `py_compile`과 `tools/dist_test.sh`/`run_eval.sh` `bash -n`은 통과.
+
 ## 2026-06-26 KST — Independent Gaussian alpha 검증 메모
 
 - `QueryHead` dummy forward/backward smoke는 현재 shell Python에 `torch`가 없어 `ModuleNotFoundError: No module named 'torch'`로 실행하지 못함.

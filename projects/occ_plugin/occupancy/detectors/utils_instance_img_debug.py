@@ -1120,7 +1120,7 @@ class EfficientOCFInstanceImgDebugMixin:
         self,
         mixture_centers_world_tqg3: torch.Tensor,
         mixture_sigmas_world_tqg3: torch.Tensor,
-        mixture_yaw_tqg: torch.Tensor,
+        mixture_quat_tqg4: torch.Tensor,
         mixture_weights_tqg: torch.Tensor,
         future_egomotion,
         query_match_inputs: dict,
@@ -1129,7 +1129,7 @@ class EfficientOCFInstanceImgDebugMixin:
         query_t_idx_t: torch.Tensor = None,
         chunk: int = 32,
     ) -> dict:
-        del mixture_yaw_tqg  # Current CAM target uses axis-aligned projected sigma.
+        del mixture_quat_tqg4  # Current CAM target uses axis-aligned projected sigma.
 
         if (
             (not isinstance(query_match_inputs, dict))
@@ -1488,7 +1488,7 @@ class EfficientOCFInstanceImgDebugMixin:
         self,
         mixture_centers_world_tqg3: torch.Tensor,
         mixture_sigmas_world_tqg3: torch.Tensor,
-        mixture_yaw_tqg: torch.Tensor,
+        mixture_quat_tqg4: torch.Tensor,
         mixture_weights_tqg: torch.Tensor,
         future_egomotion,
         query_match_inputs: dict,
@@ -1496,7 +1496,7 @@ class EfficientOCFInstanceImgDebugMixin:
         proj = self._project_query_gaussians_to_cam_maps(
             mixture_centers_world_tqg3=mixture_centers_world_tqg3,
             mixture_sigmas_world_tqg3=mixture_sigmas_world_tqg3,
-            mixture_yaw_tqg=mixture_yaw_tqg,
+            mixture_quat_tqg4=mixture_quat_tqg4,
             mixture_weights_tqg=mixture_weights_tqg,
             future_egomotion=future_egomotion,
             query_match_inputs=query_match_inputs,

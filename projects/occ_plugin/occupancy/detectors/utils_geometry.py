@@ -54,7 +54,7 @@ class EfficientOCFGeometryMixin:
             gaussian_sigmas_world_tq3=_t(sigmas),
             mixture_centers_world_tqg3=_t(mix_c),
             mixture_sigmas_world_tqg3=_t(mix_s),
-            mixture_yaw_tqg=_t(mix_y),
+            mixture_quat_tqg4=_t(mix_y),
             mixture_weights_tqg=_t(mix_w),
         )
         return pack if isinstance(pack, dict) else {}

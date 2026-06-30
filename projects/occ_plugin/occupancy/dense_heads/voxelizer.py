@@ -2,6 +2,80 @@ import torch
 import torch.nn as nn
 
 
+def normalize_quat_wxyz(quat: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    norm = quat.norm(dim=-1, keepdim=True)
+    q = quat / norm.clamp_min(float(eps))
+    identity = torch.zeros_like(q)
+    identity[..., 0] = 1.0
+    return torch.where(norm > float(eps), q, identity)
+
+
+def quat_to_rotmat_wxyz(quat: torch.Tensor) -> torch.Tensor:
+    q = normalize_quat_wxyz(quat)
+    w, x, y, z = q.unbind(dim=-1)
+    ww, xx, yy, zz = w * w, x * x, y * y, z * z
+    wx, wy, wz = w * x, w * y, w * z
+    xy, xz, yz = x * y, x * z, y * z
+    return torch.stack(
+        [
+            torch.stack([ww + xx - yy - zz, 2.0 * (xy - wz), 2.0 * (xz + wy)], dim=-1),
+            torch.stack([2.0 * (xy + wz), ww - xx + yy - zz, 2.0 * (yz - wx)], dim=-1),
+            torch.stack([2.0 * (xz - wy), 2.0 * (yz + wx), ww - xx - yy + zz], dim=-1),
+        ],
+        dim=-2,
+    )
+
+
+def rotmat_to_quat_wxyz(rot: torch.Tensor) -> torch.Tensor:
+    m00 = rot[..., 0, 0]
+    m01 = rot[..., 0, 1]
+    m02 = rot[..., 0, 2]
+    m10 = rot[..., 1, 0]
+    m11 = rot[..., 1, 1]
+    m12 = rot[..., 1, 2]
+    m20 = rot[..., 2, 0]
+    m21 = rot[..., 2, 1]
+    m22 = rot[..., 2, 2]
+    trace = m00 + m11 + m22
+    s_trace = 2.0 * torch.sqrt((trace + 1.0).clamp_min(1e-12))
+    qw_trace = 0.25 * s_trace
+    qx_trace = (m21 - m12) / s_trace.clamp_min(1e-12)
+    qy_trace = (m02 - m20) / s_trace.clamp_min(1e-12)
+    qz_trace = (m10 - m01) / s_trace.clamp_min(1e-12)
+
+    s_x = 2.0 * torch.sqrt((1.0 + m00 - m11 - m22).clamp_min(1e-12))
+    qw_x = (m21 - m12) / s_x.clamp_min(1e-12)
+    qx_x = 0.25 * s_x
+    qy_x = (m01 + m10) / s_x.clamp_min(1e-12)
+    qz_x = (m02 + m20) / s_x.clamp_min(1e-12)
+
+    s_y = 2.0 * torch.sqrt((1.0 + m11 - m00 - m22).clamp_min(1e-12))
+    qw_y = (m02 - m20) / s_y.clamp_min(1e-12)
+    qx_y = (m01 + m10) / s_y.clamp_min(1e-12)
+    qy_y = 0.25 * s_y
+    qz_y = (m12 + m21) / s_y.clamp_min(1e-12)
+
+    s_z = 2.0 * torch.sqrt((1.0 + m22 - m00 - m11).clamp_min(1e-12))
+    qw_z = (m10 - m01) / s_z.clamp_min(1e-12)
+    qx_z = (m02 + m20) / s_z.clamp_min(1e-12)
+    qy_z = (m12 + m21) / s_z.clamp_min(1e-12)
+    qz_z = 0.25 * s_z
+
+    use_trace = trace > 0.0
+    use_x = (~use_trace) & (m00 > m11) & (m00 > m22)
+    use_y = (~use_trace) & (~use_x) & (m11 > m22)
+    qw = torch.where(use_trace, qw_trace, torch.where(use_x, qw_x, torch.where(use_y, qw_y, qw_z)))
+    qx = torch.where(use_trace, qx_trace, torch.where(use_x, qx_x, torch.where(use_y, qx_y, qx_z)))
+    qy = torch.where(use_trace, qy_trace, torch.where(use_x, qy_x, torch.where(use_y, qy_y, qy_z)))
+    qz = torch.where(use_trace, qz_trace, torch.where(use_x, qz_x, torch.where(use_y, qz_y, qz_z)))
+    return normalize_quat_wxyz(torch.stack([qw, qx, qy, qz], dim=-1))
+
+
+def rotated_gaussian_std_world(sigmas_world: torch.Tensor, quat_wxyz: torch.Tensor) -> torch.Tensor:
+    rot = quat_to_rotmat_wxyz(quat_wxyz)
+    return torch.sqrt((rot.pow(2) * sigmas_world.pow(2).unsqueeze(-2)).sum(dim=-1).clamp_min(1e-12))
+
+
 # class SoftVoxelizerOneAdd(nn.Module):
 #     def __init__(self,
 #                  point_cloud_range,
@@ -134,6 +208,7 @@ class SoftVoxelizerOneAdd(nn.Module):
         force_fp32=True,
         gaussian_truncate_sigma=3.0,
         gaussian_sigma_floor_vox=0.35,
+        gaussian_combine_mode="poisson",
     ):
         super().__init__()
         self.point_cloud_range = point_cloud_range
@@ -152,6 +227,12 @@ class SoftVoxelizerOneAdd(nn.Module):
         self.force_fp32 = force_fp32
         self.gaussian_truncate_sigma = float(gaussian_truncate_sigma)
         self.gaussian_sigma_floor_vox = float(gaussian_sigma_floor_vox)
+        self.gaussian_combine_mode = str(gaussian_combine_mode).lower()
+        if self.gaussian_combine_mode not in ("poisson", "union"):
+            raise ValueError(
+                "gaussian_combine_mode must be one of {'poisson','union'}, "
+                f"got {self.gaussian_combine_mode!r}"
+            )
 
         # buffers
         x_min, y_min, z_min, x_max, y_max, z_max = point_cloud_range
@@ -410,7 +491,7 @@ class SoftVoxelizerOneAdd(nn.Module):
         mixture_centers_world_tkg3: torch.Tensor,
         mixture_sigmas_world_tkg3: torch.Tensor,
         mixture_weights_tkg: torch.Tensor,
-        mixture_yaw_tkg: torch.Tensor,
+        mixture_quat_tkg4: torch.Tensor,
         pair_weights_tk: torch.Tensor = None,
         pair_chunk_size: int = 8,
     ) -> torch.Tensor:
@@ -419,12 +500,12 @@ class SoftVoxelizerOneAdd(nn.Module):
         Args:
             mixture_centers_world_tkg3: [T,K,G,3]
             mixture_sigmas_world_tkg3: [T,K,G,3]
-            mixture_weights_tkg: [T,K,G] independent per-component alpha in [0,1]
-            mixture_yaw_tkg: [T,K,G] (z-axis yaw, radians)
+            mixture_weights_tkg: [T,K,G] component weights
+            mixture_quat_tkg4: [T,K,G,4] quaternion rotation (wxyz)
             pair_weights_tk: optional [T,K] scalar weight per pair
             pair_chunk_size: chunk size over K for memory control
         Returns:
-            occ_tk1zyx: [T,K,1,D,H,W], with p = 1 - exp(-sum_g w_g * G_g(x))
+            occ_tk1zyx: [T,K,1,D,H,W]
         """
         if mixture_centers_world_tkg3.dim() != 4:
             raise ValueError(
@@ -437,12 +518,12 @@ class SoftVoxelizerOneAdd(nn.Module):
             )
         if mixture_weights_tkg.dim() != 3:
             raise ValueError(f"mixture_weights_tkg must be [T,K,G], got {tuple(mixture_weights_tkg.shape)}")
-        if mixture_yaw_tkg.dim() != 3:
-            raise ValueError(f"mixture_yaw_tkg must be [T,K,G], got {tuple(mixture_yaw_tkg.shape)}")
-        if mixture_weights_tkg.shape != mixture_yaw_tkg.shape:
+        if mixture_quat_tkg4.dim() != 4 or int(mixture_quat_tkg4.shape[-1]) != 4:
+            raise ValueError(f"mixture_quat_tkg4 must be [T,K,G,4], got {tuple(mixture_quat_tkg4.shape)}")
+        if tuple(mixture_weights_tkg.shape) != tuple(mixture_quat_tkg4.shape[:3]):
             raise ValueError(
-                f"mixture_weights_tkg/mixture_yaw_tkg shape mismatch: "
-                f"{tuple(mixture_weights_tkg.shape)} vs {tuple(mixture_yaw_tkg.shape)}"
+                f"mixture_weights_tkg/mixture_quat_tkg4 shape mismatch: "
+                f"{tuple(mixture_weights_tkg.shape)} vs {tuple(mixture_quat_tkg4.shape)}"
             )
         if tuple(mixture_weights_tkg.shape[:3]) != tuple(mixture_centers_world_tkg3.shape[:3]):
             raise ValueError(
@@ -463,13 +544,13 @@ class SoftVoxelizerOneAdd(nn.Module):
             centers = mixture_centers_world_tkg3.float()
             sigmas = mixture_sigmas_world_tkg3.float()
             comp_weights = mixture_weights_tkg.float()
-            yaws = mixture_yaw_tkg.float()
+            quats = mixture_quat_tkg4.float()
             pair_weights = pair_weights_tk.float() if pair_weights_tk is not None else None
         else:
             centers = mixture_centers_world_tkg3
             sigmas = mixture_sigmas_world_tkg3
             comp_weights = mixture_weights_tkg
-            yaws = mixture_yaw_tkg
+            quats = mixture_quat_tkg4
             pair_weights = pair_weights_tk
 
         pc_min = self.pc_min.to(device=device, dtype=centers.dtype)
@@ -481,19 +562,17 @@ class SoftVoxelizerOneAdd(nn.Module):
         cx = (centers[..., 0] - pc_min[0]) / vs[0] - 0.5
         cy = (centers[..., 1] - pc_min[1]) / vs[1] - 0.5
         cz = (centers[..., 2] - pc_min[2]) / vs[2] - 0.5
-        sx = (sigmas[..., 0] / vs[0]).clamp(min=self.gaussian_sigma_floor_vox)
-        sy = (sigmas[..., 1] / vs[1]).clamp(min=self.gaussian_sigma_floor_vox)
-        sz = (sigmas[..., 2] / vs[2]).clamp(min=self.gaussian_sigma_floor_vox)
+        sigma_floor_world = vs * float(self.gaussian_sigma_floor_vox)
+        sigmas = torch.maximum(sigmas, sigma_floor_world.view(1, 1, 1, 3))
+        sx = sigmas[..., 0]
+        sy = sigmas[..., 1]
+        sz = sigmas[..., 2]
         wt = comp_weights.clamp(min=0.0)
-        yaw = yaws
-
-        cos_y = torch.cos(yaw)
-        sin_y = torch.sin(yaw)
-        sx_rot = torch.sqrt((cos_y.pow(2) * sx.pow(2)) + (sin_y.pow(2) * sy.pow(2)))
-        sy_rot = torch.sqrt((sin_y.pow(2) * sx.pow(2)) + (cos_y.pow(2) * sy.pow(2)))
-        rx = torch.ceil(trunc * sx_rot).to(torch.long).clamp(min=1)
-        ry = torch.ceil(trunc * sy_rot).to(torch.long).clamp(min=1)
-        rz = torch.ceil(trunc * sz).to(torch.long).clamp(min=1)
+        rot = quat_to_rotmat_wxyz(quats)
+        std_vox = rotated_gaussian_std_world(sigmas, quats) / vs.view(1, 1, 1, 3)
+        rx = torch.ceil(trunc * std_vox[..., 0]).to(torch.long).clamp(min=1)
+        ry = torch.ceil(trunc * std_vox[..., 1]).to(torch.long).clamp(min=1)
+        rz = torch.ceil(trunc * std_vox[..., 2]).to(torch.long).clamp(min=1)
 
         occ_tkzyx = centers.new_zeros((T, K, self.D, self.H, self.W))
         for t in range(T):
@@ -510,8 +589,7 @@ class SoftVoxelizerOneAdd(nn.Module):
                 syc = sy[t, k0:k1]
                 szc = sz[t, k0:k1]
                 wtc = wt[t, k0:k1]
-                cosc = cos_y[t, k0:k1]
-                sinc = sin_y[t, k0:k1]
+                rotc = rot[t, k0:k1]
                 rxc = rx[t, k0:k1]
                 ryc = ry[t, k0:k1]
                 rzc = rz[t, k0:k1]
@@ -545,21 +623,39 @@ class SoftVoxelizerOneAdd(nn.Module):
                 zs = torch.arange(z0, z1 + 1, device=device, dtype=centers.dtype)
                 xx, yy, zz = torch.meshgrid(xs, ys, zs, indexing="ij")
 
-                dx = xx[None, None] - cxc[..., None, None, None]
-                dy = yy[None, None] - cyc[..., None, None, None]
-                dz = zz[None, None] - czc[..., None, None, None]
+                dx = (xx[None, None] - cxc[..., None, None, None]) * vs[0]
+                dy = (yy[None, None] - cyc[..., None, None, None]) * vs[1]
+                dz = (zz[None, None] - czc[..., None, None, None]) * vs[2]
 
-                xr = cosc[..., None, None, None] * dx + sinc[..., None, None, None] * dy
-                yr = -sinc[..., None, None, None] * dx + cosc[..., None, None, None] * dy
+                xr = (
+                    rotc[..., 0, 0, None, None, None] * dx
+                    + rotc[..., 1, 0, None, None, None] * dy
+                    + rotc[..., 2, 0, None, None, None] * dz
+                )
+                yr = (
+                    rotc[..., 0, 1, None, None, None] * dx
+                    + rotc[..., 1, 1, None, None, None] * dy
+                    + rotc[..., 2, 1, None, None, None] * dz
+                )
+                zr = (
+                    rotc[..., 0, 2, None, None, None] * dx
+                    + rotc[..., 1, 2, None, None, None] * dy
+                    + rotc[..., 2, 2, None, None, None] * dz
+                )
                 md2 = (
                     (xr / sxc[..., None, None, None]).pow(2)
                     + (yr / syc[..., None, None, None]).pow(2)
-                    + (dz / szc[..., None, None, None]).pow(2)
+                    + (zr / szc[..., None, None, None]).pow(2)
                 )
                 gauss = torch.exp(-0.5 * md2)
                 gauss = gauss * (md2 <= trunc2).to(gauss.dtype)
-                lam_pair = (wtc[..., None, None, None] * gauss).sum(dim=1)
-                p_pair = (-torch.expm1(-lam_pair)).clamp(0.0, 1.0)
+                wg = wtc[..., None, None, None] * gauss
+                if self.gaussian_combine_mode == "union":
+                    factor = (1.0 - wg).clamp(1e-6, 1.0)
+                    p_pair = (1.0 - factor.prod(dim=1)).clamp(0.0, 1.0)
+                else:
+                    lam_pair = wg.sum(dim=1)
+                    p_pair = (-torch.expm1(-lam_pair)).clamp(0.0, 1.0)
 
                 in_pair = (
                     (xx[None] >= x0_pair[:, None, None, None].to(xx.dtype))
@@ -576,6 +672,129 @@ class SoftVoxelizerOneAdd(nn.Module):
                 occ_tkzyx[t, k0:k1, z0:z1 + 1, y0:y1 + 1, x0:x1 + 1] = p_pair.permute(0, 3, 2, 1)
 
         return occ_tkzyx.unsqueeze(2).to(out_dtype)
+
+    def forward_gaussian_mixture_scene(
+        self,
+        mixture_centers_world_tqg3: torch.Tensor,
+        mixture_sigmas_world_tqg3: torch.Tensor,
+        mixture_weights_tqg: torch.Tensor,
+        mixture_quat_tqg4: torch.Tensor,
+        pair_weights_tq: torch.Tensor = None,
+    ) -> torch.Tensor:
+        if mixture_centers_world_tqg3.dim() != 4 or int(mixture_centers_world_tqg3.shape[-1]) != 3:
+            raise ValueError(
+                f"mixture_centers_world_tqg3 must be [T,Q,G,3], got {tuple(mixture_centers_world_tqg3.shape)}"
+            )
+        if mixture_sigmas_world_tqg3.shape != mixture_centers_world_tqg3.shape:
+            raise ValueError(
+                f"mixture_sigmas_world_tqg3 shape mismatch: {tuple(mixture_sigmas_world_tqg3.shape)} "
+                f"vs {tuple(mixture_centers_world_tqg3.shape)}"
+            )
+        if mixture_weights_tqg.dim() != 3 or tuple(mixture_weights_tqg.shape) != tuple(mixture_centers_world_tqg3.shape[:3]):
+            raise ValueError(f"mixture_weights_tqg must be [T,Q,G], got {tuple(mixture_weights_tqg.shape)}")
+        if mixture_quat_tqg4.dim() != 4 or int(mixture_quat_tqg4.shape[-1]) != 4:
+            raise ValueError(f"mixture_quat_tqg4 must be [T,Q,G,4], got {tuple(mixture_quat_tqg4.shape)}")
+        if tuple(mixture_quat_tqg4.shape[:3]) != tuple(mixture_centers_world_tqg3.shape[:3]):
+            raise ValueError(
+                f"mixture_quat_tqg4 shape mismatch: {tuple(mixture_quat_tqg4.shape)} "
+                f"vs {tuple(mixture_centers_world_tqg3.shape[:3])}"
+            )
+        T, Q, G, _ = [int(v) for v in mixture_centers_world_tqg3.shape]
+        if T <= 0 or Q <= 0 or G <= 0:
+            return mixture_centers_world_tqg3.new_zeros((max(T, 0), 1, self.D, self.H, self.W))
+
+        device = mixture_centers_world_tqg3.device
+        out_dtype = mixture_centers_world_tqg3.dtype
+        if self.force_fp32:
+            centers = mixture_centers_world_tqg3.float()
+            sigmas = mixture_sigmas_world_tqg3.float()
+            comp_weights = mixture_weights_tqg.float()
+            quats = mixture_quat_tqg4.float()
+            pair_w = pair_weights_tq.float() if pair_weights_tq is not None else None
+        else:
+            centers = mixture_centers_world_tqg3
+            sigmas = mixture_sigmas_world_tqg3
+            comp_weights = mixture_weights_tqg
+            quats = mixture_quat_tqg4
+            pair_w = pair_weights_tq
+
+        pc_min = self.pc_min.to(device=device, dtype=centers.dtype)
+        vs = self.vs.to(device=device, dtype=centers.dtype)
+        trunc = max(1.0, float(self.gaussian_truncate_sigma))
+        trunc2 = trunc * trunc
+
+        cx = (centers[..., 0] - pc_min[0]) / vs[0] - 0.5
+        cy = (centers[..., 1] - pc_min[1]) / vs[1] - 0.5
+        cz = (centers[..., 2] - pc_min[2]) / vs[2] - 0.5
+        sigma_floor_world = vs * float(self.gaussian_sigma_floor_vox)
+        sigmas = torch.maximum(sigmas, sigma_floor_world.view(1, 1, 1, 3))
+        sx = sigmas[..., 0]
+        sy = sigmas[..., 1]
+        sz = sigmas[..., 2]
+        wt = comp_weights.clamp(min=0.0)
+        rot = quat_to_rotmat_wxyz(quats)
+        std_vox = rotated_gaussian_std_world(sigmas, quats) / vs.view(1, 1, 1, 3)
+        rx = torch.ceil(trunc * std_vox[..., 0]).to(torch.long).clamp(min=1)
+        ry = torch.ceil(trunc * std_vox[..., 1]).to(torch.long).clamp(min=1)
+        rz = torch.ceil(trunc * std_vox[..., 2]).to(torch.long).clamp(min=1)
+        union = self.gaussian_combine_mode == "union"
+
+        scene = centers.new_zeros((T, self.D, self.H, self.W))
+        for t in range(T):
+            for q in range(Q):
+                cxg, cyg, czg = cx[t, q], cy[t, q], cz[t, q]
+                sxg, syg, szg = sx[t, q], sy[t, q], sz[t, q]
+                rotg = rot[t, q]
+                floor_cx = torch.floor(cxg).to(torch.long)
+                floor_cy = torch.floor(cyg).to(torch.long)
+                floor_cz = torch.floor(czg).to(torch.long)
+                x0 = int((floor_cx - rx[t, q]).amin().clamp(min=0, max=self.W - 1).item())
+                x1 = int((floor_cx + rx[t, q]).amax().clamp(min=0, max=self.W - 1).item())
+                y0 = int((floor_cy - ry[t, q]).amin().clamp(min=0, max=self.H - 1).item())
+                y1 = int((floor_cy + ry[t, q]).amax().clamp(min=0, max=self.H - 1).item())
+                z0 = int((floor_cz - rz[t, q]).amin().clamp(min=0, max=self.D - 1).item())
+                z1 = int((floor_cz + rz[t, q]).amax().clamp(min=0, max=self.D - 1).item())
+                if (x1 < x0) or (y1 < y0) or (z1 < z0):
+                    continue
+                xs = torch.arange(x0, x1 + 1, device=device, dtype=centers.dtype)
+                ys = torch.arange(y0, y1 + 1, device=device, dtype=centers.dtype)
+                zs = torch.arange(z0, z1 + 1, device=device, dtype=centers.dtype)
+                xx, yy, zz = torch.meshgrid(xs, ys, zs, indexing="ij")
+                dx = (xx[None] - cxg[:, None, None, None]) * vs[0]
+                dy = (yy[None] - cyg[:, None, None, None]) * vs[1]
+                dz = (zz[None] - czg[:, None, None, None]) * vs[2]
+                xr = (
+                    rotg[:, 0, 0, None, None, None] * dx
+                    + rotg[:, 1, 0, None, None, None] * dy
+                    + rotg[:, 2, 0, None, None, None] * dz
+                )
+                yr = (
+                    rotg[:, 0, 1, None, None, None] * dx
+                    + rotg[:, 1, 1, None, None, None] * dy
+                    + rotg[:, 2, 1, None, None, None] * dz
+                )
+                zr = (
+                    rotg[:, 0, 2, None, None, None] * dx
+                    + rotg[:, 1, 2, None, None, None] * dy
+                    + rotg[:, 2, 2, None, None, None] * dz
+                )
+                md2 = (
+                    (xr / sxg[:, None, None, None]).pow(2)
+                    + (yr / syg[:, None, None, None]).pow(2)
+                    + (zr / szg[:, None, None, None]).pow(2)
+                )
+                gauss = torch.exp(-0.5 * md2) * (md2 <= trunc2).to(centers.dtype)
+                wg = wt[t, q][:, None, None, None] * gauss
+                if union:
+                    p = (1.0 - (1.0 - wg).clamp(1e-6, 1.0).prod(dim=0)).clamp(0.0, 1.0)
+                else:
+                    p = (-torch.expm1(-wg.sum(dim=0))).clamp(0.0, 1.0)
+                if pair_w is not None:
+                    p = p * pair_w[t, q].clamp(min=0.0)
+                sl = scene[t, z0:z1 + 1, y0:y1 + 1, x0:x1 + 1]
+                scene[t, z0:z1 + 1, y0:y1 + 1, x0:x1 + 1] = torch.maximum(sl, p.permute(2, 1, 0))
+
+        return scene.unsqueeze(1).to(out_dtype)
 
 
 if __name__ == "__main__":

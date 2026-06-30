@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
+from projects.occ_plugin.occupancy.dense_heads.voxelizer import quat_to_rotmat_wxyz
 
 try:
     from scipy.optimize import linear_sum_assignment
@@ -66,7 +67,7 @@ class EfficientOCFMatcherMixin:
         mixture_centers_world_tqg3: torch.Tensor,
         mixture_sigmas_world_tqg3: torch.Tensor,
         mixture_weights_tqg: torch.Tensor,
-        mixture_yaw_tqg: torch.Tensor,
+        mixture_quat_tqg4: torch.Tensor,
         pair_chunk_size: int = 8,
     ):
         if (
@@ -75,8 +76,10 @@ class EfficientOCFMatcherMixin:
             or (not torch.is_tensor(mixture_sigmas_world_tqg3))
             or tuple(mixture_sigmas_world_tqg3.shape) != tuple(mixture_centers_world_tqg3.shape)
             or (not torch.is_tensor(mixture_weights_tqg))
-            or (not torch.is_tensor(mixture_yaw_tqg))
-            or tuple(mixture_weights_tqg.shape) != tuple(mixture_yaw_tqg.shape)
+            or (not torch.is_tensor(mixture_quat_tqg4))
+            or mixture_quat_tqg4.dim() != 4
+            or int(mixture_quat_tqg4.shape[-1]) != 4
+            or tuple(mixture_quat_tqg4.shape[:3]) != tuple(mixture_centers_world_tqg3.shape[:3])
             or tuple(mixture_weights_tqg.shape) != tuple(mixture_centers_world_tqg3.shape[:3])
         ):
             return None
@@ -91,7 +94,7 @@ class EfficientOCFMatcherMixin:
         centers = mixture_centers_world_tqg3.to(torch.float32)
         sigmas = mixture_sigmas_world_tqg3.to(torch.float32)
         weights = mixture_weights_tqg.to(torch.float32).clamp(min=0.0)
-        yaw = mixture_yaw_tqg.to(torch.float32)
+        quat = mixture_quat_tqg4.to(torch.float32)
 
         pc_min = voxelizer.pc_min.to(device=device, dtype=torch.float32)
         vs = voxelizer.vs.to(device=device, dtype=torch.float32)
@@ -102,15 +105,19 @@ class EfficientOCFMatcherMixin:
 
         cx = (centers[..., 0] - pc_min[0]) / vs[0] - 0.5
         cy = (centers[..., 1] - pc_min[1]) / vs[1] - 0.5
-        sx = (sigmas[..., 0] / vs[0]).clamp(min=sigma_floor)
-        sy = (sigmas[..., 1] / vs[1]).clamp(min=sigma_floor)
-
-        cos_y = torch.cos(yaw)
-        sin_y = torch.sin(yaw)
-        sx_rot = torch.sqrt((cos_y.pow(2) * sx.pow(2)) + (sin_y.pow(2) * sy.pow(2)))
-        sy_rot = torch.sqrt((sin_y.pow(2) * sx.pow(2)) + (cos_y.pow(2) * sy.pow(2)))
-        rx = torch.ceil(trunc * sx_rot).to(torch.long).clamp(min=1)
-        ry = torch.ceil(trunc * sy_rot).to(torch.long).clamp(min=1)
+        sigma_floor_world = vs * float(sigma_floor)
+        sigmas = torch.maximum(sigmas, sigma_floor_world.view(1, 1, 1, 3))
+        rot = quat_to_rotmat_wxyz(quat)
+        sig2 = sigmas.pow(2)
+        cov_xx = (rot[..., 0, :].pow(2) * sig2).sum(dim=-1).clamp_min(1e-12)
+        cov_xy = (rot[..., 0, :] * rot[..., 1, :] * sig2).sum(dim=-1)
+        cov_yy = (rot[..., 1, :].pow(2) * sig2).sum(dim=-1).clamp_min(1e-12)
+        det = (cov_xx * cov_yy - cov_xy.pow(2)).clamp_min(1e-12)
+        inv_xx = cov_yy / det
+        inv_xy = -cov_xy / det
+        inv_yy = cov_xx / det
+        rx = torch.ceil(trunc * torch.sqrt(cov_xx) / vs[0]).to(torch.long).clamp(min=1)
+        ry = torch.ceil(trunc * torch.sqrt(cov_yy) / vs[1]).to(torch.long).clamp(min=1)
 
         out_tqhw = centers.new_zeros((T, Q, H, W))
         for t in range(T):
@@ -122,11 +129,10 @@ class EfficientOCFMatcherMixin:
 
                 cxc = cx[t, q0:q1]
                 cyc = cy[t, q0:q1]
-                sxc = sx[t, q0:q1]
-                syc = sy[t, q0:q1]
                 wtc = weights[t, q0:q1]
-                cosc = cos_y[t, q0:q1]
-                sinc = sin_y[t, q0:q1]
+                inv_xxc = inv_xx[t, q0:q1]
+                inv_xyc = inv_xy[t, q0:q1]
+                inv_yyc = inv_yy[t, q0:q1]
                 rxc = rx[t, q0:q1]
                 ryc = ry[t, q0:q1]
 
@@ -152,11 +158,13 @@ class EfficientOCFMatcherMixin:
                 ys = torch.arange(y0, y1 + 1, device=device, dtype=torch.float32)
                 xx, yy = torch.meshgrid(xs, ys, indexing="ij")
 
-                dx = xx[None, None] - cxc[..., None, None]
-                dy = yy[None, None] - cyc[..., None, None]
-                xr = cosc[..., None, None] * dx + sinc[..., None, None] * dy
-                yr = -sinc[..., None, None] * dx + cosc[..., None, None] * dy
-                md2 = (xr / sxc[..., None, None]).pow(2) + (yr / syc[..., None, None]).pow(2)
+                dx = (xx[None, None] - cxc[..., None, None]) * vs[0]
+                dy = (yy[None, None] - cyc[..., None, None]) * vs[1]
+                md2 = (
+                    inv_xxc[..., None, None] * dx.pow(2)
+                    + 2.0 * inv_xyc[..., None, None] * dx * dy
+                    + inv_yyc[..., None, None] * dy.pow(2)
+                )
                 gauss = torch.exp(-0.5 * md2)
                 gauss = gauss * (md2 <= trunc2).to(gauss.dtype)
                 lam_pair = (wtc[..., None, None] * gauss).sum(dim=1)
@@ -183,7 +191,7 @@ class EfficientOCFMatcherMixin:
         gt_valid_tn: torch.Tensor = None,
         mixture_centers_world_tqg3: torch.Tensor = None,
         mixture_sigmas_world_tqg3: torch.Tensor = None,
-        mixture_yaw_tqg: torch.Tensor = None,
+        mixture_quat_tqg4: torch.Tensor = None,
         mixture_weights_tqg: torch.Tensor = None,
         pair_chunk_size: int = 8,
         eps: float = 1e-6,
@@ -204,11 +212,13 @@ class EfficientOCFMatcherMixin:
         use_mixture = (
             torch.is_tensor(mixture_centers_world_tqg3)
             and torch.is_tensor(mixture_sigmas_world_tqg3)
-            and torch.is_tensor(mixture_yaw_tqg)
+            and torch.is_tensor(mixture_quat_tqg4)
             and torch.is_tensor(mixture_weights_tqg)
             and mixture_centers_world_tqg3.dim() == 4
             and tuple(mixture_centers_world_tqg3.shape) == tuple(mixture_sigmas_world_tqg3.shape)
-            and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_yaw_tqg.shape)
+            and mixture_quat_tqg4.dim() == 4
+            and int(mixture_quat_tqg4.shape[-1]) == 4
+            and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_quat_tqg4.shape[:3])
             and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_weights_tqg.shape)
             and int(mixture_centers_world_tqg3.shape[1]) == q_count
         )
@@ -217,17 +227,19 @@ class EfficientOCFMatcherMixin:
                 mixture_centers_world_tqg3=mixture_centers_world_tqg3[:t_count],
                 mixture_sigmas_world_tqg3=mixture_sigmas_world_tqg3[:t_count],
                 mixture_weights_tqg=mixture_weights_tqg[:t_count],
-                mixture_yaw_tqg=mixture_yaw_tqg[:t_count],
+                mixture_quat_tqg4=mixture_quat_tqg4[:t_count],
                 pair_chunk_size=int(max(1, pair_chunk_size)),
             )
         else:
             if (not torch.is_tensor(sigmas_world_tq3)) or tuple(sigmas_world_tq3.shape) != tuple(centers_world_tq3.shape):
                 return None, None
+            identity_quat = centers_world_tq3.new_zeros((t_count, q_count, 1, 4), dtype=torch.float32)
+            identity_quat[..., 0] = 1.0
             pred_bev_tqhw = self._rasterize_query_bev_iou_pred_tqhw(
                 mixture_centers_world_tqg3=centers_world_tq3[:t_count].unsqueeze(2),
                 mixture_sigmas_world_tqg3=sigmas_world_tq3[:t_count].unsqueeze(2),
                 mixture_weights_tqg=centers_world_tq3.new_ones((t_count, q_count, 1), dtype=torch.float32),
-                mixture_yaw_tqg=centers_world_tq3.new_zeros((t_count, q_count, 1), dtype=torch.float32),
+                mixture_quat_tqg4=identity_quat,
                 pair_chunk_size=int(max(1, pair_chunk_size)),
             )
 
@@ -481,7 +493,7 @@ class EfficientOCFMatcherMixin:
         query_sigmas_world_tq3: torch.Tensor = None,
         query_mixture_centers_world_tqg3: torch.Tensor = None,
         query_mixture_sigmas_world_tqg3: torch.Tensor = None,
-        query_mixture_yaw_tqg: torch.Tensor = None,
+        query_mixture_quat_tqg4: torch.Tensor = None,
         query_mixture_weights_tqg: torch.Tensor = None,
         gt_instance_occ3d_txyz: torch.Tensor = None,
         gt_inst_center_world_tn3: torch.Tensor = None,
@@ -708,10 +720,10 @@ class EfficientOCFMatcherMixin:
                     and int(query_mixture_sigmas_world_tqg3.shape[0]) == int(centers_world.shape[0])
                     else None
                 )
-                bev_mix_yaw_tqg = (
-                    query_mixture_yaw_tqg.index_select(0, frame_idx_t)
-                    if torch.is_tensor(query_mixture_yaw_tqg)
-                    and int(query_mixture_yaw_tqg.shape[0]) == int(centers_world.shape[0])
+                bev_mix_quat_tqg4 = (
+                    query_mixture_quat_tqg4.index_select(0, frame_idx_t)
+                    if torch.is_tensor(query_mixture_quat_tqg4)
+                    and int(query_mixture_quat_tqg4.shape[0]) == int(centers_world.shape[0])
                     else None
                 )
                 bev_mix_weights_tqg = (
@@ -727,7 +739,7 @@ class EfficientOCFMatcherMixin:
                 bev_sigmas_tq3 = query_sigmas_world_tq3
                 bev_mix_centers_tqg3 = query_mixture_centers_world_tqg3
                 bev_mix_sigmas_tqg3 = query_mixture_sigmas_world_tqg3
-                bev_mix_yaw_tqg = query_mixture_yaw_tqg
+                bev_mix_quat_tqg4 = query_mixture_quat_tqg4
                 bev_mix_weights_tqg = query_mixture_weights_tqg
             bev_iou_cost_qn, bev_iou_valid_qn = self._compute_query_gt_bev_iou_cost_qn(
                 centers_world_tq3=bev_centers_tq3,
@@ -737,7 +749,7 @@ class EfficientOCFMatcherMixin:
                 gt_valid_tn=bev_valid_tn,
                 mixture_centers_world_tqg3=bev_mix_centers_tqg3,
                 mixture_sigmas_world_tqg3=bev_mix_sigmas_tqg3,
-                mixture_yaw_tqg=bev_mix_yaw_tqg,
+                mixture_quat_tqg4=bev_mix_quat_tqg4,
                 mixture_weights_tqg=bev_mix_weights_tqg,
             )
             if (

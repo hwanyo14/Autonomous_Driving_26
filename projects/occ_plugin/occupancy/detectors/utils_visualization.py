@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import os
+from projects.occ_plugin.occupancy.dense_heads.voxelizer import quat_to_rotmat_wxyz
 
 
 class EfficientOCFVisualizationMixin:
@@ -1377,6 +1378,302 @@ class EfficientOCFVisualizationMixin:
             ),
         )
 
+    _QUERY_CLS_NAMES_8 = ("bg", "bicycle", "bus", "car", "constr_veh", "motorcycle", "trailer", "truck")
+
+    def maybe_save_query_mixture_3d_vis(
+        self,
+        query_vis_bundle=None,
+        gt_instance_occ3d_txyz=None,
+        gt_inst_center_world_tn3=None,
+        gt_inst_center_valid_tn=None,
+        gt_inst_cls_n=None,
+        img_metas=None,
+        step: int = 0,
+        occ_threshold: float = None,
+        frame_idx: int = None,
+        is_eval: bool = False,
+    ) -> None:
+        vis_every = int(getattr(self, "debug_query_mixture3d_vis_every", 0))
+        if vis_every <= 0:
+            return
+        if (int(step) % vis_every) != 0:
+            return
+        if (not self._is_main_process()) and (not getattr(self, "_eval_vis_all_ranks", False)):
+            return
+        if not isinstance(query_vis_bundle, dict):
+            return
+        if (not torch.is_tensor(gt_instance_occ3d_txyz)) or gt_instance_occ3d_txyz.dim() != 4:
+            return
+        sel_points_tq3 = query_vis_bundle.get("selected_points_tq3", None)
+        if (not torch.is_tensor(sel_points_tq3)) or sel_points_tq3.dim() != 3:
+            return
+        try:
+            import numpy as np
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            from matplotlib import cm
+        except Exception:
+            return
+
+        pc = [float(v) for v in self.point_cloud_range]
+        x_dim, y_dim, z_dim = [int(v) for v in gt_instance_occ3d_txyz.shape[1:4]]
+        vx = (pc[3] - pc[0]) / x_dim
+        vy = (pc[4] - pc[1]) / y_dim
+        vz = (pc[5] - pc[2]) / z_dim
+        t_present = max(0, int(getattr(self, "time_receptive_field", 3)) - 1)
+        if frame_idx is not None:
+            t_present = max(0, int(frame_idx))
+
+        t_occ = min(t_present, int(gt_instance_occ3d_txyz.shape[0]) - 1)
+        occ = gt_instance_occ3d_txyz[t_occ].detach()
+        occ_idx = torch.nonzero(occ > 0, as_tuple=False)
+        inst_ids = occ[occ_idx[:, 0], occ_idx[:, 1], occ_idx[:, 2]].to(torch.long)
+        max_pts = int(getattr(self, "debug_query_mixture3d_vis_max_gt_points", 40000))
+        if int(occ_idx.shape[0]) > max_pts:
+            stride = -(-int(occ_idx.shape[0]) // max_pts)
+            occ_idx = occ_idx[::stride]
+            inst_ids = inst_ids[::stride]
+        occ_xyz = occ_idx.to(torch.float32).cpu().numpy()
+        occ_xyz[:, 0] = pc[0] + (occ_xyz[:, 0] + 0.5) * vx
+        occ_xyz[:, 1] = pc[1] + (occ_xyz[:, 1] + 0.5) * vy
+        occ_xyz[:, 2] = pc[2] + (occ_xyz[:, 2] + 0.5) * vz
+
+        gt_centers = None
+        gt_cls = None
+        if torch.is_tensor(gt_inst_center_world_tn3) and gt_inst_center_world_tn3.dim() == 3:
+            t_gt = min(t_present, int(gt_inst_center_world_tn3.shape[0]) - 1)
+            centers_n3 = gt_inst_center_world_tn3[t_gt].detach()
+            valid_n = (
+                gt_inst_center_valid_tn[t_gt].detach().to(torch.bool)
+                if torch.is_tensor(gt_inst_center_valid_tn)
+                and gt_inst_center_valid_tn.dim() == 2
+                and int(gt_inst_center_valid_tn.shape[1]) == int(centers_n3.shape[0])
+                else torch.ones((int(centers_n3.shape[0]),), device=centers_n3.device, dtype=torch.bool)
+            )
+            gt_centers = centers_n3[valid_n].cpu().numpy()
+            if torch.is_tensor(gt_inst_cls_n) and int(gt_inst_cls_n.numel()) == int(centers_n3.shape[0]):
+                gt_cls = gt_inst_cls_n.detach().reshape(-1)[valid_n.cpu()].to(torch.long).cpu().numpy()
+
+        max_q = int(getattr(self, "debug_query_mixture3d_vis_max_queries", 50))
+        t_q = min(t_present, int(sel_points_tq3.shape[0]) - 1)
+        sel_pts = sel_points_tq3[t_q, :max_q].detach().cpu().numpy()
+        sel_cls = query_vis_bundle.get("selected_pred_cls_q", None)
+        sel_cls = (
+            sel_cls.detach()[:max_q].to(torch.long).cpu().numpy()
+            if torch.is_tensor(sel_cls) else np.zeros((sel_pts.shape[0],), dtype=np.int64)
+        )
+        sel_score = query_vis_bundle.get("selected_score_q", None)
+        sel_score = (
+            sel_score.detach()[:max_q].cpu().numpy()
+            if torch.is_tensor(sel_score) else np.zeros((sel_pts.shape[0],), dtype=np.float32)
+        )
+        sel_idx = query_vis_bundle.get("selected_query_idx_q", None)
+        matched_idx = query_vis_bundle.get("matched_query_idx_q", None)
+        matched_set = (
+            set(int(v) for v in matched_idx.detach().cpu().tolist())
+            if torch.is_tensor(matched_idx) else set()
+        )
+        sel_is_matched = np.array(
+            [int(v) in matched_set for v in sel_idx.detach()[:max_q].cpu().tolist()]
+            if torch.is_tensor(sel_idx) else [False] * sel_pts.shape[0],
+            dtype=bool,
+        )
+
+        mix_centers = query_vis_bundle.get("selected_mixture_centers_tqg3", None)
+        mix_sigmas = query_vis_bundle.get("selected_mixture_sigmas_tqg3", None)
+        mix_quat = query_vis_bundle.get("selected_mixture_quat_tqg4", None)
+        mix_weights = query_vis_bundle.get("selected_mixture_weights_tqg", None)
+        has_mixture = all(torch.is_tensor(v) for v in (mix_centers, mix_sigmas, mix_quat, mix_weights))
+        mc_t = ms_t = my_t = mw_t = None
+        if has_mixture:
+            t_m = min(t_present, int(mix_centers.shape[0]) - 1)
+            mc_t = mix_centers[t_m, :max_q].detach()
+            ms_t = mix_sigmas[t_m, :max_q].detach()
+            my_t = mix_quat[t_m, :max_q].detach()
+            mw_t = mix_weights[t_m, :max_q].detach()
+            mix_centers = mc_t.cpu().numpy()
+            mix_sigmas = ms_t.cpu().numpy()
+            mix_quat = my_t.cpu().numpy()
+            mix_weights = mw_t.cpu().numpy()
+
+        score_thr = float(os.environ.get("EOCF_EVAL_FG_THR", getattr(self, "debug_query_score_threshold", 0.5)))
+        keep = sel_score >= score_thr
+        n_before = int(sel_pts.shape[0])
+        sel_pts = sel_pts[keep]
+        sel_cls = sel_cls[keep]
+        sel_score = sel_score[keep]
+        sel_is_matched = sel_is_matched[keep]
+        if has_mixture:
+            keep_t = torch.as_tensor(keep, device=mc_t.device)
+            mc_t, ms_t, my_t, mw_t = mc_t[keep_t], ms_t[keep_t], my_t[keep_t], mw_t[keep_t]
+            mix_centers, mix_sigmas = mix_centers[keep], mix_sigmas[keep]
+            mix_quat, mix_weights = mix_quat[keep], mix_weights[keep]
+
+        def _cls_color(cls_id):
+            return cm.tab10((int(cls_id) % 10) / 9.0)
+
+        def _cls_name(cls_id):
+            cls_id = int(cls_id)
+            if 0 <= cls_id < len(self._QUERY_CLS_NAMES_8):
+                return self._QUERY_CLS_NAMES_8[cls_id]
+            return f"c{cls_id}"
+
+        def _ellipsoid_wire(center, sigma, quat):
+            u = np.linspace(0.0, 2.0 * np.pi, 13)
+            v = np.linspace(0.0, np.pi, 7)
+            xs = np.outer(np.cos(u), np.sin(v)) * sigma[0]
+            ys = np.outer(np.sin(u), np.sin(v)) * sigma[1]
+            zs = np.outer(np.ones_like(u), np.cos(v)) * sigma[2]
+            pts = torch.as_tensor(
+                np.stack([xs, ys, zs], axis=-1),
+                dtype=torch.float32,
+            )
+            rot = quat_to_rotmat_wxyz(torch.as_tensor(quat, dtype=torch.float32)).cpu().numpy()
+            out = np.einsum("...j,ij->...i", pts.cpu().numpy(), rot) + np.asarray(center, dtype=np.float32)
+            return out[..., 0], out[..., 1], out[..., 2]
+
+        occ_thr = (
+            float(occ_threshold)
+            if occ_threshold is not None
+            else float(getattr(self, "eval_occ_threshold", 0.5))
+        )
+        if is_eval:
+            mvox = (getattr(self, "mixture3d_eval_voxelizer", None)
+                    or getattr(self, "voxelizer", None)
+                    or getattr(self, "matched_gmo_voxelizer", None))
+        else:
+            mvox = getattr(self, "matched_gmo_voxelizer", None) or getattr(self, "voxelizer", None)
+        W2, H2, D2 = (int(mvox.W), int(mvox.H), int(mvox.D)) if mvox is not None else (0, 0, 0)
+        gmm_vs = (
+            (float(mvox.vs[0]), float(mvox.vs[1]), float(mvox.vs[2]))
+            if mvox is not None else (vx, vy, vz)
+        )
+        gmm_occ = np.zeros((W2, H2, D2), dtype=bool)
+        gmm_col = np.zeros((W2, H2, D2, 4), dtype=np.float32)
+        if (
+            has_mixture and sel_pts.shape[0] > 0 and mvox is not None
+            and hasattr(mvox, "forward_gaussian_mixture_grouped")
+        ):
+            for q_i in range(int(mc_t.shape[0])):
+                try:
+                    occ_q = mvox.forward_gaussian_mixture_grouped(
+                        mixture_centers_world_tkg3=mc_t[q_i][None, None],
+                        mixture_sigmas_world_tkg3=ms_t[q_i][None, None],
+                        mixture_weights_tkg=mw_t[q_i][None, None],
+                        mixture_quat_tkg4=my_t[q_i][None, None],
+                    )
+                except Exception:
+                    continue
+                vidx = torch.nonzero(occ_q[0, 0, 0] >= occ_thr, as_tuple=False).cpu().numpy()
+                if vidx.shape[0] == 0:
+                    continue
+                zz, yy, xx = vidx[:, 0], vidx[:, 1], vidx[:, 2]
+                gmm_occ[xx, yy, zz] = True
+                gmm_col[xx, yy, zz] = np.asarray(_cls_color(sel_cls[q_i]), dtype=np.float32)
+
+        views = (
+            ("oblique true-z", 35.0, -60.0, 0.078),
+            ("low side true-z", 8.0, -90.0, 0.078),
+        )
+        n_views = len(views)
+
+        def _finalize(ax, title, elev, azim, z_aspect):
+            ax.set_xlim(pc[0], pc[3])
+            ax.set_ylim(pc[4], pc[1])
+            ax.set_zlim(pc[2], pc[5])
+            ax.set_box_aspect((1.0, 1.0, float(z_aspect)))
+            ax.view_init(elev=elev, azim=azim)
+            ax.set_title(title, fontsize=9)
+
+        try:
+            fig = plt.figure(figsize=(9 * n_views, 18))
+            center_size = 45
+            for view_i, (view_name, elev, azim, z_aspect) in enumerate(views):
+                ax = fig.add_subplot(2, n_views, view_i + 1, projection="3d")
+                if occ_xyz.shape[0] > 0:
+                    ax.scatter(
+                        occ_xyz[:, 0], occ_xyz[:, 1], occ_xyz[:, 2],
+                        c="0.6", s=1.5, alpha=0.32, linewidths=0,
+                    )
+                if gt_centers is not None and gt_centers.shape[0] > 0:
+                    ax.scatter(
+                        gt_centers[:, 0], gt_centers[:, 1], gt_centers[:, 2],
+                        marker="o", c="lime", s=center_size, edgecolors="black",
+                        linewidths=0.8, depthshade=False, zorder=25,
+                    )
+                    if gt_cls is not None and view_i == 0:
+                        for n_i in range(gt_centers.shape[0]):
+                            ax.text(
+                                gt_centers[n_i, 0], gt_centers[n_i, 1], gt_centers[n_i, 2] + 0.5,
+                                _cls_name(gt_cls[n_i]), color="lime", fontsize=6,
+                            )
+                for q_i in range(sel_pts.shape[0]):
+                    q_color = _cls_color(sel_cls[q_i])
+                    ax.scatter(
+                        sel_pts[q_i, 0], sel_pts[q_i, 1], sel_pts[q_i, 2],
+                        c="black", s=center_size, marker="o",
+                        edgecolors="none", linewidths=0, depthshade=False, zorder=25,
+                    )
+                    if has_mixture:
+                        w_g = mix_weights[q_i]
+                        ax.scatter(
+                            mix_centers[q_i, :, 0], mix_centers[q_i, :, 1], mix_centers[q_i, :, 2],
+                            c=[q_color], s=3.0 + 18.0 * (w_g / max(float(w_g.max()), 1e-6)),
+                            alpha=0.5, linewidths=0,
+                        )
+                        for g_i in np.argsort(-w_g)[:6]:
+                            ex, ey, ez = _ellipsoid_wire(
+                                mix_centers[q_i, g_i], mix_sigmas[q_i, g_i], mix_quat[q_i, g_i]
+                            )
+                            ax.plot_wireframe(ex, ey, ez, color=q_color, linewidth=0.4, alpha=0.45)
+                _finalize(ax, f"{view_name} 1sigma | iter {int(step)} t={t_occ}", elev, azim, z_aspect)
+
+                ax2 = fig.add_subplot(2, n_views, view_i + 1 + n_views, projection="3d")
+                if occ_xyz.shape[0] > 0:
+                    ax2.scatter(
+                        occ_xyz[:, 0], occ_xyz[:, 1], occ_xyz[:, 2],
+                        c="0.4", s=1.7, alpha=0.45, linewidths=0,
+                    )
+                if gmm_occ.any():
+                    nz = np.argwhere(gmm_occ)
+                    x0, y0, z0 = nz.min(0)
+                    x1, y1, z1 = nz.max(0)
+                    sub = gmm_occ[x0:x1 + 1, y0:y1 + 1, z0:z1 + 1]
+                    fc = gmm_col[x0:x1 + 1, y0:y1 + 1, z0:z1 + 1].copy()
+                    fc[..., 3] = 0.85
+                    ex = pc[0] + (x0 + np.arange(sub.shape[0] + 1)) * gmm_vs[0]
+                    ey = pc[1] + (y0 + np.arange(sub.shape[1] + 1)) * gmm_vs[1]
+                    ez = pc[2] + (z0 + np.arange(sub.shape[2] + 1)) * gmm_vs[2]
+                    gx, gy, gz = np.meshgrid(ex, ey, ez, indexing="ij")
+                    ax2.voxels(gx, gy, gz, sub, facecolors=fc,
+                               edgecolors=(0.15, 0.15, 0.15, 0.25), linewidth=0.2)
+                for q_i in range(sel_pts.shape[0]):
+                    ax2.scatter(
+                        sel_pts[q_i, 0], sel_pts[q_i, 1], sel_pts[q_i, 2],
+                        marker="o", c="black", s=center_size,
+                        edgecolors="none", linewidths=0, depthshade=False, zorder=25,
+                    )
+                _finalize(ax2, f"{view_name} pred occ>={occ_thr:g} cubes {W2}x{H2}x{D2}@{gmm_vs[0]:.1f}m "
+                               f"| iter {int(step)} t={t_occ}", elev, azim, z_aspect)
+            fig.suptitle(
+                f"score>={score_thr:g}: selected={sel_pts.shape[0]}/{n_before} "
+                f"matched(sel)={int(sel_is_matched.sum())} "
+                f"gt_inst={0 if gt_centers is None else gt_centers.shape[0]} | "
+                f"top=1sigma ellipsoid, bottom=pred occ>={occ_thr:g} cubes ({W2}x{H2}x{D2}, {gmm_vs[0]:.1f}m)",
+                fontsize=11,
+            )
+            vis_dir = str(getattr(self, "debug_query_mixture3d_vis_dir", "./work_dirs/query_mixture3d_vis"))
+            os.makedirs(vis_dir, exist_ok=True)
+            fig.savefig(
+                os.path.join(vis_dir, f"iter_{int(step):06d}.png"),
+                dpi=120, bbox_inches="tight",
+            )
+        except Exception as exc:
+            print(f"[query_mixture3d_vis] render failed at iter {int(step)}: {exc}")
+        finally:
+            plt.close("all")
+
     def _build_query_visualization_bundle(
         self,
         centers_world_tq3: torch.Tensor,
@@ -1389,7 +1686,7 @@ class EfficientOCFVisualizationMixin:
         gaussian_sigmas_world_tq3: torch.Tensor = None,
         mixture_centers_world_tqg3: torch.Tensor = None,
         mixture_sigmas_world_tqg3: torch.Tensor = None,
-        mixture_yaw_tqg: torch.Tensor = None,
+        mixture_quat_tqg4: torch.Tensor = None,
         mixture_weights_tqg: torch.Tensor = None,
         traj_mode_idx_q: torch.Tensor = None,
         query_attn_cam_score_pack: dict = None,
@@ -1412,11 +1709,13 @@ class EfficientOCFVisualizationMixin:
         has_mixture = (
             torch.is_tensor(mixture_centers_world_tqg3)
             and torch.is_tensor(mixture_sigmas_world_tqg3)
-            and torch.is_tensor(mixture_yaw_tqg)
+            and torch.is_tensor(mixture_quat_tqg4)
             and torch.is_tensor(mixture_weights_tqg)
             and mixture_centers_world_tqg3.dim() == 4
             and tuple(mixture_centers_world_tqg3.shape) == tuple(mixture_sigmas_world_tqg3.shape)
-            and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_yaw_tqg.shape)
+            and mixture_quat_tqg4.dim() == 4
+            and int(mixture_quat_tqg4.shape[-1]) == 4
+            and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_quat_tqg4.shape[:3])
             and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_weights_tqg.shape)
             and int(mixture_centers_world_tqg3.shape[1]) == q_count
         )
@@ -1447,8 +1746,8 @@ class EfficientOCFVisualizationMixin:
             if has_mixture
             else None
         )
-        score_mix_yaw_tqg = (
-            mixture_yaw_tqg[:score_frame_count].contiguous()
+        score_mix_quat_tqg4 = (
+            mixture_quat_tqg4[:score_frame_count].contiguous()
             if has_mixture
             else None
         )
@@ -1470,7 +1769,7 @@ class EfficientOCFVisualizationMixin:
                 sigmas_world_tq3=score_sigmas_tq3,
                 mixture_centers_world_tqg3=score_mix_centers_tqg3,
                 mixture_sigmas_world_tqg3=score_mix_sigmas_tqg3,
-                mixture_yaw_tqg=score_mix_yaw_tqg,
+                mixture_quat_tqg4=score_mix_quat_tqg4,
                 mixture_weights_tqg=score_mix_weights_tqg,
                 gt_instance_occ3d_txyz_pred=score_gt_occ_txyz,
                 inst_match_result=inst_match_result,
@@ -1517,7 +1816,8 @@ class EfficientOCFVisualizationMixin:
         selected_candidate_idx = torch.nonzero(fg_mask_q, as_tuple=False).squeeze(1)
         if int(selected_candidate_idx.numel()) > 0:
             candidate_scores = score_q.index_select(0, selected_candidate_idx)
-            keep_thr = candidate_scores >= float(self.debug_query_score_threshold)
+            _fg_thr = float(os.environ.get("EOCF_EVAL_FG_THR", self.debug_query_score_threshold))
+            keep_thr = candidate_scores >= _fg_thr
             selected_candidate_idx = selected_candidate_idx[keep_thr]
 
         if int(selected_candidate_idx.numel()) > 0 and int(self.debug_query_score_topk) > 0:
@@ -1571,7 +1871,7 @@ class EfficientOCFVisualizationMixin:
             if (has_mixture and int(candidate_idx.numel()) > 0) else None
         )
         candidate_mix_yaw = (
-            mixture_yaw_tqg.index_select(1, candidate_idx)
+            mixture_quat_tqg4.index_select(1, candidate_idx)
             if (has_mixture and int(candidate_idx.numel()) > 0) else None
         )
         candidate_mix_weights = (
@@ -1598,7 +1898,7 @@ class EfficientOCFVisualizationMixin:
             if (has_mixture and int(selected_idx.numel()) > 0) else None
         )
         selected_mix_yaw = (
-            mixture_yaw_tqg.index_select(1, selected_idx)
+            mixture_quat_tqg4.index_select(1, selected_idx)
             if (has_mixture and int(selected_idx.numel()) > 0) else None
         )
         selected_mix_weights = (
@@ -1673,7 +1973,7 @@ class EfficientOCFVisualizationMixin:
             if (has_mixture and int(matched_idx.numel()) > 0) else None
         )
         matched_mix_yaw = (
-            mixture_yaw_tqg.index_select(1, matched_idx)
+            mixture_quat_tqg4.index_select(1, matched_idx)
             if (has_mixture and int(matched_idx.numel()) > 0) else None
         )
         matched_mix_weights = (
@@ -1758,15 +2058,15 @@ class EfficientOCFVisualizationMixin:
             "gaussian_sigmas_tq3": gaussian_sigmas_world_tq3.detach() if has_surrogate_sigma else None,
             "candidate_mixture_centers_tqg3": candidate_mix_centers.detach() if candidate_mix_centers is not None else None,
             "candidate_mixture_sigmas_tqg3": candidate_mix_sigmas.detach() if candidate_mix_sigmas is not None else None,
-            "candidate_mixture_yaw_tqg": candidate_mix_yaw.detach() if candidate_mix_yaw is not None else None,
+            "candidate_mixture_quat_tqg4": candidate_mix_yaw.detach() if candidate_mix_yaw is not None else None,
             "candidate_mixture_weights_tqg": candidate_mix_weights.detach() if candidate_mix_weights is not None else None,
             "selected_mixture_centers_tqg3": selected_mix_centers.detach() if selected_mix_centers is not None else None,
             "selected_mixture_sigmas_tqg3": selected_mix_sigmas.detach() if selected_mix_sigmas is not None else None,
-            "selected_mixture_yaw_tqg": selected_mix_yaw.detach() if selected_mix_yaw is not None else None,
+            "selected_mixture_quat_tqg4": selected_mix_yaw.detach() if selected_mix_yaw is not None else None,
             "selected_mixture_weights_tqg": selected_mix_weights.detach() if selected_mix_weights is not None else None,
             "matched_mixture_centers_tqg3": matched_mix_centers.detach() if matched_mix_centers is not None else None,
             "matched_mixture_sigmas_tqg3": matched_mix_sigmas.detach() if matched_mix_sigmas is not None else None,
-            "matched_mixture_yaw_tqg": matched_mix_yaw.detach() if matched_mix_yaw is not None else None,
+            "matched_mixture_quat_tqg4": matched_mix_yaw.detach() if matched_mix_yaw is not None else None,
             "matched_mixture_weights_tqg": matched_mix_weights.detach() if matched_mix_weights is not None else None,
             "traj_mode_idx_q": traj_mode_idx_q.detach() if torch.is_tensor(traj_mode_idx_q) else None,
             "top_k": int(self.debug_query_score_topk),

@@ -9,7 +9,11 @@ from mmdet.models import DETECTORS
 from .bevdepth import BEVDepth
 from projects.occ_plugin.occupancy.image2bev.transformer import TransformerModule
 from projects.occ_plugin.occupancy.dense_heads.query_head import QueryHead
-from projects.occ_plugin.occupancy.dense_heads.voxelizer import SoftVoxelizerOneAdd
+from projects.occ_plugin.occupancy.dense_heads.voxelizer import (
+    SoftVoxelizerOneAdd,
+    quat_to_rotmat_wxyz,
+    rotmat_to_quat_wxyz,
+)
 
 from .utils_visualization import EfficientOCFVisualizationMixin
 from .utils_dbg import EfficientOCFDebugMixin
@@ -205,7 +209,8 @@ class EfficientOCF(
             voxel_size=0.2,
             occ_size=(512, 512, 40),
             as_prob=True,
-            lambda_occ=1.0
+            lambda_occ=1.0,
+            gaussian_combine_mode=self.query_multi_gaussian_occ_combine_mode,
         )
         low_x, low_y, low_z = self.query_matched_gmo_bce_occ_size
         range_x = float(self.point_cloud_range[3] - self.point_cloud_range[0])
@@ -219,6 +224,18 @@ class EfficientOCF(
             lambda_occ=1.0,
             gaussian_truncate_sigma=float(self.voxelizer.gaussian_truncate_sigma),
             gaussian_sigma_floor_vox=float(self.voxelizer.gaussian_sigma_floor_vox),
+            gaussian_combine_mode=self.query_multi_gaussian_occ_combine_mode,
+        )
+        ev_x, ev_y, ev_z = self.debug_query_mixture3d_vis_eval_occ_size
+        self.mixture3d_eval_voxelizer = SoftVoxelizerOneAdd(
+            point_cloud_range=point_cloud_range,
+            voxel_size=(range_x / float(ev_x), range_y / float(ev_y), range_z / float(ev_z)),
+            occ_size=(ev_x, ev_y, ev_z),
+            as_prob=True,
+            lambda_occ=1.0,
+            gaussian_truncate_sigma=float(self.voxelizer.gaussian_truncate_sigma),
+            gaussian_sigma_floor_vox=0.0,
+            gaussian_combine_mode=self.query_multi_gaussian_occ_combine_mode,
         )
 
         self.n_cam = 6
@@ -550,7 +567,7 @@ class EfficientOCF(
         present_sigmas_world_tq3: torch.Tensor = None,
         present_mix_centers_world_tqg3: torch.Tensor = None,
         present_mix_sigmas_world_tqg3: torch.Tensor = None,
-        present_mix_yaw_tqg: torch.Tensor = None,
+        present_mix_quat_tqg4: torch.Tensor = None,
         present_mix_weights_tqg: torch.Tensor = None,
         traj_offsets_fq2: torch.Tensor = None,
         future_egomotion: torch.Tensor = None,
@@ -566,7 +583,7 @@ class EfficientOCF(
             "sigmas_world_tq3": present_sigmas_world_tq3,
             "mix_centers_world_tqg3": present_mix_centers_world_tqg3,
             "mix_sigmas_world_tqg3": present_mix_sigmas_world_tqg3,
-            "mix_yaw_tqg": present_mix_yaw_tqg,
+            "mix_quat_tqg4": present_mix_quat_tqg4,
             "mix_weights_tqg": present_mix_weights_tqg,
             "traj_offsets_fq2": traj_offsets_fq2,
             "traj_frame_indices_t": None,
@@ -614,15 +631,16 @@ class EfficientOCF(
         mix_enabled = (
             torch.is_tensor(present_mix_centers_world_tqg3)
             and torch.is_tensor(present_mix_sigmas_world_tqg3)
-            and torch.is_tensor(present_mix_yaw_tqg)
+            and torch.is_tensor(present_mix_quat_tqg4)
             and torch.is_tensor(present_mix_weights_tqg)
             and present_mix_centers_world_tqg3.dim() == 4
             and present_mix_sigmas_world_tqg3.dim() == 4
-            and present_mix_yaw_tqg.dim() == 3
+            and present_mix_quat_tqg4.dim() == 4
+            and int(present_mix_quat_tqg4.shape[-1]) == 4
             and present_mix_weights_tqg.dim() == 3
             and int(present_mix_centers_world_tqg3.shape[0]) == 1
             and tuple(present_mix_centers_world_tqg3.shape) == tuple(present_mix_sigmas_world_tqg3.shape)
-            and tuple(present_mix_centers_world_tqg3.shape[:3]) == tuple(present_mix_yaw_tqg.shape)
+            and tuple(present_mix_centers_world_tqg3.shape[:3]) == tuple(present_mix_quat_tqg4.shape[:3])
             and tuple(present_mix_centers_world_tqg3.shape[:3]) == tuple(present_mix_weights_tqg.shape)
         )
         if mix_enabled:
@@ -689,11 +707,11 @@ class EfficientOCF(
             out["mix_sigmas_world_tqg3"] = sigma_present_qg3.unsqueeze(0).expand(
                 int(centers_world_traj_tq3.shape[0]), -1, -1, -1
             ).contiguous()
-            out["mix_yaw_tqg"] = present_mix_yaw_tqg[0].to(
+            out["mix_quat_tqg4"] = present_mix_quat_tqg4[0].to(
                 device=present_centers_world_tq3.device,
-                dtype=present_mix_yaw_tqg.dtype,
+                dtype=present_mix_quat_tqg4.dtype,
             ).unsqueeze(0).expand(
-                int(centers_world_traj_tq3.shape[0]), -1, -1
+                int(centers_world_traj_tq3.shape[0]), -1, -1, -1
             ).contiguous()
             out["mix_weights_tqg"] = weight_present_qg.unsqueeze(0).expand(
                 int(centers_world_traj_tq3.shape[0]), -1, -1
@@ -708,7 +726,7 @@ class EfficientOCF(
         gaussian_sigmas_world_tq3: torch.Tensor = None,
         mixture_centers_world_tqg3: torch.Tensor = None,
         mixture_sigmas_world_tqg3: torch.Tensor = None,
-        mixture_yaw_tqg: torch.Tensor = None,
+        mixture_quat_tqg4: torch.Tensor = None,
         mixture_weights_tqg: torch.Tensor = None,
     ):
         out = {
@@ -716,7 +734,7 @@ class EfficientOCF(
             "gaussian_sigmas_world_tq3": gaussian_sigmas_world_tq3,
             "mixture_centers_world_tqg3": mixture_centers_world_tqg3,
             "mixture_sigmas_world_tqg3": mixture_sigmas_world_tqg3,
-            "mixture_yaw_tqg": mixture_yaw_tqg,
+            "mixture_quat_tqg4": mixture_quat_tqg4,
             "mixture_weights_tqg": mixture_weights_tqg,
         }
         if (
@@ -738,11 +756,13 @@ class EfficientOCF(
         mix_enabled = (
             torch.is_tensor(mixture_centers_world_tqg3)
             and torch.is_tensor(mixture_sigmas_world_tqg3)
-            and torch.is_tensor(mixture_yaw_tqg)
+            and torch.is_tensor(mixture_quat_tqg4)
             and torch.is_tensor(mixture_weights_tqg)
             and mixture_centers_world_tqg3.dim() == 4
             and tuple(mixture_centers_world_tqg3.shape) == tuple(mixture_sigmas_world_tqg3.shape)
-            and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_yaw_tqg.shape)
+            and mixture_quat_tqg4.dim() == 4
+            and int(mixture_quat_tqg4.shape[-1]) == 4
+            and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_quat_tqg4.shape[:3])
             and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_weights_tqg.shape)
         )
         if not mix_enabled:
@@ -779,22 +799,20 @@ class EfficientOCF(
             present_global_idx=present_global_idx,
         )
 
-        yaw_aligned = []
-        yaw_src_tqg = mixture_yaw_tqg.to(torch.float32)
+        quat_aligned = []
+        rot_src_tqg33 = quat_to_rotmat_wxyz(mixture_quat_tqg4.to(torch.float32))
         for step in range(t_count):
-            yaw_delta = self._yaw_delta_from_transform_xy(
-                lidar_target_to_present[step].to(
-                    device=centers_world_tq3.device, dtype=torch.float32
-                )
+            rot_delta = lidar_target_to_present[step].to(
+                device=centers_world_tq3.device, dtype=torch.float32
+            )[:3, :3]
+            rot_step_qg33 = torch.matmul(
+                rot_delta.view(1, 1, 3, 3),
+                rot_src_tqg33[step],
             )
-            yaw_step_qg = torch.atan2(
-                torch.sin(yaw_src_tqg[step] + yaw_delta),
-                torch.cos(yaw_src_tqg[step] + yaw_delta),
-            )
-            yaw_aligned.append(yaw_step_qg)
-        out["mixture_yaw_tqg"] = torch.stack(yaw_aligned, dim=0).to(
-            device=mixture_yaw_tqg.device,
-            dtype=mixture_yaw_tqg.dtype,
+            quat_aligned.append(rotmat_to_quat_wxyz(rot_step_qg33))
+        out["mixture_quat_tqg4"] = torch.stack(quat_aligned, dim=0).to(
+            device=mixture_quat_tqg4.device,
+            dtype=mixture_quat_tqg4.dtype,
         ).contiguous()
         return out
 
@@ -980,7 +998,7 @@ class EfficientOCF(
         gaussian_sigmas_world = None
         mixture_centers_world_tqg3 = query_head_outputs["mixture_centers_world_tqg3"]
         mixture_sigmas_world_tqg3 = query_head_outputs["mixture_sigmas_world_tqg3"]
-        mixture_yaw_tqg = query_head_outputs["mixture_yaw_tqg"]
+        mixture_quat_tqg4 = query_head_outputs["mixture_quat_tqg4"]
         mixture_weights_tqg = query_head_outputs["mixture_weights_tqg"]
         query_present_local_idx = int(query_head_outputs.get("query_present_local_idx", 0))
         if int(centers_world.shape[0]) > 0:
@@ -1008,11 +1026,11 @@ class EfficientOCF(
             and int(mixture_sigmas_world_tqg3.shape[0]) > query_present_local_idx
             else None
         )
-        present_mix_yaw_tqg = (
-            mixture_yaw_tqg.narrow(0, query_present_local_idx, 1).contiguous()
-            if torch.is_tensor(mixture_yaw_tqg)
-            and mixture_yaw_tqg.dim() == 3
-            and int(mixture_yaw_tqg.shape[0]) > query_present_local_idx
+        present_mix_quat_tqg4 = (
+            mixture_quat_tqg4.narrow(0, query_present_local_idx, 1).contiguous()
+            if torch.is_tensor(mixture_quat_tqg4)
+            and mixture_quat_tqg4.dim() == 4
+            and int(mixture_quat_tqg4.shape[0]) > query_present_local_idx
             else None
         )
         present_mix_weights_tqg = (
@@ -1027,7 +1045,7 @@ class EfficientOCF(
             present_sigmas_world_tq3=None,
             present_mix_centers_world_tqg3=present_mix_centers_world_tqg3,
             present_mix_sigmas_world_tqg3=present_mix_sigmas_world_tqg3,
-            present_mix_yaw_tqg=present_mix_yaw_tqg,
+            present_mix_quat_tqg4=present_mix_quat_tqg4,
             present_mix_weights_tqg=present_mix_weights_tqg,
             traj_offsets_fq2=traj_offsets_fq2,
             future_egomotion=future_egomotion,
@@ -1052,9 +1070,9 @@ class EfficientOCF(
         mixture_sigmas_world_traj_tqg3 = traj_geom_pack.get("mix_sigmas_world_tqg3", None)
         if not torch.is_tensor(mixture_sigmas_world_traj_tqg3):
             mixture_sigmas_world_traj_tqg3 = mixture_sigmas_world_tqg3
-        mixture_yaw_traj_tqg = traj_geom_pack.get("mix_yaw_tqg", None)
+        mixture_yaw_traj_tqg = traj_geom_pack.get("mix_quat_tqg4", None)
         if not torch.is_tensor(mixture_yaw_traj_tqg):
-            mixture_yaw_traj_tqg = mixture_yaw_tqg
+            mixture_yaw_traj_tqg = mixture_quat_tqg4
         mixture_weights_traj_tqg = traj_geom_pack.get("mix_weights_tqg", None)
         if not torch.is_tensor(mixture_weights_traj_tqg):
             mixture_weights_traj_tqg = mixture_weights_tqg
@@ -1066,14 +1084,14 @@ class EfficientOCF(
                 if (
                     torch.is_tensor(present_mix_centers_world_tqg3)
                     and torch.is_tensor(present_mix_sigmas_world_tqg3)
-                    and torch.is_tensor(present_mix_yaw_tqg)
+                    and torch.is_tensor(present_mix_quat_tqg4)
                     and torch.is_tensor(present_mix_weights_tqg)
                 ):
                     pred_occ_q = self.voxelizer.forward_gaussian_mixture_grouped(
                         mixture_centers_world_tkg3=present_mix_centers_world_tqg3,
                         mixture_sigmas_world_tkg3=present_mix_sigmas_world_tqg3,
                         mixture_weights_tkg=present_mix_weights_tqg,
-                        mixture_yaw_tkg=present_mix_yaw_tqg,
+                        mixture_quat_tkg4=present_mix_quat_tqg4,
                         pair_weights_tk=None,
                         pair_chunk_size=int(self.query_multi_gaussian_pair_chunk),
                     ).to(torch.float32)
@@ -1102,7 +1120,7 @@ class EfficientOCF(
             query_present_local_idx,
             mixture_centers_world_tqg3,
             mixture_sigmas_world_tqg3,
-            mixture_yaw_tqg,
+            mixture_quat_tqg4,
             mixture_weights_tqg,
             gaussian_sigmas_world_traj_tq3,
             mixture_centers_world_traj_tqg3,
@@ -1111,6 +1129,702 @@ class EfficientOCF(
             mixture_weights_traj_tqg,
             traj_motion_input_tqd2,
         )
+
+
+    def _maybe_save_eval_query_vis(self, pred_occ_prob, gt_inst, centers_world,
+                                   present_idx, cls_scores_qc, bundle, prob_threshold,
+                                   img_metas=None, img_inputs_seq=None,
+                                   future_egomotion=None, instance_img_debug_bundle=None,
+                                   eval_mode="future", centers_future_tq3=None,
+                                   pred_occ_future=None, mix_future=None):
+        import os
+        if os.environ.get("EOCF_EVAL_VIS", "0") != "1":
+            return
+        try:
+            from mmcv.runner import get_dist_info
+            step_local = int(getattr(self, "_eval_vis_step", 0))
+            self._eval_vis_step = step_local + 1
+            every = max(1, int(os.environ.get("EOCF_EVAL_VIS_EVERY", "50")))
+            if (step_local % every) != 0:
+                return
+            head = getattr(self, "query_head", None)
+            if head is None or not hasattr(head, "maybe_save_query_debug_vis"):
+                return
+            vis_dir = os.environ.get("EOCF_EVAL_VIS_DIR", "./work_dirs/eval_vis")
+            os.makedirs(vis_dir, exist_ok=True)
+            qdv_dir = os.path.join(vis_dir, "query_debug_vis")
+            os.makedirs(qdv_dir, exist_ok=True)
+            head.debug_vis_dir = qdv_dir
+            head.debug_vis_every = 1
+            head._eval_vis_all_ranks = True
+            self._eval_vis_all_ranks = True
+            rank, _ = get_dist_info()
+            step = int(rank) * 1000000 + step_local
+            global_idx = self._extract_eval_global_idx(img_metas)
+            if global_idx is not None:
+                step = int(global_idx)
+            pres = int(present_idx)
+            conf = (1.0 - cls_scores_qc[:, int(self.query_bg_class)]).clamp(0.0, 1.0).detach()
+            cls_ids = torch.argmax(cls_scores_qc, dim=-1).detach()
+            if str(eval_mode).lower() != "present" and torch.is_tensor(centers_future_tq3) \
+                    and centers_future_tq3.dim() == 3:
+                pts = centers_future_tq3.detach()
+                pred_vis = pred_occ_future.detach() if torch.is_tensor(pred_occ_future) else None
+                gt_vis = self._eval_future_tail(gt_inst).detach() if torch.is_tensor(gt_inst) else None
+                conf_seq = conf.unsqueeze(0).expand(int(pts.shape[0]), -1).contiguous()
+                cls_seq = cls_ids.unsqueeze(0).expand(int(pts.shape[0]), -1).contiguous()
+                vis_max_frames = int(pts.shape[0])
+            else:
+                pts = centers_world[pres:pres + 1].detach()
+                pred_vis = pred_occ_prob.detach() if torch.is_tensor(pred_occ_prob) else None
+                gt_vis = gt_inst.detach() if torch.is_tensor(gt_inst) else None
+                conf_seq = conf.unsqueeze(0)
+                cls_seq = cls_ids.unsqueeze(0)
+                vis_max_frames = 1
+            vis_bundle = dict(bundle) if isinstance(bundle, dict) else None
+            if isinstance(vis_bundle, dict):
+                vis_bundle["_skip_traj_rows"] = True
+                if global_idx is not None:
+                    vis_bundle["_filename_prefix"] = "sample"
+            if str(eval_mode).lower() != "present" and vis_max_frames > 1 and isinstance(vis_bundle, dict):
+                bundle_2d = self._build_eval_future_2d_bundle(vis_bundle, pts, mix_future, conf, cls_ids)
+            else:
+                bundle_2d = vis_bundle
+            head.maybe_save_query_debug_vis(
+                pred_occ_prob=pred_vis,
+                gt_occ=None,
+                gt_occ_inst=gt_vis,
+                gt_occ_semantic=None,
+                ignore_index=255,
+                points_world=pts,
+                step=step,
+                max_frames=vis_max_frames,
+                voxel_center_offset=0.5,
+                prob_threshold=float(prob_threshold),
+                pred_layout="zyx",
+                pred_occ_prob_all_obj=pred_vis,
+                points_world_all=pts,
+                point_conf_all=conf_seq,
+                point_class_ids_all=cls_seq,
+                query_vis_bundle=bundle_2d,
+            )
+            if torch.is_tensor(gt_inst) and isinstance(vis_bundle, dict) and hasattr(self, "maybe_save_query_mixture_3d_vis"):
+                m3d_dir = os.path.join(vis_dir, "query_mixture3d_vis")
+                os.makedirs(m3d_dir, exist_ok=True)
+                self.debug_query_mixture3d_vis_dir = m3d_dir
+                self.debug_query_mixture3d_vis_every = 1
+                self._eval_vis_all_ranks = True
+                if str(eval_mode).lower() != "present" and isinstance(bundle_2d, dict) \
+                        and torch.is_tensor(bundle_2d.get("selected_points_tq3", None)):
+                    self.maybe_save_query_mixture_3d_vis(
+                        query_vis_bundle=bundle_2d,
+                        gt_instance_occ3d_txyz=self._eval_future_tail(gt_inst).detach(),
+                        img_metas=img_metas, step=step,
+                        occ_threshold=float(prob_threshold), frame_idx=1,
+                        is_eval=True,
+                    )
+                else:
+                    self.maybe_save_query_mixture_3d_vis(
+                        query_vis_bundle=vis_bundle,
+                        gt_instance_occ3d_txyz=gt_inst.detach(),
+                        img_metas=img_metas, step=step,
+                        occ_threshold=float(prob_threshold),
+                        is_eval=True,
+                    )
+            gt_inst_d = gt_inst.detach() if torch.is_tensor(gt_inst) else None
+            if isinstance(instance_img_debug_bundle, dict) and isinstance(vis_bundle, dict):
+                self.debug_query_cam_gaussian_vis_dir = os.path.join(vis_dir, "query_cam_gaussian_vis")
+                os.makedirs(self.debug_query_cam_gaussian_vis_dir, exist_ok=True)
+                self.debug_query_cam_gaussian_vis_enabled = True
+                self.debug_query_cam_gaussian_vis_every = 1
+                self.maybe_save_query_cam_gaussian_vis(
+                    debug_bundle=instance_img_debug_bundle,
+                    query_vis_bundle=vis_bundle,
+                    future_egomotion=future_egomotion,
+                    step=step,
+                    gt_segmentation_instance3d=gt_inst_d,
+                )
+        except Exception as e:
+            print(f"[eval_vis] skipped (err={e})", flush=True)
+
+    @staticmethod
+    def _extract_eval_global_idx(img_metas):
+        if img_metas is None:
+            return None
+        meta = img_metas
+        while isinstance(meta, (list, tuple)) and len(meta) > 0:
+            meta = meta[0]
+        if not isinstance(meta, dict):
+            return None
+        val = meta.get("global_idx", None)
+        if isinstance(val, (list, tuple)) and len(val) > 0:
+            val = val[0]
+        if torch.is_tensor(val):
+            if val.numel() == 0:
+                return None
+            val = val.reshape(-1)[0].item()
+        try:
+            return int(val)
+        except Exception:
+            return None
+
+    def forward_test(self, img_inputs_seq=None, img_metas=None, future_egomotion=None,
+                     segmentation=None, segmentation_bev=None, gt_occ=None, gt_occ_inst=None,
+                     segmentation_instance3d=None, segmentation_cls_instance3d=None,
+                     **kwargs):
+        return self.simple_test(
+            img_inputs_seq=img_inputs_seq, img_metas=img_metas,
+            future_egomotion=future_egomotion, segmentation_bev=segmentation_bev,
+            gt_occ=gt_occ, gt_occ_inst=gt_occ_inst,
+            segmentation=segmentation, segmentation_instance3d=segmentation_instance3d,
+            segmentation_cls_instance3d=segmentation_cls_instance3d, **kwargs)
+
+    @torch.no_grad()
+    def simple_test(self, img_inputs_seq=None, img_metas=None, future_egomotion=None,
+                    segmentation=None, segmentation_bev=None, gt_occ=None, gt_occ_inst=None,
+                    segmentation_instance3d=None, segmentation_cls_instance3d=None,
+                    **kwargs):
+        import os
+        import numpy as np
+
+        def _pack(cm):
+            return dict(hist_for_iou=cm,
+                        hist_for_iou_bbox=np.zeros((2, 2), dtype=np.int64),
+                        height_l1=torch.tensor(0.0),
+                        iou_3d=float("nan"), recall_3d=float("nan"))
+
+        empty = _pack(np.zeros((2, 2), dtype=np.int64))
+        eval_vis_on = os.environ.get("EOCF_EVAL_VIS", "0") == "1"
+        feat_out = self.extract_feat_query(
+            img_inputs_seq, img_metas, future_egomotion, voxelize=False,
+            return_query_match_inputs=True,
+            return_instance_img_debug=eval_vis_on,
+            return_instance_img_debug_fullseq=True,
+            return_query_cam_gaussian_vis_debug=eval_vis_on)
+        centers_world = feat_out[4]
+        centers_world_traj = feat_out[5]
+        sigmas_world = feat_out[2]
+        cls_scores_qc = feat_out[8]
+        present_idx = feat_out[19]
+        mix_c, mix_s, mix_y, mix_w = feat_out[20], feat_out[21], feat_out[22], feat_out[23]
+        sigmas_world_traj = feat_out[24] if len(feat_out) > 24 else None
+        mix_future = (
+            self._eval_future_tail(feat_out[25]) if len(feat_out) > 25 and torch.is_tensor(feat_out[25]) else None,
+            self._eval_future_tail(feat_out[26]) if len(feat_out) > 26 and torch.is_tensor(feat_out[26]) else None,
+            self._eval_future_tail(feat_out[27]) if len(feat_out) > 27 and torch.is_tensor(feat_out[27]) else None,
+            self._eval_future_tail(feat_out[28]) if len(feat_out) > 28 and torch.is_tensor(feat_out[28]) else None,
+        )
+        eval_instance_img_debug_bundle = feat_out[16]
+        if not (torch.is_tensor(centers_world) and torch.is_tensor(cls_scores_qc)
+                and torch.is_tensor(segmentation_bev)):
+            return empty
+        present_idx = int(present_idx) if present_idx is not None else centers_world.shape[0] - 1
+
+        gt_seg_inst3d = self._prepare_segmentation_instance3d(
+            segmentation_instance3d=segmentation_instance3d)
+        gt_bundle = self._prepare_gt_occ_inst_primary_targets(
+            gt_occ_inst=gt_occ_inst, fallback_segmentation_instance3d_txyz=gt_seg_inst3d)
+        gt_inst = gt_bundle.get("dense_inst_txyz", None) if isinstance(gt_bundle, dict) else None
+        if torch.is_tensor(gt_inst):
+            while gt_inst.dim() > 4:
+                gt_inst = gt_inst[0]
+            gt_inst = gt_inst.to(centers_world.device)
+
+        sel_idx = None
+        selected_score = None
+        bundle = self._build_query_visualization_bundle(
+            centers_world_tq3=centers_world,
+            query_cls_scores_qc=cls_scores_qc,
+            inst_match_result={},
+            gt_segmentation_instance3d_txyz=gt_inst,
+            gaussian_sigmas_world_tq3=sigmas_world,
+            mixture_centers_world_tqg3=mix_c, mixture_sigmas_world_tqg3=mix_s,
+            mixture_quat_tqg4=mix_y, mixture_weights_tqg=mix_w,
+            traj_mode_idx_q=None, query_attn_cam_score_pack=None)
+        if isinstance(bundle, dict):
+            sel_idx = bundle.get("selected_query_idx_q", None)
+            selected_score = bundle.get("selected_score_q", None)
+
+        thr = float(os.environ.get("EOCF_EVAL_OCC_THR", getattr(self, "eval_occ_threshold", 0.5)))
+        eval_mode = "present" if self._eval_mode_is_present() else "future"
+        H, W, D = int(self.voxelizer.H), int(self.voxelizer.W), int(self.voxelizer.D)
+        n_sel = int(sel_idx.numel()) if torch.is_tensor(sel_idx) else 0
+        pred_occ_vis = None
+        pred_occ_eval = None
+        centers_eval_tq3 = self._eval_future_tail(self._pick_tensor(centers_world_traj, centers_world))
+        sigmas_eval_tq3 = self._eval_future_tail(self._pick_tensor(sigmas_world_traj, sigmas_world))
+        if not (torch.is_tensor(centers_eval_tq3) and torch.is_tensor(sigmas_eval_tq3)):
+            return empty
+        if n_sel == 0:
+            pred_bev = torch.zeros((H, W), dtype=torch.bool, device=centers_world.device)
+            pred_occ3d = torch.zeros((D, H, W), dtype=torch.bool, device=centers_world.device)
+            pred_txyz = centers_world.new_zeros(
+                (int(centers_eval_tq3.shape[0]), W, H, D), dtype=torch.bool)
+        else:
+            cen = centers_world[present_idx].index_select(0, sel_idx)
+            weights_sel = (
+                selected_score.to(device=cen.device, dtype=cen.dtype).reshape(-1)
+                if torch.is_tensor(selected_score) and int(selected_score.numel()) == n_sel
+                else cen.new_ones((n_sel,), dtype=cen.dtype)
+            )
+            cen_eval = centers_eval_tq3.index_select(1, sel_idx)
+            weights_tq = weights_sel.view(1, -1).expand(int(cen_eval.shape[0]), -1).contiguous()
+            use_mix = (
+                bool(getattr(self, "query_eval_occ_use_mixture", False))
+                and all(torch.is_tensor(m) for m in (mix_c, mix_s, mix_y, mix_w))
+                and mix_c.dim() == 4
+                and int(mix_c.shape[0]) > int(present_idx)
+                and int(mix_c.shape[1]) == int(centers_world.shape[1])
+            )
+            if use_mix:
+                off_sg3, sig_sg3, yaw_sg, w_sg = self._eval_select_mixture_params(
+                    present_idx, mix_c, mix_s, mix_y, mix_w, centers_world, sel_idx)
+                pred_occ = self._eval_mixture_scene_occ(
+                    cen.unsqueeze(0), off_sg3, sig_sg3, yaw_sg, w_sg, weights_sel.view(1, -1))
+                pred_occ_eval = self._eval_mixture_scene_occ(
+                    cen_eval, off_sg3, sig_sg3, yaw_sg, w_sg, weights_tq)
+            else:
+                sig = (sigmas_world[present_idx].index_select(0, sel_idx)
+                       if torch.is_tensor(sigmas_world) else None)
+                sig_eval = sigmas_eval_tq3.index_select(1, sel_idx)
+                pred_occ = self.voxelizer(
+                    cen.unsqueeze(0),
+                    sigmas_world=(sig.unsqueeze(0) if torch.is_tensor(sig) else None),
+                    weights=weights_sel.view(1, -1))
+                pred_occ_eval = self.voxelizer(cen_eval, sigmas_world=sig_eval, weights=weights_tq)
+            pred_occ3d = (pred_occ[0, 0] > thr)
+            pred_bev = pred_occ3d.amax(dim=0)
+            pred_occ_vis = pred_occ
+            pred_txyz = (pred_occ_eval[:, 0] > thr).permute(0, 3, 2, 1).contiguous()
+
+        if eval_mode == "present":
+            pred_txyz = pred_occ3d.permute(2, 1, 0).unsqueeze(0).contiguous()
+
+        self._maybe_save_eval_query_vis(
+            pred_occ_prob=pred_occ_vis, gt_inst=gt_inst, centers_world=centers_world,
+            present_idx=present_idx, cls_scores_qc=cls_scores_qc, bundle=bundle,
+            prob_threshold=thr, img_metas=img_metas,
+            img_inputs_seq=img_inputs_seq, future_egomotion=future_egomotion,
+            instance_img_debug_bundle=eval_instance_img_debug_bundle,
+            eval_mode=eval_mode, centers_future_tq3=centers_eval_tq3,
+            pred_occ_future=pred_occ_eval, mix_future=mix_future)
+
+        gt = segmentation_bev
+        while gt.dim() > 3:
+            gt = gt[0]
+        gt = (gt > 0).to(pred_bev.device)
+        pred_bev_t = pred_txyz.permute(0, 3, 2, 1).any(dim=1).contiguous()
+
+        align = getattr(self, "_eval_occ_align", None)
+        if align is None:
+            env = os.environ.get("EOCF_EVAL_ALIGN", "").strip().lower()
+            if env == "auto":
+                print(f"[simple_test][diag] #selected={n_sel}/{int(cls_scores_qc.shape[0])} "
+                      f"pred_bev#={int(pred_bev.sum())} pred_shape={tuple(pred_bev.shape)} "
+                      f"gt_shape={tuple(gt.shape)} (thr={thr})", flush=True)
+                align = self._calibrate_eval_bev_align(pred_bev, gt)
+            else:
+                t, tr, fh, fw = [int(x) for x in env.split(",")] if env else (2, 1, 0, 0)
+                align = (t, bool(tr), (fh, fw))
+            self._eval_occ_align = align
+            print(f"[simple_test] BEV align {align}", flush=True)
+        if align is None:
+            return empty
+        _, bev_transpose, bev_flips = align
+        gt_bin_t = self._apply_bev_align_sequence(
+            self._eval_mode_slice(gt), bev_transpose, bev_flips)
+        t_bev = min(int(pred_bev_t.shape[0]), int(gt_bin_t.shape[0]))
+        cm_nusocc = (
+            self._binary_occ_cm(pred_bev_t[:t_bev], gt_bin_t[:t_bev])
+            if t_bev > 0 else np.zeros((2, 2), dtype=np.int64)
+        )
+
+        iou_3d, recall_3d = float("nan"), float("nan")
+        cm_bbox = np.zeros((2, 2), dtype=np.int64)
+        gt_bbox_src = self._eval_bbox_cls_occ_txyz(segmentation_cls_instance3d)
+        if not torch.is_tensor(gt_bbox_src):
+            gt_bbox_src = self._eval_bbox_occ_txyz(
+                segmentation=segmentation,
+                segmentation_instance3d=segmentation_instance3d,
+                gt_occ_inst=gt_occ_inst,
+                fallback_shape=(tuple(gt_occ.shape) if torch.is_tensor(gt_occ) else None),
+            )
+        if torch.is_tensor(gt_bbox_src):
+            gt_bbox_src = gt_bbox_src.to(device=pred_occ3d.device, dtype=torch.long)
+        gt_occ_fg = self._eval_nusocc_3d_fg(gt_occ, device=pred_occ3d.device)
+        gt_occ_valid = self._eval_nusocc_3d_valid(gt_occ, device=pred_occ3d.device)
+        if torch.is_tensor(gt_occ_fg) and gt_occ_fg.dim() == 4:
+            align3d = getattr(self, "_eval_3d_align", None)
+            if align3d is None:
+                env3d = os.environ.get("EOCF_EVAL_3D_ALIGN", "").strip().lower()
+                if env3d == "auto":
+                    align3d = self._calibrate_eval_3d_align(pred_occ3d, gt_occ_fg)
+                else:
+                    t, tr, fh, fw, fz = [int(x) for x in env3d.split(",")] if env3d else (0, 1, 0, 0, 0)
+                    align3d = (t, bool(tr), fh, fw, fz)
+                    print(f"[simple_test] 3D align {align3d}", flush=True)
+                self._eval_3d_align = align3d
+            if align3d is not None:
+                _, transpose, fh, fw, fz = align3d
+                gt3d_t = self._apply_3d_align_sequence(
+                    self._eval_mode_slice(gt_occ_fg), transpose, fh, fw, fz)
+                valid3d_t = (
+                    self._apply_3d_align_sequence(self._eval_mode_slice(gt_occ_valid), transpose, fh, fw, fz)
+                    if torch.is_tensor(gt_occ_valid) and gt_occ_valid.dim() == 4 else None
+                )
+                bbox3d_t = None
+                if tuple(gt3d_t.shape[1:]) == tuple(pred_occ3d.shape):
+                    if torch.is_tensor(gt_bbox_src) and gt_bbox_src.dim() == 4:
+                        bbox3d_src_t = self._eval_mode_slice((gt_bbox_src > 0) & (gt_bbox_src != 255))
+                        bbox3d_t = self._apply_3d_align_sequence(
+                            bbox3d_src_t, transpose, fh, fw, fz)
+                        if torch.is_tensor(bbox3d_t):
+                            bbox_bev_t = bbox3d_t.any(dim=1).contiguous()
+                            t_bbox = min(int(pred_bev_t.shape[0]), int(bbox_bev_t.shape[0]))
+                            if t_bbox > 0 and tuple(bbox_bev_t.shape[1:]) == tuple(pred_bev_t.shape[1:]):
+                                cm_bbox = self._binary_occ_cm(
+                                    pred_bev_t[:t_bbox], bbox_bev_t[:t_bbox])
+                    t_eval = min(int(pred_txyz.shape[0]), int(gt3d_t.shape[0]))
+                    if t_eval > 0:
+                        pred_zyx_t = pred_txyz[:t_eval].permute(0, 3, 2, 1).contiguous()
+                        gt3d_t = gt3d_t[:t_eval]
+                        if tuple(pred_zyx_t.shape) == tuple(gt3d_t.shape):
+                            bbox_arg = bbox3d_t[:t_eval] if (
+                                torch.is_tensor(bbox3d_t) and int(bbox3d_t.shape[0]) >= t_eval
+                            ) else None
+                            valid_arg = valid3d_t[:t_eval] if (
+                                torch.is_tensor(valid3d_t) and int(valid3d_t.shape[0]) >= t_eval
+                            ) else None
+                            iou_3d, recall_3d = self._iou_recall_3d(
+                                pred_zyx_t, gt3d_t, bbox3d=bbox_arg, valid3d=valid_arg)
+
+        return dict(hist_for_iou=cm_nusocc, hist_for_iou_bbox=cm_bbox,
+                    height_l1=torch.tensor(0.0),
+                    iou_3d=iou_3d, recall_3d=recall_3d)
+
+    @staticmethod
+    def _binary_occ_cm(pred_bin, gt_bin):
+        import numpy as np
+        p = pred_bin.bool().reshape(-1)
+        g = gt_bin.bool().reshape(-1)
+        tp = int((p & g).sum())
+        fp = int((p & ~g).sum())
+        fn = int((~p & g).sum())
+        tn = int((~p & ~g).sum())
+        return np.array([[tn, fp], [fn, tp]], dtype=np.int64)
+
+    @staticmethod
+    def _apply_bev_align_sequence(gt_txy, transpose, flips):
+        g = gt_txy.transpose(1, 2).contiguous() if transpose else gt_txy
+        for d, f in enumerate(flips):
+            if f:
+                g = torch.flip(g, dims=[d + 1])
+        return g.contiguous()
+
+    def _calibrate_eval_bev_align(self, pred_bev, gt):
+        T = int(gt.shape[0])
+        best, best_iou = None, -1.0
+        for t in range(T):
+            base = gt[t]
+            for transpose in (False, True):
+                g0 = base.transpose(0, 1).contiguous() if transpose else base
+                if tuple(g0.shape) != tuple(pred_bev.shape):
+                    continue
+                for fh in (0, 1):
+                    for fw in (0, 1):
+                        g = g0
+                        for d, fl in ((0, fh), (1, fw)):
+                            if fl:
+                                g = torch.flip(g, dims=[d])
+                        inter = float((pred_bev & g).sum())
+                        union = float((pred_bev | g).sum())
+                        iou = inter / union if union > 0 else 0.0
+                        if iou > best_iou:
+                            best_iou, best = iou, (t, transpose, (fh, fw))
+        print(f"[simple_test] calib best BEV movable IoU={best_iou:.4f} at {best}", flush=True)
+        return best
+
+    @staticmethod
+    def _apply_3d_align(fg_txyz, t_idx, transpose, flipH, flipW, flipZ):
+        g = fg_txyz[t_idx].permute(2, 0, 1)
+        if transpose:
+            g = g.transpose(1, 2)
+        if flipZ:
+            g = torch.flip(g, dims=[0])
+        if flipH:
+            g = torch.flip(g, dims=[1])
+        if flipW:
+            g = torch.flip(g, dims=[2])
+        return g.bool().contiguous()
+
+    @staticmethod
+    def _apply_3d_align_sequence(fg_txyz, transpose, flipH, flipW, flipZ):
+        g = fg_txyz.permute(0, 3, 1, 2)
+        if transpose:
+            g = g.transpose(2, 3)
+        if flipZ:
+            g = torch.flip(g, dims=[1])
+        if flipH:
+            g = torch.flip(g, dims=[2])
+        if flipW:
+            g = torch.flip(g, dims=[3])
+        return g.bool().contiguous()
+
+    def _calibrate_eval_3d_align(self, pred_occ3d, fg_txyz):
+        T = int(fg_txyz.shape[0])
+        p = pred_occ3d.bool()
+        best, best_iou = None, -1.0
+        for t in range(T):
+            for transpose in (False, True):
+                for fz in (0, 1):
+                    for fh in (0, 1):
+                        for fw in (0, 1):
+                            g = self._apply_3d_align(fg_txyz, t, transpose, fh, fw, fz)
+                            if tuple(g.shape) != tuple(p.shape):
+                                continue
+                            inter = float((p & g).sum())
+                            union = float((p | g).sum())
+                            iou = inter / union if union > 0 else 0.0
+                            if iou > best_iou:
+                                best_iou, best = iou, (t, transpose, fh, fw, fz)
+        if best_iou <= 0.0:
+            return None
+        print(f"[simple_test] calib best 3D movable IoU={best_iou:.4f} at {best}", flush=True)
+        return best
+
+    @staticmethod
+    def _iou_recall_3d(pred3d, gt3d, bbox3d=None, valid3d=None):
+        p = pred3d.bool()
+        g = gt3d.bool()
+        if torch.is_tensor(valid3d) and tuple(valid3d.shape) == tuple(p.shape):
+            valid = valid3d.bool()
+            p = p & valid
+            g = g & valid
+        tp = float((p & g).sum())
+        fp = float((p & ~g).sum())
+        fn = float((~p & g).sum())
+        iou = tp / (tp + fp + fn) if (tp + fp + fn) > 0 else float("nan")
+        bbox_fp = 0.0
+        if torch.is_tensor(bbox3d) and tuple(bbox3d.shape) == tuple(p.shape):
+            bbox_fp = float((p & ~g & bbox3d.bool()).sum())
+        denom = tp + fn + fp - bbox_fp
+        recall = (tp + bbox_fp) / denom if denom > 0 else float("nan")
+        return iou, recall
+
+    def _eval_nusocc_3d_fg(self, gt_occ, device=None):
+        if gt_occ is None:
+            return None
+        if isinstance(gt_occ, (list, tuple)):
+            frames = [x for x in gt_occ if torch.is_tensor(x)]
+            if len(frames) <= 0:
+                return None
+            gt = torch.stack(frames, dim=0)
+        elif torch.is_tensor(gt_occ):
+            gt = gt_occ
+        else:
+            return None
+        while gt.dim() > 4:
+            gt = gt[0]
+        if gt.dim() != 4:
+            return None
+        gt = gt.to(device=device, dtype=torch.long)
+        ids = [
+            int(v) for v in getattr(self, "query_class_ids", ())
+            if int(v) > 0 and int(v) != int(self.query_bg_class)
+        ]
+        if len(ids) <= 0:
+            return (gt > 0) & (gt != 255)
+        mask = torch.zeros_like(gt, dtype=torch.bool)
+        for cls_id in ids:
+            mask |= (gt == int(cls_id))
+        return mask
+
+    @staticmethod
+    def _eval_unwrap_single(x):
+        x = getattr(x, "data", x)
+        while isinstance(x, (list, tuple)) and len(x) == 1:
+            x = getattr(x[0], "data", x[0])
+        return x
+
+    def _eval_tensor_to_txyz(self, x):
+        x = self._eval_unwrap_single(x)
+        if isinstance(x, (list, tuple)):
+            x = [getattr(v, "data", v) for v in x]
+            if len(x) == 0 or not all(torch.is_tensor(v) for v in x):
+                return None
+            x = torch.stack(x, dim=0)
+        if not torch.is_tensor(x):
+            return None
+        if x.dim() == 6 and int(x.shape[0]) == 1 and int(x.shape[2]) == 1:
+            x = x[0, :, 0]
+        elif x.dim() == 5 and int(x.shape[0]) == 1:
+            x = x[0]
+        elif x.dim() == 5 and int(x.shape[1]) == 1:
+            x = x[:, 0]
+        elif x.dim() == 4:
+            pass
+        else:
+            return None
+        return x.to(torch.long).contiguous()
+
+    def _eval_bbox_cls_occ_txyz(self, segmentation_cls_instance3d=None):
+        if segmentation_cls_instance3d is None:
+            return None
+        seg_cls = self._eval_unwrap_single(segmentation_cls_instance3d)
+        if not torch.is_tensor(seg_cls):
+            return None
+        if seg_cls.dim() == 6 and int(seg_cls.shape[0]) == 1 and int(seg_cls.shape[2]) == 2:
+            cls_txyz = seg_cls[0, :, 0].to(torch.long).contiguous()
+        elif seg_cls.dim() == 5 and int(seg_cls.shape[1]) == 2:
+            cls_txyz = seg_cls[:, 0].to(torch.long).contiguous()
+        else:
+            return None
+        cls_txyz = cls_txyz.clone()
+        cls_txyz[cls_txyz == 7] = 0
+        return cls_txyz
+
+    def _eval_bbox_occ_txyz(
+            self,
+            segmentation=None,
+            segmentation_instance3d=None,
+            gt_occ_inst=None,
+            fallback_shape=None,
+        ):
+        out = self._eval_tensor_to_txyz(segmentation_instance3d)
+        if torch.is_tensor(out):
+            return out
+        out = self._eval_tensor_to_txyz(segmentation)
+        if torch.is_tensor(out):
+            return out
+
+        gt_occ_inst_bundle = self._prepare_gt_occ_inst_primary_targets(
+            gt_occ_inst=gt_occ_inst,
+            fallback_segmentation_instance3d_txyz=None,
+        )
+        if isinstance(gt_occ_inst_bundle, dict) and torch.is_tensor(gt_occ_inst_bundle.get("dense_inst_txyz", None)):
+            return gt_occ_inst_bundle["dense_inst_txyz"].to(torch.long).contiguous()
+
+        if fallback_shape is None:
+            return None
+        shape = tuple(int(v) for v in fallback_shape)
+        while len(shape) > 4 and shape[0] == 1:
+            shape = shape[1:]
+        if len(shape) != 4:
+            return None
+        return torch.zeros(shape, dtype=torch.long)
+
+    def _eval_nusocc_3d_valid(self, gt_occ, device=None):
+        if gt_occ is None:
+            return None
+        if isinstance(gt_occ, (list, tuple)):
+            frames = [x for x in gt_occ if torch.is_tensor(x)]
+            if len(frames) <= 0:
+                return None
+            gt = torch.stack(frames, dim=0)
+        elif torch.is_tensor(gt_occ):
+            gt = gt_occ
+        else:
+            return None
+        while gt.dim() > 4:
+            gt = gt[0]
+        if gt.dim() != 4:
+            return None
+        gt = gt.to(device=device, dtype=torch.long)
+        return (gt != 255) & (gt != 7)
+
+    def _eval_future_tail(self, x):
+        target_t = int(self.n_future_frames)
+        if torch.is_tensor(x) and x.dim() > 0 and target_t > 0 and int(x.shape[0]) > target_t:
+            return x[-target_t:].contiguous()
+        return x
+
+    @staticmethod
+    def _eval_mode_is_present():
+        import os
+        return os.environ.get("EOCF_EVAL_MODE", "1").strip().lower() in ("0", "present")
+
+    def _eval_mode_slice(self, x):
+        if self._eval_mode_is_present():
+            if torch.is_tensor(x) and x.dim() > 0:
+                t = int(x.shape[0])
+                pi = max(0, t - int(self.n_future_frames) - 1)
+                return x[pi:pi + 1].contiguous()
+            return x
+        return self._eval_future_tail(x)
+
+    def _build_eval_future_2d_bundle(self, present_bundle, centers_future_tq3, mix_future,
+                                     conf_q=None, cls_ids_q=None):
+        meta_only = {k: v for k, v in present_bundle.items() if str(k).startswith("_")}
+        sel_idx = present_bundle.get("selected_query_idx_q", None)
+        if (not torch.is_tensor(sel_idx)) or int(sel_idx.numel()) == 0:
+            return meta_only
+        if (not isinstance(mix_future, (tuple, list))) or len(mix_future) != 4:
+            return meta_only
+        mc, ms, my, mw = mix_future
+        if not all(torch.is_tensor(t) for t in (centers_future_tq3, mc, ms, my, mw)):
+            return meta_only
+        sel = sel_idx.to(dtype=torch.long, device=centers_future_tq3.device)
+
+        def _isel(x):
+            return x.index_select(1, sel).detach() if torch.is_tensor(x) and x.dim() >= 2 else None
+
+        pts_sel = _isel(centers_future_tq3)
+        mc_s, ms_s, my_s, mw_s = _isel(mc), _isel(ms), _isel(my), _isel(mw)
+        if pts_sel is None or mc_s is None:
+            return meta_only
+        score_q = present_bundle.get("selected_score_q", None)
+        cls_q = present_bundle.get("selected_pred_cls_q", None)
+        fb = dict(meta_only)
+        fb["selected_points_tq3"] = pts_sel
+        fb["selected_mixture_centers_tqg3"] = mc_s
+        fb["selected_mixture_sigmas_tqg3"] = ms_s
+        fb["selected_mixture_quat_tqg4"] = my_s
+        fb["selected_mixture_weights_tqg"] = mw_s
+        fb["selected_score_q"] = score_q
+        fb["selected_pred_cls_q"] = cls_q
+        cand_idx = None
+        if torch.is_tensor(cls_ids_q) and torch.is_tensor(conf_q):
+            cand_idx = (cls_ids_q.to(device=sel.device) != int(self.query_bg_class)).nonzero(as_tuple=False).reshape(-1)
+        if torch.is_tensor(cand_idx) and int(cand_idx.numel()) > 0:
+            def _ic(x):
+                return x.index_select(1, cand_idx).detach() if torch.is_tensor(x) and x.dim() >= 2 else None
+            fb["candidate_points_tq3"] = _ic(centers_future_tq3)
+            fb["candidate_mixture_centers_tqg3"] = _ic(mc)
+            fb["candidate_mixture_sigmas_tqg3"] = _ic(ms)
+            fb["candidate_mixture_quat_tqg4"] = _ic(my)
+            fb["candidate_mixture_weights_tqg"] = _ic(mw)
+            fb["candidate_score_q"] = conf_q.index_select(0, cand_idx).detach()
+            fb["candidate_pred_cls_q"] = cls_ids_q.index_select(0, cand_idx).detach()
+        else:
+            for k in ("points_tq3", "mixture_centers_tqg3", "mixture_sigmas_tqg3",
+                      "mixture_quat_tqg4", "mixture_weights_tqg", "score_q", "pred_cls_q"):
+                fb[f"candidate_{k}"] = fb[f"selected_{k}"]
+        fb["selected_query_idx_q"] = sel
+        fb["score_thr"] = 0.0
+        for k in ("top_k", "w_iou", "w_cls", "w_cam", "distance_nms_radius_m"):
+            if k in present_bundle:
+                fb[k] = present_bundle[k]
+        return fb
+
+    def _eval_select_mixture_params(self, present_idx, mix_c, mix_s, mix_y, mix_w,
+                                    centers_world, sel_idx):
+        pi = int(present_idx)
+        off_qg3 = mix_c[pi] - centers_world[pi].unsqueeze(1)
+        off_sg3 = off_qg3.index_select(0, sel_idx).contiguous()
+        sig_sg3 = mix_s[pi].index_select(0, sel_idx).contiguous()
+        yaw_sg = mix_y[pi].index_select(0, sel_idx).contiguous()
+        w_sg = mix_w[pi].index_select(0, sel_idx).contiguous()
+        return off_sg3, sig_sg3, yaw_sg, w_sg
+
+    def _eval_mixture_scene_occ(self, centers_frames_ts3, off_sg3, sig_sg3, yaw_sg, w_sg,
+                                pair_w_ts):
+        T = int(centers_frames_ts3.shape[0])
+        cen_tsg3 = centers_frames_ts3.unsqueeze(2) + off_sg3.unsqueeze(0)
+        sig_tsg3 = sig_sg3.unsqueeze(0).expand(T, -1, -1, -1)
+        yaw_tsg = yaw_sg.unsqueeze(0).expand(T, -1, -1, -1)
+        w_tsg = w_sg.unsqueeze(0).expand(T, -1, -1)
+        return self.voxelizer.forward_gaussian_mixture_scene(
+            cen_tsg3, sig_tsg3, w_tsg, yaw_tsg, pair_weights_tq=pair_w_ts)
 
 
     def forward_train(self,
@@ -1357,7 +2071,7 @@ class EfficientOCF(
             _query_present_local_idx,
             mixture_centers_world_tqg3,
             mixture_sigmas_world_tqg3,
-            mixture_yaw_tqg,
+            mixture_quat_tqg4,
             mixture_weights_tqg,
             gaussian_sigmas_world_traj_tq3,
             mixture_centers_world_traj_tqg3,
@@ -1384,7 +2098,7 @@ class EfficientOCF(
         gaussian_sigmas_world_loss = _pick(gaussian_sigmas_world_traj_tq3, gaussian_sigmas_world)
         mixture_centers_world_loss = _pick(mixture_centers_world_traj_tqg3, mixture_centers_world_tqg3)
         mixture_sigmas_world_loss = _pick(mixture_sigmas_world_traj_tqg3, mixture_sigmas_world_tqg3)
-        mixture_yaw_loss = _pick(mixture_yaw_traj_tqg, mixture_yaw_tqg)
+        mixture_yaw_loss = _pick(mixture_yaw_traj_tqg, mixture_quat_tqg4)
         mixture_weights_loss = _pick(mixture_weights_traj_tqg, mixture_weights_tqg)
         expected_traj_horizon = int(self.n_future_frames) + 1
         centers_world_temporal_sup_tq3 = centers_world_loss
@@ -1448,7 +2162,7 @@ class EfficientOCF(
             gaussian_sigmas_world_loss_aligned_tq3 = loss_geom_pack.get("gaussian_sigmas_world_tq3", gaussian_sigmas_world_loss_aligned_tq3)
             mixture_centers_world_loss_aligned_tqg3 = loss_geom_pack.get("mixture_centers_world_tqg3", mixture_centers_world_loss_aligned_tqg3)
             mixture_sigmas_world_loss_aligned_tqg3 = loss_geom_pack.get("mixture_sigmas_world_tqg3", mixture_sigmas_world_loss_aligned_tqg3)
-            mixture_yaw_loss_aligned_tqg = loss_geom_pack.get("mixture_yaw_tqg", mixture_yaw_loss_aligned_tqg)
+            mixture_yaw_loss_aligned_tqg = loss_geom_pack.get("mixture_quat_tqg4", mixture_yaw_loss_aligned_tqg)
             mixture_weights_loss_aligned_tqg = loss_geom_pack.get("mixture_weights_tqg", mixture_weights_loss_aligned_tqg)
         if _needs_ego_align:
             with torch.no_grad():
@@ -1462,7 +2176,7 @@ class EfficientOCF(
             gaussian_sigmas_world_vis_tq3 = vis_geom_pack.get("gaussian_sigmas_world_tq3", gaussian_sigmas_world_vis_tq3)
             mixture_centers_world_vis_tqg3 = vis_geom_pack.get("mixture_centers_world_tqg3", mixture_centers_world_vis_tqg3)
             mixture_sigmas_world_vis_tqg3 = vis_geom_pack.get("mixture_sigmas_world_tqg3", mixture_sigmas_world_vis_tqg3)
-            mixture_yaw_vis_tqg = vis_geom_pack.get("mixture_yaw_tqg", mixture_yaw_vis_tqg)
+            mixture_yaw_vis_tqg = vis_geom_pack.get("mixture_quat_tqg4", mixture_yaw_vis_tqg)
             mixture_weights_vis_tqg = vis_geom_pack.get("mixture_weights_tqg", mixture_weights_vis_tqg)
 
         # Build 7-frame visualization tensors (past + present + future) by
@@ -1509,7 +2223,7 @@ class EfficientOCF(
                 gaussian_sigmas_world_vis_full_tq3 = _ppd(gaussian_sigmas_world, gaussian_sigmas_world_vis_tq3)
             mixture_centers_world_vis_full_tqg3 = _ppd(mixture_centers_world_tqg3, mixture_centers_world_vis_tqg3)
             mixture_sigmas_world_vis_full_tqg3 = _ppd(mixture_sigmas_world_tqg3, mixture_sigmas_world_vis_tqg3)
-            mixture_yaw_vis_full_tqg = _ppd(mixture_yaw_tqg, mixture_yaw_vis_tqg)
+            mixture_yaw_vis_full_tqg = _ppd(mixture_quat_tqg4, mixture_yaw_vis_tqg)
             mixture_weights_vis_full_tqg = _ppd(mixture_weights_tqg, mixture_weights_vis_tqg)
         traj_loss_has_present_anchor = (
             torch.is_tensor(centers_world_loss_aligned_tq3)
@@ -1527,7 +2241,7 @@ class EfficientOCF(
                 gaussian_sigmas_world_loss_full_tq3 = _pp(gaussian_sigmas_world, gaussian_sigmas_world_loss_aligned_tq3)
             mixture_centers_world_loss_full_tqg3 = _pp(mixture_centers_world_tqg3, mixture_centers_world_loss_aligned_tqg3)
             mixture_sigmas_world_loss_full_tqg3 = _pp(mixture_sigmas_world_tqg3, mixture_sigmas_world_loss_aligned_tqg3)
-            mixture_yaw_loss_full_tqg = _pp(mixture_yaw_tqg, mixture_yaw_loss_aligned_tqg)
+            mixture_yaw_loss_full_tqg = _pp(mixture_quat_tqg4, mixture_yaw_loss_aligned_tqg)
             mixture_weights_loss_full_tqg = _pp(mixture_weights_tqg, mixture_weights_loss_aligned_tqg)
         use_full7_temporal_sup = bool(
             traj_loss_has_present_anchor
@@ -1605,7 +2319,7 @@ class EfficientOCF(
             query_sigmas_world_tq3=gaussian_sigmas_world_match_tq3,
             query_mixture_centers_world_tqg3=mixture_centers_world_match_tqg3,
             query_mixture_sigmas_world_tqg3=mixture_sigmas_world_match_tqg3,
-            query_mixture_yaw_tqg=mixture_yaw_match_tqg,
+            query_mixture_quat_tqg4=mixture_yaw_match_tqg,
             query_mixture_weights_tqg=mixture_weights_match_tqg,
             gt_instance_occ3d_txyz=match_gt_instance_occ3d_txyz,
             gt_inst_center_world_tn3=match_gt_centers_tn3,
@@ -1703,14 +2417,14 @@ class EfficientOCF(
                 _present_sg = _safe_narrow(gaussian_sigmas_world, _query_present_local_idx)
                 _present_mc = _safe_narrow(mixture_centers_world_tqg3, _query_present_local_idx)
                 _present_ms = _safe_narrow(mixture_sigmas_world_tqg3, _query_present_local_idx)
-                _present_my = _safe_narrow(mixture_yaw_tqg, _query_present_local_idx)
+                _present_my = _safe_narrow(mixture_quat_tqg4, _query_present_local_idx)
                 _present_mw = _safe_narrow(mixture_weights_tqg, _query_present_local_idx)
                 _traj_geom_real = self._build_query_trajectory_geometry_from_present(
                     present_centers_world_tq3=_present_c,
                     present_sigmas_world_tq3=None,
                     present_mix_centers_world_tqg3=_present_mc,
                     present_mix_sigmas_world_tqg3=_present_ms,
-                    present_mix_yaw_tqg=_present_my,
+                    present_mix_quat_tqg4=_present_my,
                     present_mix_weights_tqg=_present_mw,
                     traj_offsets_fq2=_traj_offsets_fq2,
                 )
@@ -1736,9 +2450,9 @@ class EfficientOCF(
                         _ms = _traj_geom_real.get("mix_sigmas_world_tqg3", None)
                         if torch.is_tensor(_ms):
                             mixture_sigmas_world_vis_full_tqg3 = _ppd_v(mixture_sigmas_world_tqg3, _ms)
-                        _my = _traj_geom_real.get("mix_yaw_tqg", None)
+                        _my = _traj_geom_real.get("mix_quat_tqg4", None)
                         if torch.is_tensor(_my):
-                            mixture_yaw_vis_full_tqg = _ppd_v(mixture_yaw_tqg, _my)
+                            mixture_yaw_vis_full_tqg = _ppd_v(mixture_quat_tqg4, _my)
                         _mw = _traj_geom_real.get("mix_weights_tqg", None)
                         if torch.is_tensor(_mw):
                             mixture_weights_vis_full_tqg = _ppd_v(mixture_weights_tqg, _mw)
@@ -1812,7 +2526,7 @@ class EfficientOCF(
                 query_attn_cam_targets = self.build_query_attn_cam_gaussian_targets(
                     mixture_centers_world_tqg3=mixture_centers_world_loss,
                     mixture_sigmas_world_tqg3=mixture_sigmas_world_loss,
-                    mixture_yaw_tqg=mixture_yaw_loss,
+                    mixture_quat_tqg4=mixture_yaw_loss,
                     mixture_weights_tqg=mixture_weights_loss,
                     future_egomotion=future_egomotion,
                     query_match_inputs=query_match_inputs,
@@ -1837,7 +2551,7 @@ class EfficientOCF(
                 sigmas_world_tq3=gaussian_sigmas_world_match_tq3,
                 mixture_centers_world_tqg3=mixture_centers_world_match_tqg3,
                 mixture_sigmas_world_tqg3=mixture_sigmas_world_match_tqg3,
-                mixture_yaw_tqg=mixture_yaw_match_tqg,
+                mixture_quat_tqg4=mixture_yaw_match_tqg,
                 mixture_weights_tqg=mixture_weights_match_tqg,
                 gt_instance_occ3d_txyz_pred=match_gt_instance_occ3d_txyz,
                 bbox_instance_occ3d_txyz=match_bbox_instance_occ3d_txyz,
@@ -1917,7 +2631,7 @@ class EfficientOCF(
                 gaussian_sigmas_world_tq3=_d(gaussian_sigmas_world_vis_full_tq3),
                 mixture_centers_world_tqg3=_d(mixture_centers_world_vis_full_tqg3),
                 mixture_sigmas_world_tqg3=_d(mixture_sigmas_world_vis_full_tqg3),
-                mixture_yaw_tqg=_d(mixture_yaw_vis_full_tqg),
+                mixture_quat_tqg4=_d(mixture_yaw_vis_full_tqg),
                 mixture_weights_tqg=_d(mixture_weights_vis_full_tqg),
                 query_attn_cam_score_pack=query_attn_cam_score_pack,
             )

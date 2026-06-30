@@ -105,6 +105,30 @@ def parse_args():
         args.eval_options = args.options
     return args
 
+
+def _ensure_eval_meta_keys(cfg):
+    def _patch_pipeline(pipeline):
+        if not isinstance(pipeline, list):
+            return
+        for transform in pipeline:
+            if not isinstance(transform, dict):
+                continue
+            if transform.get('type') == 'Collect3D':
+                meta_keys = transform.get('meta_keys', ())
+                if isinstance(meta_keys, tuple):
+                    if 'global_idx' not in meta_keys:
+                        transform['meta_keys'] = meta_keys + ('global_idx',)
+                elif isinstance(meta_keys, list) and 'global_idx' not in meta_keys:
+                    meta_keys.append('global_idx')
+
+    test_cfg = cfg.data.test
+    if isinstance(test_cfg, dict):
+        _patch_pipeline(test_cfg.get('pipeline', None))
+    elif isinstance(test_cfg, list):
+        for ds_cfg in test_cfg:
+            _patch_pipeline(ds_cfg.get('pipeline', None))
+
+
 def main():
     args = parse_args()
 
@@ -121,9 +145,15 @@ def main():
         raise ValueError('The output file must be a pkl file.')
 
     cfg = Config.fromfile(args.config)
+    if os.environ.get('EOCF_EVAL_VIS', '0') == '1' and not os.environ.get('EOCF_EVAL_VIS_DIR'):
+        config_name = osp.splitext(osp.basename(args.config))[0]
+        timestamp = os.environ.get('EOCF_EVAL_TIMESTAMP') or time.strftime('%Y%m%d_%H%M%S')
+        os.environ['EOCF_EVAL_VIS_DIR'] = osp.join('./work_dirs', config_name, 'eval', timestamp)
+        print('[eval_vis] save dir: ', os.environ['EOCF_EVAL_VIS_DIR'])
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
     sync_occ_dt_loading_with_model_cfg(cfg)
+    _ensure_eval_meta_keys(cfg)
     # import modules from string list.
     if cfg.get('custom_imports', None):
         from mmcv.utils import import_modules_from_strings
