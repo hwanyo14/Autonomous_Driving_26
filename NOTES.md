@@ -1,5 +1,19 @@
 # NOTES
 
+## 2026-06-30 KST — Remaining loader pruning 메모
+
+- `segmentation_bev`는 test `simple_test`의 BEV metric에 필요하므로 test에서는 유지하고 train에서만 `load_segmentation_bev=False`로 차단했다.
+- `LoadMultiViewImageFromFiles_BEVDet`의 `results['canvas']`는 `Collect3D`/model/debug 경로에서 읽히지 않는다. 검색상 다른 `canvas`는 각 시각화 함수 내부 로컬 변수라 이미지 로더 output과 무관하다.
+- `projects/configs/baselines/EfficientOCF_V1.1_1gpu.py`는 현재 repo에 없어서 반영 대상에서 제외했다. 현재 존재하는 baseline config는 `base_config.py`, `EfficientOCF_V1.1_lyft.py`뿐이다.
+
+## 2026-06-30 KST — Data loading pruning 기준
+
+- 현재 사용 config는 `projects/configs/baselines/base_config.py`로 확정해서 판단했다.
+- train pipeline에서는 `LoadOccupancy`를 제거했다. 현재 `use_segmentation_as_query_gt=True`, train eval hook 비활성 상태라 `gt_occ`는 학습 손실에 쓰이지 않는다.
+- test pipeline의 `gt_occ`와 `segmentation_bev`는 evaluation metric 계산에 쓰이므로 유지했다.
+- `segmentation_cls_instance3d`는 `gt_occ_inst` 기반 dense class/instance bundle이 detector 내부에서 우선 사용되므로 base config에서 로드를 껐다.
+- `segmentation`/`segmentation_instance3d`/`gt_occ_inst`/`gt_instance_centers_*`는 matching, local AABB GMO, trajectory/depth target, shape 기준에 연결되어 있어 유지했다.
+
 ## 2026-06-30 KST — Eval/visualization 이식 검증 메모
 
 ## 2026-06-30 KST — Unified Gaussian quaternion rotation 검증 메모

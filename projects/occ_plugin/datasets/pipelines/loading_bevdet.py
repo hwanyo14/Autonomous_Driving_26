@@ -346,7 +346,6 @@ class LoadMultiViewImageFromFiles_BEVDet(object):
         post_rots_seq = []
         post_trans_seq = []
         gt_depths_seq = list()
-        canvas_seq = []
         sensor2sensors_seq = []
 
         for counter in range(sequence_length):
@@ -358,7 +357,6 @@ class LoadMultiViewImageFromFiles_BEVDet(object):
             post_rots = []
             post_trans = []
             gt_depths = list()
-            canvas = []
             sensor2sensors = []
 
             for cam_idx, cam_name in enumerate(cam_names):
@@ -403,8 +401,6 @@ class LoadMultiViewImageFromFiles_BEVDet(object):
                 gt_depth = torch.zeros(1)
                 gt_depths.append(gt_depth)
                 
-                canvas.append(np.array(img))
-                
                 if self.colorjitter and self.is_train:
                     img = self.pipeline_colorjitter(img)
                 
@@ -432,7 +428,6 @@ class LoadMultiViewImageFromFiles_BEVDet(object):
             post_rots_seq.append(post_rots)
             post_trans_seq.append(post_trans)
             gt_depths_seq.append(gt_depths)
-            canvas_seq.append(canvas)
             sensor2sensors_seq.append(sensor2sensors)
 
         imgs_seq = torch.stack(imgs_seq)
@@ -443,8 +438,6 @@ class LoadMultiViewImageFromFiles_BEVDet(object):
         post_trans_seq = torch.stack(post_trans_seq)
         gt_depths_seq = torch.stack(gt_depths_seq)
         sensor2sensors_seq = torch.stack(sensor2sensors_seq)
-
-        results['canvas'] = canvas
 
         return imgs_seq, rots_seq, trans_seq, intrins_seq, post_rots_seq, post_trans_seq, gt_depths_seq, sensor2sensors_seq
 

@@ -13,7 +13,7 @@ import copy
 
 @PIPELINES.register_module()
 class LoadInstanceWithFlow(object):
-    def __init__(self, ocf_dataset_path, grid_size=[512, 512, 40], pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0], background=0, use_flow=True, use_separate_classes=False, use_lyft=False, validate_cache=False, write_cache=True, load_segmentation_instance3d=False, segmentation_instance3d_path=None, segmentation_instance3d_key='segmentation_instance_saved_list2', load_segmentation_cls_instance3d=False, segmentation_cls_dataset_path=None, segmentation_cls_key='segmentation_saved_list2', validate_segmentation_cls_instance3d_alignment=False, load_gt_occ_inst=False, gt_occ_inst_dataset_path=None, gt_occ_inst_key='segmentation_instance_saved_list2', exclude_occ_class_ids=()):
+    def __init__(self, ocf_dataset_path, grid_size=[512, 512, 40], pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0], background=0, use_flow=True, use_separate_classes=False, use_lyft=False, validate_cache=False, write_cache=True, load_segmentation_bev=True, load_segmentation_instance3d=False, segmentation_instance3d_path=None, segmentation_instance3d_key='segmentation_instance_saved_list2', load_segmentation_cls_instance3d=False, segmentation_cls_dataset_path=None, segmentation_cls_key='segmentation_saved_list2', validate_segmentation_cls_instance3d_alignment=False, load_gt_occ_inst=False, gt_occ_inst_dataset_path=None, gt_occ_inst_key='segmentation_instance_saved_list2', exclude_occ_class_ids=()):
         '''
         Loading sequential occupancy labels and instance flows for training and testing
         '''
@@ -32,6 +32,7 @@ class LoadInstanceWithFlow(object):
         self.use_lyft = use_lyft
         self.validate_cache = bool(validate_cache)
         self.write_cache = bool(write_cache)
+        self.load_segmentation_bev = bool(load_segmentation_bev)
         self.load_segmentation_instance3d = bool(load_segmentation_instance3d)
         self.segmentation_instance3d_path = segmentation_instance3d_path
         self.segmentation_instance3d_key = str(segmentation_instance3d_key)
@@ -1008,21 +1009,25 @@ class LoadInstanceWithFlow(object):
             sample_key
         )
 
-        instance_bev_label_dir = os.path.join(self.ocf_dataset_path, prefix, "instance_bev")
-        if not os.path.exists(instance_bev_label_dir):
-            os.mkdir(instance_bev_label_dir)
-        instance_bev_label_path = os.path.join(
-            instance_bev_label_dir,
-            sample_key
-        )
+        instance_bev_label_path = None
+        if self.use_flow:
+            instance_bev_label_dir = os.path.join(self.ocf_dataset_path, prefix, "instance_bev")
+            if not os.path.exists(instance_bev_label_dir):
+                os.mkdir(instance_bev_label_dir)
+            instance_bev_label_path = os.path.join(
+                instance_bev_label_dir,
+                sample_key
+            )
 
-        flow_bev_label_dir = os.path.join(self.ocf_dataset_path, prefix, "flow_bev")
-        if not os.path.exists(flow_bev_label_dir):
-            os.mkdir(flow_bev_label_dir)
-        flow_bev_label_path = os.path.join(
-            flow_bev_label_dir,
-            sample_key
-        )
+        flow_bev_label_path = None
+        if self.use_flow:
+            flow_bev_label_dir = os.path.join(self.ocf_dataset_path, prefix, "flow_bev")
+            if not os.path.exists(flow_bev_label_dir):
+                os.mkdir(flow_bev_label_dir)
+            flow_bev_label_path = os.path.join(
+                flow_bev_label_dir,
+                sample_key
+            )
 
         pcd_height_label_path = None
         if self.use_lyft:
@@ -1180,11 +1185,13 @@ class LoadInstanceWithFlow(object):
 
         check_list = [
             (seg_label_path + ".npz", "segmentation_saved_list2"),
-            (seg_bev_label_path + ".npz", "segmentation_bev_saved_list2"),
-            (instance_bev_label_path + ".npz", "instance_bev_saved_list2"),
-            (flow_bev_label_path + ".npz", "flow_bev_saved_list2"),
         ]
 
+        if self.load_segmentation_bev:
+            check_list.append((seg_bev_label_path + ".npz", "segmentation_bev_saved_list2"))
+        if self.use_flow:
+            check_list.append((instance_bev_label_path + ".npz", "instance_bev_saved_list2"))
+            check_list.append((flow_bev_label_path + ".npz", "flow_bev_saved_list2"))
         if self.load_segmentation_instance3d and (seg_instance3d_label_path is not None):
             check_list.append((seg_instance3d_label_path + ".npz", self.segmentation_instance3d_key))
         if self.load_segmentation_cls_instance3d and (seg_cls_label_path is not None):
@@ -1240,7 +1247,7 @@ class LoadInstanceWithFlow(object):
                 need_regen = True
 
         segmentation_bev_list = []
-        if (not need_regen) and os.path.exists(seg_bev_label_path + ".npz"):
+        if self.load_segmentation_bev and (not need_regen) and os.path.exists(seg_bev_label_path + ".npz"):
             try:
                 gt_list = load_list_from_npz(seg_bev_label_path + ".npz", "segmentation_bev_saved_list2")
                 for j in range(len(gt_list)):
@@ -1262,7 +1269,7 @@ class LoadInstanceWithFlow(object):
                 need_regen = True
 
         instance_bev_list = []
-        if (not need_regen) and os.path.exists(instance_bev_label_path + ".npz"):
+        if self.use_flow and (not need_regen) and os.path.exists(instance_bev_label_path + ".npz"):
             try:
                 gt_list = load_list_from_npz(instance_bev_label_path + ".npz", "instance_bev_saved_list2")
                 for j in range(len(gt_list)):
@@ -1284,7 +1291,7 @@ class LoadInstanceWithFlow(object):
                 need_regen = True
 
         flow_bev_list = []
-        if (not need_regen) and os.path.exists(flow_bev_label_path + ".npz"):
+        if self.use_flow and (not need_regen) and os.path.exists(flow_bev_label_path + ".npz"):
             try:
                 gt_list = load_list_from_npz(flow_bev_label_path + ".npz", "flow_bev_saved_list2")
                 for j in range(len(gt_list)):
@@ -1352,14 +1359,17 @@ class LoadInstanceWithFlow(object):
         # ---------------- decide cache usage ----------------
         use_cache = (not need_regen) \
             and os.path.exists(seg_label_path + ".npz") \
-            and os.path.exists(seg_bev_label_path + ".npz") \
-            and os.path.exists(instance_bev_label_path + ".npz") \
-            and os.path.exists(flow_bev_label_path + ".npz") \
-            and (len(segmentation_list) > 0) \
-            and (len(segmentation_bev_list) > 0) \
-            and (len(instance_bev_list) > 0) \
-            and (len(flow_bev_list) > 0)
+            and (len(segmentation_list) > 0)
 
+        if self.load_segmentation_bev:
+            use_cache = use_cache and os.path.exists(seg_bev_label_path + ".npz") \
+                and (len(segmentation_bev_list) > 0)
+
+        if self.use_flow:
+            use_cache = use_cache and os.path.exists(instance_bev_label_path + ".npz") \
+                and os.path.exists(flow_bev_label_path + ".npz") \
+                and (len(instance_bev_list) > 0) \
+                and (len(flow_bev_list) > 0)
         if self.use_lyft:
             use_cache = use_cache and os.path.exists(pcd_height_label_path + ".npz") and (len(pcd_height_list) > 0)
         if self.load_segmentation_instance3d:
@@ -1372,12 +1382,12 @@ class LoadInstanceWithFlow(object):
 
         if use_cache:
             results['segmentation'] = torch.cat(segmentation_list, dim=0)
-            results['attribute_label'] = torch.from_numpy(
-                np.zeros((self.dimension[0], self.dimension[1], self.dimension[2]), dtype=np.float32)
-            ).unsqueeze(0)
-            results['segmentation_bev'] = torch.cat(segmentation_bev_list, dim=0)
-            results['instance_bev'] = torch.cat(instance_bev_list, dim=0)
-            results['flow_bev'] = torch.cat(flow_bev_list, dim=0).float()
+            if self.load_segmentation_bev:
+                results['segmentation_bev'] = torch.cat(segmentation_bev_list, dim=0)
+            if self.use_flow:
+                results['instance_bev'] = torch.cat(instance_bev_list, dim=0)
+            if self.use_flow:
+                results['flow_bev'] = torch.cat(flow_bev_list, dim=0).float()
             if self.load_segmentation_instance3d:
                 results['segmentation_instance3d'] = torch.cat(segmentation_instance3d_list, dim=0).long()
                 if segmentation_instance3d_sparse_list is None:
@@ -1430,9 +1440,10 @@ class LoadInstanceWithFlow(object):
 
         # ---------------- regenerate and save (원래 else 블록 유지) ----------------
         results['segmentation'] = []
-        results['attribute_label'] = []
-        results['segmentation_bev'] = []
-        results['instance_bev'] = []
+        if self.load_segmentation_bev:
+            results['segmentation_bev'] = []
+        if self.use_flow:
+            results['instance_bev'] = []
         if self.load_segmentation_instance3d:
             results['segmentation_instance3d'] = []
             segmentation_instance3d_sparse_list = []
@@ -1449,14 +1460,15 @@ class LoadInstanceWithFlow(object):
         self.visible_instance_set = set()
 
         for self.counter in range(sequence_length):
-            segmentation, instance, attribute_label, bbox_height = self.get_label(results)
-            segmentation_bev = self.get_segmentation_bev(segmentation)
-            instance_bev = self.get_instance_bev(instance)
+            segmentation, instance, _, bbox_height = self.get_label(results)
 
             results['segmentation'].append(segmentation)
-            results['attribute_label'].append(attribute_label)
-            results['segmentation_bev'].append(segmentation_bev.unsqueeze(0))
-            results['instance_bev'].append(instance_bev.unsqueeze(0))
+            if self.load_segmentation_bev:
+                segmentation_bev = self.get_segmentation_bev(segmentation)
+                results['segmentation_bev'].append(segmentation_bev.unsqueeze(0))
+            if self.use_flow:
+                instance_bev = self.get_instance_bev(instance)
+                results['instance_bev'].append(instance_bev.unsqueeze(0))
             if self.load_segmentation_instance3d:
                 results['segmentation_instance3d'].append(instance.long())
                 instance_cur = instance.squeeze(0).long()
@@ -1482,22 +1494,25 @@ class LoadInstanceWithFlow(object):
             kept = segmentation_for_save[:, -1] != 0
             segmentation_saved_list.append(segmentation_for_save[kept])
 
-            x_grid_bev = torch.linspace(0, self.dimension[0] - 1, self.dimension[0], dtype=torch.long)
-            x_grid_bev = x_grid_bev.view(self.dimension[0], 1).expand(self.dimension[0], self.dimension[1])
-            y_grid_bev = torch.linspace(0, self.dimension[1] - 1, self.dimension[1], dtype=torch.long)
-            y_grid_bev = y_grid_bev.view(1, self.dimension[1]).expand(self.dimension[0], self.dimension[1])
+            if self.load_segmentation_bev or self.use_flow or self.use_lyft:
+                x_grid_bev = torch.linspace(0, self.dimension[0] - 1, self.dimension[0], dtype=torch.long)
+                x_grid_bev = x_grid_bev.view(self.dimension[0], 1).expand(self.dimension[0], self.dimension[1])
+                y_grid_bev = torch.linspace(0, self.dimension[1] - 1, self.dimension[1], dtype=torch.long)
+                y_grid_bev = y_grid_bev.view(1, self.dimension[1]).expand(self.dimension[0], self.dimension[1])
 
-            segmentation_bev_for_save = torch.stack((x_grid_bev, y_grid_bev), -1).view(-1, 2)
-            segmentation_bev_label = segmentation_bev.unsqueeze(-1).view(-1, 1)
-            segmentation_bev_for_save = torch.cat((segmentation_bev_for_save, segmentation_bev_label), dim=-1)
-            kept = segmentation_bev_for_save[:, -1] != 0
-            segmentation_bev_saved_list.append(segmentation_bev_for_save[kept])
+            if self.load_segmentation_bev:
+                segmentation_bev_for_save = torch.stack((x_grid_bev, y_grid_bev), -1).view(-1, 2)
+                segmentation_bev_label = segmentation_bev.unsqueeze(-1).view(-1, 1)
+                segmentation_bev_for_save = torch.cat((segmentation_bev_for_save, segmentation_bev_label), dim=-1)
+                kept = segmentation_bev_for_save[:, -1] != 0
+                segmentation_bev_saved_list.append(segmentation_bev_for_save[kept])
 
-            instance_bev_for_save = torch.stack((x_grid_bev, y_grid_bev), -1).view(-1, 2)
-            instance_bev_label = instance_bev.unsqueeze(-1).view(-1, 1)
-            instance_bev_for_save = torch.cat((instance_bev_for_save, instance_bev_label), dim=-1)
-            kept = instance_bev_for_save[:, -1] != 0
-            instance_bev_saved_list.append(instance_bev_for_save[kept])
+            if self.use_flow:
+                instance_bev_for_save = torch.stack((x_grid_bev, y_grid_bev), -1).view(-1, 2)
+                instance_bev_label = instance_bev.unsqueeze(-1).view(-1, 1)
+                instance_bev_for_save = torch.cat((instance_bev_for_save, instance_bev_label), dim=-1)
+                kept = instance_bev_for_save[:, -1] != 0
+                instance_bev_saved_list.append(instance_bev_for_save[kept])
 
             if self.use_lyft:
                 results['height'].append(bbox_height)
@@ -1509,17 +1524,19 @@ class LoadInstanceWithFlow(object):
 
         if self.write_cache:
             segmentation_saved_list2 = [item.cpu().detach().numpy() for item in segmentation_saved_list]
-            segmentation_bev_saved_list2 = [item.cpu().detach().numpy() for item in segmentation_bev_saved_list]
-            instance_bev_saved_list2 = [item.cpu().detach().numpy() for item in instance_bev_saved_list]
 
             obj_seg = np.array(segmentation_saved_list2, dtype=object)
             self.atomic_savez(seg_label_path, segmentation_saved_list2=obj_seg)
 
-            obj_seg_bev = np.array(segmentation_bev_saved_list2, dtype=object)
-            self.atomic_savez(seg_bev_label_path, segmentation_bev_saved_list2=obj_seg_bev)
+            if self.load_segmentation_bev:
+                segmentation_bev_saved_list2 = [item.cpu().detach().numpy() for item in segmentation_bev_saved_list]
+                obj_seg_bev = np.array(segmentation_bev_saved_list2, dtype=object)
+                self.atomic_savez(seg_bev_label_path, segmentation_bev_saved_list2=obj_seg_bev)
 
-            obj_inst_bev = np.array(instance_bev_saved_list2, dtype=object)
-            self.atomic_savez(instance_bev_label_path, instance_bev_saved_list2=obj_inst_bev)
+            if self.use_flow:
+                instance_bev_saved_list2 = [item.cpu().detach().numpy() for item in instance_bev_saved_list]
+                obj_inst_bev = np.array(instance_bev_saved_list2, dtype=object)
+                self.atomic_savez(instance_bev_label_path, instance_bev_saved_list2=obj_inst_bev)
 
             if self.use_lyft:
                 pcd_height_saved_list2 = [item.cpu().detach().numpy() for item in pcd_height_saved_list]
@@ -1530,11 +1547,10 @@ class LoadInstanceWithFlow(object):
             results['height'] = torch.cat(results['height'], dim=0)
 
         results['segmentation'] = torch.cat(results['segmentation'], dim=0)
-        results['attribute_label'] = torch.from_numpy(
-            np.zeros((self.dimension[0], self.dimension[1], self.dimension[2]), dtype=np.float32)
-        ).unsqueeze(0)
-        results['segmentation_bev'] = torch.cat(results['segmentation_bev'], dim=0)
-        results['instance_bev'] = torch.cat(results['instance_bev'], dim=0)
+        if self.load_segmentation_bev:
+            results['segmentation_bev'] = torch.cat(results['segmentation_bev'], dim=0)
+        if self.use_flow:
+            results['instance_bev'] = torch.cat(results['instance_bev'], dim=0)
         if self.load_segmentation_instance3d:
             results['segmentation_instance3d'] = torch.cat(results['segmentation_instance3d'], dim=0).long()
             centers_world, centers_valid, instance_ids = self.build_instance_center_world_targets(segmentation_instance3d_sparse_list)
@@ -1564,9 +1580,10 @@ class LoadInstanceWithFlow(object):
         if self.load_gt_occ_inst:
             results['gt_occ_inst'] = gt_occ_inst_sparse_list
 
-        results['flow_bev'] = self.get_flow_label(results, ignore_index=255)
+        if self.use_flow:
+            results['flow_bev'] = self.get_flow_label(results, ignore_index=255)
 
-        if self.write_cache:
+        if self.use_flow and self.write_cache:
             flow_bev_saved_list = []
             d0 = self.dimension[0] // 4
             d1 = self.dimension[1] // 4

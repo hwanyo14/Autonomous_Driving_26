@@ -28,6 +28,7 @@ class LoadOccupancy(object):
                  load_occ_dt=False,
                  dt_type='float16',
                  strict_dt=True,
+                 load_height=True,
                  validate_height_cache=True,
                  write_height_cache=True,
                  exclude_occ_class_ids=()):
@@ -50,6 +51,7 @@ class LoadOccupancy(object):
         self.load_occ_dt = load_occ_dt
         self.dt_type = dt_type
         self.strict_dt = strict_dt
+        self.load_height = bool(load_height)
         self.validate_height_cache = bool(validate_height_cache)
         self.write_height_cache = bool(write_height_cache)
         self.exclude_occ_class_ids = tuple(int(v) for v in exclude_occ_class_ids)
@@ -334,6 +336,12 @@ class LoadOccupancy(object):
         if self.use_lyft:
             prefix = prefix + "_lyft"
             results['gt_occ'] = self.get_seq_occ(results, only_gt_occ=True)
+            return results
+
+        if not self.load_height:
+            results['gt_occ'] = self.get_seq_occ(results, only_gt_occ=True)
+            if self.load_occ_dt:
+                results["occ_dt"] = self.get_seq_occ_dt(results)
             return results
 
         height_bev_dir = os.path.join(self.ocf_dataset_path, prefix, "pcd_height")

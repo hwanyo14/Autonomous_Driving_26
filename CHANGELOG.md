@@ -1,5 +1,31 @@
 # Changelog
 
+## 2026-06-30 13:12 KST
+
+### Remaining Data Loader Pruning
+
+**핵심 내용**: train에서만 불필요한 `segmentation_bev` 로드/생성을 차단하고, 사용처가 없는 이미지 `canvas` 복사를 제거.
+
+**주요 변경사항**:
+- `base_config.py`: `LoadInstanceWithFlow(load_segmentation_bev=False)`를 train에 적용하고 test는 evaluation metric용으로 `True` 유지.
+- `loading_instance.py`: `load_segmentation_bev` 옵션 추가. `False`면 `segmentation_bev` cache check/read/dense 변환/regen/save/results 저장을 건너뜀.
+- `loading_bevdet.py`: downstream 사용처가 없는 `canvas_seq`, per-frame `canvas`, `results['canvas']` 생성을 제거.
+- 검증: 대상 파일 `py_compile`, config run-path key 점검, `results['canvas']` 잔여 사용처 검색 통과.
+
+## 2026-06-30 12:58 KST
+
+### Data Loading Bottleneck Pruning
+
+**핵심 내용**: `base_config.py` 기준 미사용 GT/캐시 로드를 줄여 train dataloader CPU/RAM 부담을 완화.
+
+**주요 변경사항**:
+- `base_config.py`: train pipeline에서 `LoadOccupancy` 제거. train `Collect3D`에서 `gt_occ`, `occ_dt`, `segmentation_bev`, `instance_bev`, `segmentation_cls_instance3d` 제거.
+- `base_config.py`: test pipeline은 evaluation용 `gt_occ`/`segmentation_bev`는 유지하고, `occ_dt`, `instance_bev`, `segmentation_cls_instance3d` 제거. `LoadOccupancy(load_occ_dt=False, load_height=False)` 명시.
+- `loading_occupancy.py`: `load_height` 옵션 추가. `False`면 height cache read/write/regen을 건너뜀.
+- `loading_instance.py`: `use_flow=False`일 때 `instance_bev`/`flow_bev` cache read, cache 필수조건, 재생성, 저장을 건너뜀.
+- `loading_instance.py`: 수집되지 않는 `attribute_label` dense tensor를 results에 넣지 않도록 정리.
+- 검증: 대상 파일 `py_compile`, config run-path key 점검, `git diff --check` 통과.
+
 ## 2026-06-30 12:34 KST
 
 ### Unified Gaussian Head Quaternion Rotation

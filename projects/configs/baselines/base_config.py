@@ -48,7 +48,7 @@ class_names = [
 query_class_ids = [0, 2, 3, 4, 5, 6, 9, 10]
 query_class_names = ['background'] + class_names
 exclude_occ_class_ids = (7,)  # pedestrian: 로드 단계에서 제거 (nohuman)
-validate_segmentation_cls_instance3d_alignment = True
+validate_segmentation_cls_instance3d_alignment = False
 strict_query_class_id_validation = True
 use_separate_classes = False
 use_fine_occ = False
@@ -127,6 +127,7 @@ train_capacity = 4000  # 3880
 test_capacity = 5119  # default: use all sequences
 validate_instance_cache = False
 write_instance_cache = False
+load_height = False
 write_height_cache = False
 
 train_pipeline = [
@@ -140,8 +141,9 @@ train_pipeline = [
         use_separate_classes=use_separate_classes,
         validate_cache=validate_instance_cache,
         write_cache=write_instance_cache,
+        load_segmentation_bev=False,
         load_segmentation_instance3d=True,
-        load_segmentation_cls_instance3d=True,
+        load_segmentation_cls_instance3d=False,
         segmentation_cls_dataset_path=segmentation_cls_dataset_path,
         validate_segmentation_cls_instance3d_alignment=validate_segmentation_cls_instance3d_alignment,
         load_gt_occ_inst=True,
@@ -161,41 +163,18 @@ train_pipeline = [
         load_depth=True,
         img_norm_cfg=img_norm_cfg,
     ),
-    dict(
-        type='LoadOccupancy',
-        to_float32=True,
-        occ_path=occ_path,
-        ocf_dataset_path=ocf_dataset_path,
-        grid_size=occ_size,
-        unoccupied=empty_idx,
-        pc_range=point_cloud_range,
-        use_fine_occ=use_fine_occ,
-        test_mode=False,
-        dt_path=occ_dt_path,
-        load_occ_dt=True,
-        dt_type='float16',
-        strict_dt=True,
-        validate_height_cache=False,
-        write_height_cache=write_height_cache,
-        exclude_occ_class_ids=exclude_occ_class_ids,
-    ),
     dict(type='OccDefaultFormatBundle3D', class_names=class_names),
     dict(
         type='Collect3D',
         keys=[
             'img_inputs_seq',
-            'gt_occ',
             'future_egomotion',
             'segmentation',
-            'segmentation_bev',
-            'instance_bev',
             'segmentation_instance3d',
-            'segmentation_cls_instance3d',
             'gt_occ_inst',
             'gt_instance_centers_world',
             'gt_instance_centers_valid',
             'gt_instance_ids',
-            'occ_dt',
         ],
         meta_keys=(
             'filename',
@@ -240,8 +219,9 @@ test_pipeline = [
         use_separate_classes=use_separate_classes,
         validate_cache=validate_instance_cache,
         write_cache=write_instance_cache,
+        load_segmentation_bev=True,
         load_segmentation_instance3d=True,
-        load_segmentation_cls_instance3d=True,
+        load_segmentation_cls_instance3d=False,
         segmentation_cls_dataset_path=segmentation_cls_dataset_path,
         validate_segmentation_cls_instance3d_alignment=validate_segmentation_cls_instance3d_alignment,
         load_gt_occ_inst=True,
@@ -271,9 +251,10 @@ test_pipeline = [
         use_fine_occ=use_fine_occ,
         test_mode=True,
         dt_path=occ_dt_path,
-        load_occ_dt=True,
+        load_occ_dt=False,
         dt_type='float16',
         strict_dt=True,
+        load_height=load_height,
         validate_height_cache=False,
         write_height_cache=write_height_cache,
     ),
@@ -286,14 +267,11 @@ test_pipeline = [
             'future_egomotion',
             'segmentation',
             'segmentation_bev',
-            'instance_bev',
             'segmentation_instance3d',
-            'segmentation_cls_instance3d',
             'gt_occ_inst',
             'gt_instance_centers_world',
             'gt_instance_centers_valid',
             'gt_instance_ids',
-            'occ_dt',
         ],
         meta_keys=['pc_range', 'occ_size', 'scene_token', 'lidar_token'],
     ),
