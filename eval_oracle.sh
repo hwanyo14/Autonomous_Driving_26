@@ -7,14 +7,14 @@ set -euo pipefail
 # "스코어링이 병목인지" 진단한다. (oracle ≫ baseline → 스코어링 문제 / 비슷 → shape·매칭 문제)
 
 # ----- 대상 config / checkpoint / GPU -----
-CONFIG=./projects/configs/baselines/shape_guide_128_dice_weight_fl25_sz06.py
-CHECKPOINT=./work_dirs/shape_guide_128_dice_weight_fl25_sz06/epoch_12_lss_only.pth
+CONFIG=./projects/configs/baselines/full.py
+CHECKPOINT=./work_dirs/full/epoch_12_lss_only.pth
 GPUS=8
-export PORT=20025                  # baseline(20014)과 충돌 방지
+export PORT=30091              
 
 # ----- 평가 동작 (baseline과 동일하게 맞춰 공정 비교) -----
 export EOCF_EVAL_MODE=1            # 0=present / 1=future. baseline과 동일하게 future.
-export EOCF_EVAL_OCC_THR=0.75      # baseline과 동일 occ threshold.
+# export EOCF_EVAL_OCC_THR=0.75      # baseline과 동일 occ threshold.
 
 # ----- Oracle 선택 (이 스크립트의 핵심) -----
 export EOCF_EVAL_ORACLE_MATCH=1    # 1=학습과 100% 동일 매칭으로 override / 0=기존 score 선택
@@ -24,7 +24,7 @@ export EOCF_EVAL_VIS=1             # 1=켜기 / 0=끄기
 export EOCF_EVAL_VIS_EVERY=48      # 몇 샘플마다 저장 (baseline과 동일)
 # oracle 결과는 baseline과 섞이지 않게 별도 폴더(eval_oracle/<timestamp>)에 저장.
 TS=$(date +%Y%m%d_%H%M%S)
-export EOCF_EVAL_VIS_DIR=./work_dirs/shape_guide_128_dice_weight_fl25_sz06/eval_oracle/${TS}
+export EOCF_EVAL_VIS_DIR=./work_dirs/eval_oracle/${TS}
 
 USE_MPS=0 \
 bash tools/dist_test.sh "$CONFIG" "$CHECKPOINT" "$GPUS"

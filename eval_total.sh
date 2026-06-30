@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # ----- 대상 config / checkpoint / GPU -----
-CONFIG=./projects/configs/baselines/shape_guide_128_dice_weight_fl25_sz06_dice3d.py
-CHECKPOINT=./work_dirs/shape_guide_128_dice_weight_fl25_sz06_dice3d/latest.pth
+CONFIG=./projects/configs/baselines/full.py
+CHECKPOINT=./work_dirs/full/latest.pth
 GPUS=8
-export PORT=20003
+export PORT=30031
 
 # ----- 평가 동작 -----
 export EOCF_EVAL_MODE=1            # 기준 프레임: 0=present(현재 1) / 1=future(미래 n_future). metric·viz 공통
-export EOCF_EVAL_OCC_THR=0.75    # occ 점유 threshold. config eval_occ_threshold override
+# export EOCF_EVAL_OCC_THR=0.75    # occ 점유 threshold. config eval_occ_threshold override
 # export EOCF_EVAL_FG_THR=0.75     # foreground(query) score threshold
 
 # ----- 시각화 (2D query_debug_vis + 3D mixture3d) -----
