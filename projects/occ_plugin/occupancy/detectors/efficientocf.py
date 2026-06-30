@@ -1070,9 +1070,9 @@ class EfficientOCF(
         mixture_sigmas_world_traj_tqg3 = traj_geom_pack.get("mix_sigmas_world_tqg3", None)
         if not torch.is_tensor(mixture_sigmas_world_traj_tqg3):
             mixture_sigmas_world_traj_tqg3 = mixture_sigmas_world_tqg3
-        mixture_yaw_traj_tqg = traj_geom_pack.get("mix_quat_tqg4", None)
-        if not torch.is_tensor(mixture_yaw_traj_tqg):
-            mixture_yaw_traj_tqg = mixture_quat_tqg4
+        mixture_quat_traj_tqg = traj_geom_pack.get("mix_quat_tqg4", None)
+        if not torch.is_tensor(mixture_quat_traj_tqg):
+            mixture_quat_traj_tqg = mixture_quat_tqg4
         mixture_weights_traj_tqg = traj_geom_pack.get("mix_weights_tqg", None)
         if not torch.is_tensor(mixture_weights_traj_tqg):
             mixture_weights_traj_tqg = mixture_weights_tqg
@@ -1125,7 +1125,7 @@ class EfficientOCF(
             gaussian_sigmas_world_traj_tq3,
             mixture_centers_world_traj_tqg3,
             mixture_sigmas_world_traj_tqg3,
-            mixture_yaw_traj_tqg,
+            mixture_quat_traj_tqg,
             mixture_weights_traj_tqg,
             traj_motion_input_tqd2,
         )
@@ -2076,7 +2076,7 @@ class EfficientOCF(
             gaussian_sigmas_world_traj_tq3,
             mixture_centers_world_traj_tqg3,
             mixture_sigmas_world_traj_tqg3,
-            mixture_yaw_traj_tqg,
+            mixture_quat_traj_tqg,
             mixture_weights_traj_tqg,
             traj_motion_input_tqd2,
         ) = self.extract_feat_query(
@@ -2098,7 +2098,7 @@ class EfficientOCF(
         gaussian_sigmas_world_loss = _pick(gaussian_sigmas_world_traj_tq3, gaussian_sigmas_world)
         mixture_centers_world_loss = _pick(mixture_centers_world_traj_tqg3, mixture_centers_world_tqg3)
         mixture_sigmas_world_loss = _pick(mixture_sigmas_world_traj_tqg3, mixture_sigmas_world_tqg3)
-        mixture_yaw_loss = _pick(mixture_yaw_traj_tqg, mixture_quat_tqg4)
+        mixture_quat_loss = _pick(mixture_quat_traj_tqg, mixture_quat_tqg4)
         mixture_weights_loss = _pick(mixture_weights_traj_tqg, mixture_weights_tqg)
         expected_traj_horizon = int(self.n_future_frames) + 1
         centers_world_temporal_sup_tq3 = centers_world_loss
@@ -2136,13 +2136,13 @@ class EfficientOCF(
         gaussian_sigmas_world_vis_tq3 = gaussian_sigmas_world_loss
         mixture_centers_world_vis_tqg3 = mixture_centers_world_loss
         mixture_sigmas_world_vis_tqg3 = mixture_sigmas_world_loss
-        mixture_yaw_vis_tqg = mixture_yaw_loss
+        mixture_quat_vis_tqg = mixture_quat_loss
         mixture_weights_vis_tqg = mixture_weights_loss
         centers_world_loss_aligned_tq3 = centers_world_temporal_sup_tq3
         gaussian_sigmas_world_loss_aligned_tq3 = gaussian_sigmas_world_loss
         mixture_centers_world_loss_aligned_tqg3 = mixture_centers_world_loss
         mixture_sigmas_world_loss_aligned_tqg3 = mixture_sigmas_world_loss
-        mixture_yaw_loss_aligned_tqg = mixture_yaw_loss
+        mixture_quat_loss_aligned_tqg = mixture_quat_loss
         mixture_weights_loss_aligned_tqg = mixture_weights_loss
         _needs_ego_align = (
             torch.is_tensor(centers_world_loss)
@@ -2156,27 +2156,27 @@ class EfficientOCF(
             loss_geom_pack = self._align_geom_pack(
                 centers_world_loss, traj_frame_indices_t, future_egomotion,
                 gaussian_sigmas_world_loss, mixture_centers_world_loss,
-                mixture_sigmas_world_loss, mixture_yaw_loss, mixture_weights_loss,
+                mixture_sigmas_world_loss, mixture_quat_loss, mixture_weights_loss,
             )
             centers_world_loss_aligned_tq3 = loss_geom_pack.get("centers_world_tq3", centers_world_loss_aligned_tq3)
             gaussian_sigmas_world_loss_aligned_tq3 = loss_geom_pack.get("gaussian_sigmas_world_tq3", gaussian_sigmas_world_loss_aligned_tq3)
             mixture_centers_world_loss_aligned_tqg3 = loss_geom_pack.get("mixture_centers_world_tqg3", mixture_centers_world_loss_aligned_tqg3)
             mixture_sigmas_world_loss_aligned_tqg3 = loss_geom_pack.get("mixture_sigmas_world_tqg3", mixture_sigmas_world_loss_aligned_tqg3)
-            mixture_yaw_loss_aligned_tqg = loss_geom_pack.get("mixture_quat_tqg4", mixture_yaw_loss_aligned_tqg)
+            mixture_quat_loss_aligned_tqg = loss_geom_pack.get("mixture_quat_tqg4", mixture_quat_loss_aligned_tqg)
             mixture_weights_loss_aligned_tqg = loss_geom_pack.get("mixture_weights_tqg", mixture_weights_loss_aligned_tqg)
         if _needs_ego_align:
             with torch.no_grad():
                 vis_geom_pack = self._align_geom_pack(
                     centers_world_loss, traj_frame_indices_t, future_egomotion,
                     gaussian_sigmas_world_loss, mixture_centers_world_loss,
-                    mixture_sigmas_world_loss, mixture_yaw_loss, mixture_weights_loss,
+                    mixture_sigmas_world_loss, mixture_quat_loss, mixture_weights_loss,
                     detach=True,
                 )
             centers_world_vis_tq3 = vis_geom_pack.get("centers_world_tq3", centers_world_vis_tq3)
             gaussian_sigmas_world_vis_tq3 = vis_geom_pack.get("gaussian_sigmas_world_tq3", gaussian_sigmas_world_vis_tq3)
             mixture_centers_world_vis_tqg3 = vis_geom_pack.get("mixture_centers_world_tqg3", mixture_centers_world_vis_tqg3)
             mixture_sigmas_world_vis_tqg3 = vis_geom_pack.get("mixture_sigmas_world_tqg3", mixture_sigmas_world_vis_tqg3)
-            mixture_yaw_vis_tqg = vis_geom_pack.get("mixture_quat_tqg4", mixture_yaw_vis_tqg)
+            mixture_quat_vis_tqg = vis_geom_pack.get("mixture_quat_tqg4", mixture_quat_vis_tqg)
             mixture_weights_vis_tqg = vis_geom_pack.get("mixture_weights_tqg", mixture_weights_vis_tqg)
 
         # Build 7-frame visualization tensors (past + present + future) by
@@ -2194,13 +2194,13 @@ class EfficientOCF(
         gaussian_sigmas_world_vis_full_tq3 = gaussian_sigmas_world_vis_tq3
         mixture_centers_world_vis_full_tqg3 = mixture_centers_world_vis_tqg3
         mixture_sigmas_world_vis_full_tqg3 = mixture_sigmas_world_vis_tqg3
-        mixture_yaw_vis_full_tqg = mixture_yaw_vis_tqg
+        mixture_quat_vis_full_tqg = mixture_quat_vis_tqg
         mixture_weights_vis_full_tqg = mixture_weights_vis_tqg
         centers_world_loss_full_tq3 = centers_world_loss_aligned_tq3
         gaussian_sigmas_world_loss_full_tq3 = gaussian_sigmas_world_loss_aligned_tq3
         mixture_centers_world_loss_full_tqg3 = mixture_centers_world_loss_aligned_tqg3
         mixture_sigmas_world_loss_full_tqg3 = mixture_sigmas_world_loss_aligned_tqg3
-        mixture_yaw_loss_full_tqg = mixture_yaw_loss_aligned_tqg
+        mixture_quat_loss_full_tqg = mixture_quat_loss_aligned_tqg
         mixture_weights_loss_full_tqg = mixture_weights_loss_aligned_tqg
         past_only_count = int(_query_present_local_idx)
         # Only prepend past frames when the vis geometry actually came from the
@@ -2223,7 +2223,7 @@ class EfficientOCF(
                 gaussian_sigmas_world_vis_full_tq3 = _ppd(gaussian_sigmas_world, gaussian_sigmas_world_vis_tq3)
             mixture_centers_world_vis_full_tqg3 = _ppd(mixture_centers_world_tqg3, mixture_centers_world_vis_tqg3)
             mixture_sigmas_world_vis_full_tqg3 = _ppd(mixture_sigmas_world_tqg3, mixture_sigmas_world_vis_tqg3)
-            mixture_yaw_vis_full_tqg = _ppd(mixture_quat_tqg4, mixture_yaw_vis_tqg)
+            mixture_quat_vis_full_tqg = _ppd(mixture_quat_tqg4, mixture_quat_vis_tqg)
             mixture_weights_vis_full_tqg = _ppd(mixture_weights_tqg, mixture_weights_vis_tqg)
         traj_loss_has_present_anchor = (
             torch.is_tensor(centers_world_loss_aligned_tq3)
@@ -2241,7 +2241,7 @@ class EfficientOCF(
                 gaussian_sigmas_world_loss_full_tq3 = _pp(gaussian_sigmas_world, gaussian_sigmas_world_loss_aligned_tq3)
             mixture_centers_world_loss_full_tqg3 = _pp(mixture_centers_world_tqg3, mixture_centers_world_loss_aligned_tqg3)
             mixture_sigmas_world_loss_full_tqg3 = _pp(mixture_sigmas_world_tqg3, mixture_sigmas_world_loss_aligned_tqg3)
-            mixture_yaw_loss_full_tqg = _pp(mixture_quat_tqg4, mixture_yaw_loss_aligned_tqg)
+            mixture_quat_loss_full_tqg = _pp(mixture_quat_tqg4, mixture_quat_loss_aligned_tqg)
             mixture_weights_loss_full_tqg = _pp(mixture_weights_tqg, mixture_weights_loss_aligned_tqg)
         use_full7_temporal_sup = bool(
             traj_loss_has_present_anchor
@@ -2253,7 +2253,7 @@ class EfficientOCF(
         gaussian_sigmas_world_match_tq3 = gaussian_sigmas_world_loss
         mixture_centers_world_match_tqg3 = mixture_centers_world_loss
         mixture_sigmas_world_match_tqg3 = mixture_sigmas_world_loss
-        mixture_yaw_match_tqg = mixture_yaw_loss
+        mixture_quat_match_tqg = mixture_quat_loss
         mixture_weights_match_tqg = mixture_weights_loss
         match_gt_instance_occ3d_txyz = gt_instance_occ3d_txyz_query
         match_bbox_instance_occ3d_txyz = gt_segmentation_instance3d_txyz_query
@@ -2270,7 +2270,7 @@ class EfficientOCF(
             gaussian_sigmas_world_match_tq3 = gaussian_sigmas_world_loss_full_tq3
             mixture_centers_world_match_tqg3 = mixture_centers_world_loss_full_tqg3
             mixture_sigmas_world_match_tqg3 = mixture_sigmas_world_loss_full_tqg3
-            mixture_yaw_match_tqg = mixture_yaw_loss_full_tqg
+            mixture_quat_match_tqg = mixture_quat_loss_full_tqg
             mixture_weights_match_tqg = mixture_weights_loss_full_tqg
             match_gt_instance_occ3d_txyz = gt_instance_occ3d_txyz_query_vis
             match_bbox_instance_occ3d_txyz = gt_segmentation_instance3d_txyz_query_vis
@@ -2319,7 +2319,7 @@ class EfficientOCF(
             query_sigmas_world_tq3=gaussian_sigmas_world_match_tq3,
             query_mixture_centers_world_tqg3=mixture_centers_world_match_tqg3,
             query_mixture_sigmas_world_tqg3=mixture_sigmas_world_match_tqg3,
-            query_mixture_quat_tqg4=mixture_yaw_match_tqg,
+            query_mixture_quat_tqg4=mixture_quat_match_tqg,
             query_mixture_weights_tqg=mixture_weights_match_tqg,
             gt_instance_occ3d_txyz=match_gt_instance_occ3d_txyz,
             gt_inst_center_world_tn3=match_gt_centers_tn3,
@@ -2452,7 +2452,7 @@ class EfficientOCF(
                             mixture_sigmas_world_vis_full_tqg3 = _ppd_v(mixture_sigmas_world_tqg3, _ms)
                         _my = _traj_geom_real.get("mix_quat_tqg4", None)
                         if torch.is_tensor(_my):
-                            mixture_yaw_vis_full_tqg = _ppd_v(mixture_quat_tqg4, _my)
+                            mixture_quat_vis_full_tqg = _ppd_v(mixture_quat_tqg4, _my)
                         _mw = _traj_geom_real.get("mix_weights_tqg", None)
                         if torch.is_tensor(_mw):
                             mixture_weights_vis_full_tqg = _ppd_v(mixture_weights_tqg, _mw)
@@ -2519,14 +2519,14 @@ class EfficientOCF(
             and isinstance(query_match_inputs, dict)
             and torch.is_tensor(mixture_centers_world_loss)
             and torch.is_tensor(mixture_sigmas_world_loss)
-            and torch.is_tensor(mixture_yaw_loss)
+            and torch.is_tensor(mixture_quat_loss)
             and torch.is_tensor(mixture_weights_loss)
         ):
             with torch.no_grad():
                 query_attn_cam_targets = self.build_query_attn_cam_gaussian_targets(
                     mixture_centers_world_tqg3=mixture_centers_world_loss,
                     mixture_sigmas_world_tqg3=mixture_sigmas_world_loss,
-                    mixture_quat_tqg4=mixture_yaw_loss,
+                    mixture_quat_tqg4=mixture_quat_loss,
                     mixture_weights_tqg=mixture_weights_loss,
                     future_egomotion=future_egomotion,
                     query_match_inputs=query_match_inputs,
@@ -2542,7 +2542,7 @@ class EfficientOCF(
             and (not self.center_only_mode)
             and torch.is_tensor(mixture_centers_world_match_tqg3)
             and torch.is_tensor(mixture_sigmas_world_match_tqg3)
-            and torch.is_tensor(mixture_yaw_match_tqg)
+            and torch.is_tensor(mixture_quat_match_tqg)
             and torch.is_tensor(mixture_weights_match_tqg)
             and torch.is_tensor(match_gt_instance_occ3d_txyz)
         ):
@@ -2551,7 +2551,7 @@ class EfficientOCF(
                 sigmas_world_tq3=gaussian_sigmas_world_match_tq3,
                 mixture_centers_world_tqg3=mixture_centers_world_match_tqg3,
                 mixture_sigmas_world_tqg3=mixture_sigmas_world_match_tqg3,
-                mixture_quat_tqg4=mixture_yaw_match_tqg,
+                mixture_quat_tqg4=mixture_quat_match_tqg,
                 mixture_weights_tqg=mixture_weights_match_tqg,
                 gt_instance_occ3d_txyz_pred=match_gt_instance_occ3d_txyz,
                 bbox_instance_occ3d_txyz=match_bbox_instance_occ3d_txyz,
@@ -2631,7 +2631,7 @@ class EfficientOCF(
                 gaussian_sigmas_world_tq3=_d(gaussian_sigmas_world_vis_full_tq3),
                 mixture_centers_world_tqg3=_d(mixture_centers_world_vis_full_tqg3),
                 mixture_sigmas_world_tqg3=_d(mixture_sigmas_world_vis_full_tqg3),
-                mixture_quat_tqg4=_d(mixture_yaw_vis_full_tqg),
+                mixture_quat_tqg4=_d(mixture_quat_vis_full_tqg),
                 mixture_weights_tqg=_d(mixture_weights_vis_full_tqg),
                 query_attn_cam_score_pack=query_attn_cam_score_pack,
             )
@@ -2726,7 +2726,7 @@ class EfficientOCF(
             gaussian_sigmas_world_loss=gaussian_sigmas_world_loss,
             mixture_centers_world_loss=mixture_centers_world_loss,
             mixture_sigmas_world_loss=mixture_sigmas_world_loss,
-            mixture_yaw_loss=mixture_yaw_loss,
+            mixture_quat_loss=mixture_quat_loss,
             mixture_weights_loss=mixture_weights_loss,
             occ_dt=occ_dt,
             gt_inst_center_world_tn3=gt_inst_center_world_tn3,

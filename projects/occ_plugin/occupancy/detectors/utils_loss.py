@@ -2702,7 +2702,7 @@ class EfficientOCFLossMixin:
         gaussian_sigmas_world_loss,
         mixture_centers_world_loss,
         mixture_sigmas_world_loss,
-        mixture_yaw_loss,
+        mixture_quat_loss,
         mixture_weights_loss,
         # DT loss inputs
         occ_dt,
@@ -2944,7 +2944,7 @@ class EfficientOCFLossMixin:
                     points_world=None,
                     mixture_centers_world_tqg3=mixture_centers_world_loss,
                     mixture_sigmas_world_tqg3=mixture_sigmas_world_loss,
-                    mixture_quat_tqg4=mixture_yaw_loss,
+                    mixture_quat_tqg4=mixture_quat_loss,
                     mixture_weights_tqg=mixture_weights_loss,
                     occ_dt=occ_dt, loss_weight=0.1, mode='bilinear',
                 )
@@ -2959,7 +2959,7 @@ class EfficientOCFLossMixin:
                 gaussian_sigmas_world=gaussian_sigmas_world_loss,
                 mixture_centers_world_tqg3=mixture_centers_world_loss,
                 mixture_sigmas_world_tqg3=mixture_sigmas_world_loss,
-                mixture_quat_tqg4=mixture_yaw_loss,
+                mixture_quat_tqg4=mixture_quat_loss,
                 mixture_weights_tqg=mixture_weights_loss,
                 gt_inst_center_world_tn3=gt_inst_center_world_tn3,
                 gt_inst_center_valid_tn=gt_inst_center_valid_tn,

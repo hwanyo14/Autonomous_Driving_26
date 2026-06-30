@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-06-30 12:34 KST
+
+### Unified Gaussian Head Quaternion Rotation
+
+**핵심 내용**: Gaussian mixture rotation 경로를 yaw 기반에서 quaternion(wxyz) 기반으로 정리.
+
+**주요 변경사항**:
+- `query_head.py`: 별도 Gaussian head placeholder를 제거하고 단일 `GaussianHead(out_dim=query_num_gaussians * 11)` 출력의 `offset(3)+sigma(3)+quat(4)+weight(1)` 구조만 사용하도록 정리.
+- `query_head.py`: BEV debug Gaussian footprint 시각화가 `mixture_quat_tqg4`와 3D sigma를 받아 2D yaw 회전 대신 quaternion 기반 3D covariance의 BEV projection을 사용하도록 변경.
+- `query_head.py`: GT2P instance coverage loss의 mixture Mahalanobis 거리를 quaternion 회전 로컬 좌표계에서 계산하도록 변경.
+- `efficientocf.py`, `utils_loss.py`: 내부 로컬 변수명을 `mixture_quat_*`로 정리해 `mixture_quat_tqg4` 경로와 일관화.
+- 검증: 대상 파일 `py_compile` 통과.
+
 ## 2026-06-30 11:52 KST
 
 ### Evaluation / Inference Visualization 구현

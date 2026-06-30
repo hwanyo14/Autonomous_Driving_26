@@ -398,10 +398,6 @@ class QueryHead(nn.Module):
         self.center_head = CenterHead(embed_dim=self.embed_dim,
                                       out_dim=center_out_dim)
         self.gaussian_head = None
-        self.gaussian_offset_head = None
-        self.gaussian_sigma_head = None
-        self.gaussian_yaw_head = None
-        self.gaussian_weight_head = None
         if not self.center_only_mode:
             g = int(self.query_num_gaussians)
             self.gaussian_head = GaussianHead(
@@ -1021,7 +1017,8 @@ class QueryHead(nn.Module):
         sigma_x_px: np.ndarray,
         sigma_y_px: np.ndarray,
         color,
-        yaw_rad: np.ndarray = None,
+        sigma_z_px: np.ndarray = None,
+        quat_wxyz: np.ndarray = None,
         component_weight: np.ndarray = None,
         valid_mask: np.ndarray = None,
         vis_mode: str = "ellipse",
@@ -1048,11 +1045,15 @@ class QueryHead(nn.Module):
         sigma_y_px = np.asarray(sigma_y_px, dtype=np.float32)
         if x_idx.shape != y_idx.shape or x_idx.shape != sigma_x_px.shape or x_idx.shape != sigma_y_px.shape:
             return
+        sigma_z_px = np.ones_like(sigma_x_px, dtype=np.float32) if sigma_z_px is None else np.asarray(sigma_z_px, dtype=np.float32)
+        if sigma_z_px.shape != x_idx.shape:
+            return
         if x_idx.ndim == 1:
             x_idx = x_idx[:, None]
             y_idx = y_idx[:, None]
             sigma_x_px = sigma_x_px[:, None]
             sigma_y_px = sigma_y_px[:, None]
+            sigma_z_px = sigma_z_px[:, None]
         elif x_idx.ndim != 2:
             return
 
@@ -1066,11 +1067,12 @@ class QueryHead(nn.Module):
         elif color_arr.ndim != 2 or color_arr.shape[0] != num_queries or color_arr.shape[1] != 3:
             return
 
-        if yaw_rad is None:
-            yaw_arr = np.zeros((num_queries, num_components), dtype=np.float32)
+        if quat_wxyz is None:
+            quat_arr = np.zeros((num_queries, num_components, 4), dtype=np.float32)
+            quat_arr[..., 0] = 1.0
         else:
-            yaw_arr = np.asarray(yaw_rad, dtype=np.float32)
-            if yaw_arr.shape != x_idx.shape:
+            quat_arr = np.asarray(quat_wxyz, dtype=np.float32)
+            if quat_arr.shape != x_idx.shape + (4,):
                 return
 
         if component_weight is None:
@@ -1092,6 +1094,41 @@ class QueryHead(nn.Module):
         thickness = max(1, int(outline_thickness_px))
         prob_threshold = float(np.clip(prob_threshold, 0.0, 1.0))
         prob_alpha_scale = max(0.0, float(prob_alpha_scale))
+
+        def _bev_gaussian_params(q_idx, g_idx):
+            sx = float(abs(sigma_x_px[q_idx, g_idx]))
+            sy = float(abs(sigma_y_px[q_idx, g_idx]))
+            sz = float(abs(sigma_z_px[q_idx, g_idx]))
+            if (not np.isfinite(sx)) or (not np.isfinite(sy)) or (not np.isfinite(sz)):
+                return None
+            q = quat_arr[q_idx, g_idx].astype(np.float32)
+            norm = float(np.linalg.norm(q))
+            if (not np.isfinite(norm)) or norm <= 1e-6:
+                q = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+            else:
+                q = q / norm
+            qw, qx, qy, qz = [float(v) for v in q]
+            rot = np.array(
+                [
+                    [qw * qw + qx * qx - qy * qy - qz * qz, 2.0 * (qx * qy - qw * qz), 2.0 * (qx * qz + qw * qy)],
+                    [2.0 * (qx * qy + qw * qz), qw * qw - qx * qx + qy * qy - qz * qz, 2.0 * (qy * qz - qw * qx)],
+                    [2.0 * (qx * qz - qw * qy), 2.0 * (qy * qz + qw * qx), qw * qw - qx * qx - qy * qy + qz * qz],
+                ],
+                dtype=np.float32,
+            )
+            sig2 = np.array([sx * sx, sy * sy, sz * sz], dtype=np.float32)
+            cov_xx = float(np.sum(rot[0, :] * rot[0, :] * sig2))
+            cov_xy = float(np.sum(rot[0, :] * rot[1, :] * sig2))
+            cov_yy = float(np.sum(rot[1, :] * rot[1, :] * sig2))
+            det = max(cov_xx * cov_yy - cov_xy * cov_xy, 1e-12)
+            return (
+                max(cov_xx, 1e-12),
+                cov_xy,
+                max(cov_yy, 1e-12),
+                cov_yy / det,
+                -cov_xy / det,
+                cov_xx / det,
+            )
 
         def _blend_patch(dst_patch, mask, rgb_color, alpha_scale):
             if not np.any(mask):
@@ -1129,18 +1166,12 @@ class QueryHead(nn.Module):
 
             if vis_mode == "ellipse":
                 for g_idx in np.nonzero(q_valid)[0].tolist():
-                    sx = float(abs(sigma_x_px[q_idx, g_idx]))
-                    sy = float(abs(sigma_y_px[q_idx, g_idx]))
-                    if (not np.isfinite(sx)) or (not np.isfinite(sy)):
+                    params = _bev_gaussian_params(q_idx, g_idx)
+                    if params is None:
                         continue
-
-                    yaw = float(yaw_arr[q_idx, g_idx])
-                    if not np.isfinite(yaw):
-                        yaw = 0.0
-                    cos_y = float(np.cos(yaw))
-                    sin_y = float(np.sin(yaw))
-                    rx = max(1, int(np.ceil(trunc * np.sqrt((sx * cos_y) ** 2 + (sy * sin_y) ** 2))))
-                    ry = max(1, int(np.ceil(trunc * np.sqrt((sx * sin_y) ** 2 + (sy * cos_y) ** 2))))
+                    cov_xx, cov_xy, cov_yy, inv_xx, inv_xy, inv_yy = params
+                    rx = max(1, int(np.ceil(trunc * np.sqrt(cov_xx))))
+                    ry = max(1, int(np.ceil(trunc * np.sqrt(cov_yy))))
                     cx = int(x_idx[q_idx, g_idx])
                     cy = int(y_idx[q_idx, g_idx])
 
@@ -1156,16 +1187,14 @@ class QueryHead(nn.Module):
                     xx, yy = np.meshgrid(xs, ys)
                     dx = xx - float(cx)
                     dy = yy - float(cy)
-                    dx_rot = (cos_y * dx) + (sin_y * dy)
-                    dy_rot = (-sin_y * dx) + (cos_y * dy)
-                    norm = (dx_rot / max(sx * trunc, 1e-6)) ** 2 + (dy_rot / max(sy * trunc, 1e-6)) ** 2
+                    md2 = inv_xx * dx * dx + 2.0 * inv_xy * dx * dy + inv_yy * dy * dy
+                    norm = md2 / max(trunc * trunc, 1e-6)
                     fill_mask = norm <= 1.0
                     if not np.any(fill_mask):
                         continue
 
-                    inner_sx = max(((sx * trunc) - float(thickness)) / trunc, 1e-6)
-                    inner_sy = max(((sy * trunc) - float(thickness)) / trunc, 1e-6)
-                    inner_norm = (dx_rot / max(inner_sx * trunc, 1e-6)) ** 2 + (dy_rot / max(inner_sy * trunc, 1e-6)) ** 2
+                    inner_scale = max((trunc - (float(thickness) / max(np.sqrt(max(cov_xx, cov_yy)), 1e-6))) / trunc, 1e-6)
+                    inner_norm = norm / max(inner_scale * inner_scale, 1e-6)
                     outline_mask = fill_mask & (inner_norm >= 1.0)
 
                     patch = canvas[y0:y1 + 1, x0:x1 + 1]
@@ -1180,17 +1209,12 @@ class QueryHead(nn.Module):
             cx_all = []
             cy_all = []
             for g_idx in np.nonzero(q_valid)[0].tolist():
-                sx = float(abs(sigma_x_px[q_idx, g_idx]))
-                sy = float(abs(sigma_y_px[q_idx, g_idx]))
-                if (not np.isfinite(sx)) or (not np.isfinite(sy)):
+                params = _bev_gaussian_params(q_idx, g_idx)
+                if params is None:
                     continue
-                yaw = float(yaw_arr[q_idx, g_idx])
-                if not np.isfinite(yaw):
-                    yaw = 0.0
-                cos_y = float(np.cos(yaw))
-                sin_y = float(np.sin(yaw))
-                rx_all.append(max(1, int(np.ceil(trunc * np.sqrt((sx * cos_y) ** 2 + (sy * sin_y) ** 2)))))
-                ry_all.append(max(1, int(np.ceil(trunc * np.sqrt((sx * sin_y) ** 2 + (sy * cos_y) ** 2)))))
+                cov_xx, _, cov_yy, _, _, _ = params
+                rx_all.append(max(1, int(np.ceil(trunc * np.sqrt(cov_xx)))))
+                ry_all.append(max(1, int(np.ceil(trunc * np.sqrt(cov_yy)))))
                 cx_all.append(int(x_idx[q_idx, g_idx]))
                 cy_all.append(int(y_idx[q_idx, g_idx]))
             if len(rx_all) <= 0:
@@ -1209,15 +1233,12 @@ class QueryHead(nn.Module):
             total_prob = np.zeros_like(xx, dtype=np.float32)
 
             for g_idx in np.nonzero(q_valid)[0].tolist():
-                sx = float(abs(sigma_x_px[q_idx, g_idx]))
-                sy = float(abs(sigma_y_px[q_idx, g_idx]))
-                if (not np.isfinite(sx)) or (not np.isfinite(sy)):
+                params = _bev_gaussian_params(q_idx, g_idx)
+                if params is None:
                     continue
+                _, _, _, inv_xx, inv_xy, inv_yy = params
                 cx = float(x_idx[q_idx, g_idx])
                 cy = float(y_idx[q_idx, g_idx])
-                yaw = float(yaw_arr[q_idx, g_idx])
-                if not np.isfinite(yaw):
-                    yaw = 0.0
                 comp_w = float(weight_arr[q_idx, g_idx])
                 if not np.isfinite(comp_w):
                     comp_w = 1.0
@@ -1225,13 +1246,9 @@ class QueryHead(nn.Module):
                 if comp_w <= 0.0:
                     continue
 
-                cos_y = float(np.cos(yaw))
-                sin_y = float(np.sin(yaw))
                 dx = xx - cx
                 dy = yy - cy
-                dx_rot = (cos_y * dx) + (sin_y * dy)
-                dy_rot = (-sin_y * dx) + (cos_y * dy)
-                mahal_sq = (dx_rot / max(sx, 1e-6)) ** 2 + (dy_rot / max(sy, 1e-6)) ** 2
+                mahal_sq = inv_xx * dx * dx + 2.0 * inv_xy * dx * dy + inv_yy * dy * dy
                 support_mask = mahal_sq <= (trunc * trunc)
                 if not np.any(support_mask):
                     continue
@@ -2010,6 +2027,22 @@ class QueryHead(nn.Module):
                 return None
             return attr
 
+        def _normalize_vector_attr(attr_tqgd, points_t, dim):
+            if (not torch.is_tensor(attr_tqgd)) or points_t is None:
+                return None
+            if attr_tqgd.dim() == 4:
+                attr = attr_tqgd
+            elif attr_tqgd.dim() == 3 and points_t.dim() == 4 and int(points_t.shape[2]) == 1:
+                attr = attr_tqgd.unsqueeze(2)
+            elif attr_tqgd.dim() == 5 and int(attr_tqgd.shape[0]) == 1:
+                attr = attr_tqgd[0]
+            else:
+                return None
+            attr = attr[:T].to(torch.float32)
+            if tuple(attr.shape) != tuple(points_t.shape[:-1]) + (int(dim),):
+                return None
+            return attr
+
         def _project_points(points_t, scores_t=None, class_ids_t=None):
             if points_t is None:
                 return None, None, None, None, None
@@ -2033,33 +2066,35 @@ class QueryHead(nn.Module):
                 class_np = class_ids_t.to(device=pc_min.device, dtype=torch.long).cpu().numpy()
             return ix_i, iy_i, valid_np, scores_np, class_np
 
-        def _project_gaussians(points_t, sigmas_t, yaw_t=None, weight_t=None):
+        def _project_gaussians(points_t, sigmas_t, quat_t=None, weight_t=None):
             if points_t is None or sigmas_t is None:
-                return None, None, None, None, None, None, None
+                return None, None, None, None, None, None, None, None
             points_t = points_t.to(device=pc_min.device, dtype=torch.float32)
             sigmas_t = sigmas_t.to(device=pc_min.device, dtype=torch.float32)
             ix_t = (points_t[..., 0] - pc_min[0]) / voxel_size[0] - off
             iy_t = (points_t[..., 1] - pc_min[1]) / voxel_size[1] - off
             sigma_x_t = (sigmas_t[..., 0] / voxel_size[0]).to(torch.float32)
             sigma_y_t = (sigmas_t[..., 1] / voxel_size[1]).to(torch.float32)
+            sigma_z_t = (sigmas_t[..., 2] / voxel_size[2]).to(torch.float32)
             valid_t = (
                 (ix_t >= 0.0) & (ix_t <= float(X - 1)) &
                 (iy_t >= 0.0) & (iy_t <= float(Y - 1)) &
-                torch.isfinite(sigma_x_t) & torch.isfinite(sigma_y_t) &
-                (sigma_x_t > 0.0) & (sigma_y_t > 0.0)
+                torch.isfinite(sigma_x_t) & torch.isfinite(sigma_y_t) & torch.isfinite(sigma_z_t) &
+                (sigma_x_t > 0.0) & (sigma_y_t > 0.0) & (sigma_z_t > 0.0)
             )
             ix_i = torch.round(ix_t).to(torch.long).cpu().numpy()
             iy_i = torch.round(iy_t).to(torch.long).cpu().numpy()
             sx_np = sigma_x_t.cpu().numpy()
             sy_np = sigma_y_t.cpu().numpy()
-            yaw_np = None
+            sz_np = sigma_z_t.cpu().numpy()
+            quat_np = None
             weight_np = None
-            if torch.is_tensor(yaw_t):
-                yaw_np = yaw_t[:T].to(device=pc_min.device, dtype=torch.float32).cpu().numpy()
+            if torch.is_tensor(quat_t):
+                quat_np = quat_t[:T].to(device=pc_min.device, dtype=torch.float32).cpu().numpy()
             if torch.is_tensor(weight_t):
                 weight_np = weight_t[:T].to(device=pc_min.device, dtype=torch.float32).cpu().numpy()
             valid_np = valid_t.cpu().numpy()
-            return ix_i, iy_i, sx_np, sy_np, yaw_np, weight_np, valid_np
+            return ix_i, iy_i, sx_np, sy_np, sz_np, quat_np, weight_np, valid_np
 
         use_score_bundle = isinstance(query_vis_bundle, dict)
         bundle_top_k = 0
@@ -2079,26 +2114,26 @@ class QueryHead(nn.Module):
             sig_candidate = _normalize_sigmas(query_vis_bundle.get("candidate_mixture_sigmas_tqg3", None), gpts_candidate)
             sig_selected = _normalize_sigmas(query_vis_bundle.get("selected_mixture_sigmas_tqg3", None), gpts_selected)
             sig_matched = _normalize_sigmas(query_vis_bundle.get("matched_mixture_sigmas_tqg3", None), gpts_matched)
-            yaw_candidate = _normalize_scalar_attr(query_vis_bundle.get("candidate_mixture_quat_tqg4", None), gpts_candidate)
-            yaw_selected = _normalize_scalar_attr(query_vis_bundle.get("selected_mixture_quat_tqg4", None), gpts_selected)
-            yaw_matched = _normalize_scalar_attr(query_vis_bundle.get("matched_mixture_quat_tqg4", None), gpts_matched)
+            quat_candidate = _normalize_vector_attr(query_vis_bundle.get("candidate_mixture_quat_tqg4", None), gpts_candidate, dim=4)
+            quat_selected = _normalize_vector_attr(query_vis_bundle.get("selected_mixture_quat_tqg4", None), gpts_selected, dim=4)
+            quat_matched = _normalize_vector_attr(query_vis_bundle.get("matched_mixture_quat_tqg4", None), gpts_matched, dim=4)
             w_candidate = _normalize_scalar_attr(query_vis_bundle.get("candidate_mixture_weights_tqg", None), gpts_candidate)
             w_selected = _normalize_scalar_attr(query_vis_bundle.get("selected_mixture_weights_tqg", None), gpts_selected)
             w_matched = _normalize_scalar_attr(query_vis_bundle.get("matched_mixture_weights_tqg", None), gpts_matched)
             if gpts_candidate is None:
                 gpts_candidate = pts_candidate
                 sig_candidate = _normalize_sigmas(query_vis_bundle.get("candidate_sigmas_tq3", None), gpts_candidate)
-                yaw_candidate = None
+                quat_candidate = None
                 w_candidate = None
             if gpts_selected is None:
                 gpts_selected = pts_selected
                 sig_selected = _normalize_sigmas(query_vis_bundle.get("selected_sigmas_tq3", None), gpts_selected)
-                yaw_selected = None
+                quat_selected = None
                 w_selected = None
             if gpts_matched is None:
                 gpts_matched = pts_matched
                 sig_matched = _normalize_sigmas(query_vis_bundle.get("matched_sigmas_tq3", None), gpts_matched)
-                yaw_matched = None
+                quat_matched = None
                 w_matched = None
             sc_candidate = _expand_attr_for_points(query_vis_bundle.get("candidate_score_q", None), pts_candidate)
             sc_selected = _expand_attr_for_points(query_vis_bundle.get("selected_score_q", None), pts_selected)
@@ -2127,9 +2162,9 @@ class QueryHead(nn.Module):
             sig_candidate = None
             sig_selected = None
             sig_matched = None
-            yaw_candidate = None
-            yaw_selected = None
-            yaw_matched = None
+            quat_candidate = None
+            quat_selected = None
+            quat_matched = None
             w_candidate = None
             w_selected = None
             w_matched = None
@@ -2145,14 +2180,14 @@ class QueryHead(nn.Module):
         mat_x_i, mat_y_i, mat_valid_np, mat_score_np, mat_cls_np = _project_points(
             pts_matched, sc_matched, cls_matched
         )
-        cand_gx_i, cand_gy_i, cand_sx_np, cand_sy_np, cand_yaw_np, cand_w_np, cand_gvalid_np = _project_gaussians(
-            gpts_candidate, sig_candidate, yaw_candidate, w_candidate
+        cand_gx_i, cand_gy_i, cand_sx_np, cand_sy_np, cand_sz_np, cand_quat_np, cand_w_np, cand_gvalid_np = _project_gaussians(
+            gpts_candidate, sig_candidate, quat_candidate, w_candidate
         )
-        sel_gx_i, sel_gy_i, sel_sx_np, sel_sy_np, sel_yaw_np, sel_w_np, sel_gvalid_np = _project_gaussians(
-            gpts_selected, sig_selected, yaw_selected, w_selected
+        sel_gx_i, sel_gy_i, sel_sx_np, sel_sy_np, sel_sz_np, sel_quat_np, sel_w_np, sel_gvalid_np = _project_gaussians(
+            gpts_selected, sig_selected, quat_selected, w_selected
         )
-        mat_gx_i, mat_gy_i, mat_sx_np, mat_sy_np, mat_yaw_np, mat_w_np, mat_gvalid_np = _project_gaussians(
-            gpts_matched, sig_matched, yaw_matched, w_matched
+        mat_gx_i, mat_gy_i, mat_sx_np, mat_sy_np, mat_sz_np, mat_quat_np, mat_w_np, mat_gvalid_np = _project_gaussians(
+            gpts_matched, sig_matched, quat_matched, w_matched
         )
         bundle_has_gaussian = any(
             x is not None for x in (cand_sx_np, sel_sx_np, mat_sx_np)
@@ -2325,7 +2360,8 @@ class QueryHead(nn.Module):
                             cand_sx_np[t],
                             cand_sy_np[t],
                             lo_color,
-                            yaw_rad=None if cand_yaw_np is None else cand_yaw_np[t],
+                            sigma_z_px=None if cand_sz_np is None else cand_sz_np[t],
+                            quat_wxyz=None if cand_quat_np is None else cand_quat_np[t],
                             component_weight=None if cand_w_np is None else cand_w_np[t],
                             valid_mask=cand_gvalid_np[t],
                             vis_mode=gaussian_vis_mode,
@@ -2346,7 +2382,8 @@ class QueryHead(nn.Module):
                             sel_sx_np[t],
                             sel_sy_np[t],
                             hi_color,
-                            yaw_rad=None if sel_yaw_np is None else sel_yaw_np[t],
+                            sigma_z_px=None if sel_sz_np is None else sel_sz_np[t],
+                            quat_wxyz=None if sel_quat_np is None else sel_quat_np[t],
                             component_weight=None if sel_w_np is None else sel_w_np[t],
                             valid_mask=sel_gvalid_np[t],
                             vis_mode=gaussian_vis_mode,
@@ -2365,7 +2402,8 @@ class QueryHead(nn.Module):
                             sel_sx_np[t],
                             sel_sy_np[t],
                             hi_color,
-                            yaw_rad=None if sel_yaw_np is None else sel_yaw_np[t],
+                            sigma_z_px=None if sel_sz_np is None else sel_sz_np[t],
+                            quat_wxyz=None if sel_quat_np is None else sel_quat_np[t],
                             component_weight=None if sel_w_np is None else sel_w_np[t],
                             valid_mask=sel_gvalid_np[t],
                             vis_mode=gaussian_vis_mode,
@@ -2397,7 +2435,8 @@ class QueryHead(nn.Module):
                             sel_sx_np[t],
                             sel_sy_np[t],
                             hi_gauss_colors,
-                            yaw_rad=None if sel_yaw_np is None else sel_yaw_np[t],
+                            sigma_z_px=None if sel_sz_np is None else sel_sz_np[t],
+                            quat_wxyz=None if sel_quat_np is None else sel_quat_np[t],
                             component_weight=None if sel_w_np is None else sel_w_np[t],
                             valid_mask=sel_gvalid_np[t],
                             vis_mode=gaussian_vis_mode,
@@ -2418,7 +2457,8 @@ class QueryHead(nn.Module):
                             mat_sx_np[t],
                             mat_sy_np[t],
                             matched_color,
-                            yaw_rad=None if mat_yaw_np is None else mat_yaw_np[t],
+                            sigma_z_px=None if mat_sz_np is None else mat_sz_np[t],
+                            quat_wxyz=None if mat_quat_np is None else mat_quat_np[t],
                             component_weight=None if mat_w_np is None else mat_w_np[t],
                             valid_mask=mat_gvalid_np[t],
                             vis_mode=gaussian_vis_mode,
@@ -4120,9 +4160,13 @@ class QueryHead(nn.Module):
             (not self.center_only_mode)
             and torch.is_tensor(mixture_centers_world_tqg3)
             and torch.is_tensor(mixture_sigmas_world_tqg3)
+            and torch.is_tensor(mixture_quat_tqg4)
             and torch.is_tensor(mixture_weights_tqg)
             and mixture_centers_world_tqg3.dim() == 4
             and tuple(mixture_centers_world_tqg3.shape) == tuple(mixture_sigmas_world_tqg3.shape)
+            and mixture_quat_tqg4.dim() == 4
+            and int(mixture_quat_tqg4.shape[-1]) == 4
+            and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_quat_tqg4.shape[:3])
             and tuple(mixture_centers_world_tqg3.shape[:3]) == tuple(mixture_weights_tqg.shape)
             and int(mixture_centers_world_tqg3.shape[0]) >= T_pred
             and int(mixture_centers_world_tqg3.shape[1]) == Q
@@ -4161,6 +4205,9 @@ class QueryHead(nn.Module):
         if use_mixture:
             comp_mu_tqg3 = mixture_centers_world_tqg3[:T_pred].to(device=pred_mu_tq3.device, dtype=torch.float32)
             comp_sigma_tqg3 = mixture_sigmas_world_tqg3[:T_pred].to(device=pred_mu_tq3.device, dtype=torch.float32).clamp(min=1e-3)
+            comp_rot_tqg33 = quat_to_rotmat_wxyz(
+                mixture_quat_tqg4[:T_pred].to(device=pred_mu_tq3.device, dtype=torch.float32)
+            )
             comp_weight_tqg = mixture_weights_tqg[:T_pred].to(device=pred_mu_tq3.device, dtype=torch.float32).clamp(0.0, 1.0)
             loss_cov_gt_acc = pred_mu_tq3.new_tensor(0.0)
             loss_cov_q_acc = pred_mu_tq3.new_tensor(0.0)
@@ -4175,13 +4222,15 @@ class QueryHead(nn.Module):
                 gt_k3 = gt_centers_tn3[t, valid_n, :]
                 comp_m3 = comp_mu_tqg3[t].reshape(-1, 3)
                 sigma_m3 = comp_sigma_tqg3[t].reshape(-1, 3)
+                rot_m33 = comp_rot_tqg33[t].reshape(-1, 3, 3)
                 weight_m = comp_weight_tqg[t].reshape(-1)
                 if comp_m3.numel() == 0:
                     continue
 
                 diff_mk3 = comp_m3[:, None, :] - gt_k3[None, :, :]
                 d_mk_m = diff_mk3.pow(2).sum(dim=-1).clamp(min=eps).sqrt()
-                d2_mk = (diff_mk3 / sigma_m3[:, None, :]).pow(2).sum(dim=-1)
+                local_diff_mk3 = torch.einsum("mkc,mcd->mkd", diff_mk3, rot_m33)
+                d2_mk = (local_diff_mk3 / sigma_m3[:, None, :]).pow(2).sum(dim=-1)
                 aff_mk = weight_m[:, None] * torch.exp(-0.5 * d2_mk / tau_v)
                 lam_k = aff_mk.sum(dim=0)
                 p_hit_k = (-torch.expm1(-lam_k)).clamp(min=eps, max=1.0)
