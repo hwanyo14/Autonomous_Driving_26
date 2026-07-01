@@ -477,7 +477,7 @@ model_cfg = dict(
     # ===== [임계값 1/2] occ 점유 판정 =====================================
     # metric + 2D occ-grid + 3D mixture3d 에 공통 적용. config 값=학습·추론 공통.
     # 추론에서만 env EOCF_EVAL_OCC_THR 주면 그때 override. (fg score는 visualization_cfg)
-    occ_score_threshold=0.5, # occ 임계값 학습/추론/시각화 공통
+    occ_score_threshold=0.75, # occ 임계값 학습/추론/시각화 공통
     # ===== [임계값 2/2] query(fg) score =================================
     # query 선택 + 2D 표시 + 3D 필터 에 공통 적용. config 값=학습·추론 공통.
     # 추론에서만 env EOCF_EVAL_FG_THR 주면 그때 override. (occ는 model_cfg의 occ_score_threshold)
