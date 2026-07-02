@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-07-02 12:59 KST
+
+### Query Attention Per-Camera Soft-IoU
+
+**핵심 내용**: query attention bbox supervision, suppress 항, matcher soft-IoU cost를 camera sum 없이 `[Ncam,H,W]` 기준으로 계산하도록 동기화.
+
+**주요 변경사항**:
+- `utils_loss.py`: matched `loss_query_attn_bbox`를 `-log(inside_mass)`에서 per-camera `amax` 정규화 soft-IoU loss로 변경. GT mask는 camera 축으로 broadcast하고 `Ncam*H*W` 전체 기준으로 inter/union 계산.
+- `utils_loss.py`: `other_weight`, `unmatched_weight` suppress 항도 per-camera `amax` 정규화 map에서 forbidden mask mass 비율을 계산하도록 변경. soft-IoU debug mean/min/max 추가.
+- `utils_matcher.py`: `_compute_query_attn_soft_iou_cost_qn`도 camera sum을 제거하고 loss와 동일하게 `[Ncam,H,W]` 전체 `amax`/`sum`/`none` 정규화 후 soft-IoU cost 계산.
+- 검증: `utils_loss.py`, `utils_matcher.py` `py_compile` 통과. dummy torch 호출은 현재 shell Python에 `torch`가 없어 미실행.
+
 ## 2026-06-30 13:12 KST
 
 ### Remaining Data Loader Pruning

@@ -42,6 +42,11 @@
 
 ## 2026-06-23 KST — QueryDepthHead soft depth CE 검증 메모
 
+## 2026-07-02 KST — Query attention per-camera soft-IoU 검증 주의
+
+- 현재 shell Python에는 `torch`가 없어 per-camera soft-IoU dummy 함수 호출이 `ModuleNotFoundError: No module named 'torch'`로 중단됨.
+- 이번 변경 검증은 `utils_loss.py`, `utils_matcher.py`의 `py_compile`로 수행함. 실제 학습 env에서 작은 batch smoke test를 한 번 확인할 것.
+
 - `tools/misc/smoke_past_frame_matching.py` 실행은 현재 shell Python에 `torch`가 없어 `ModuleNotFoundError: No module named 'torch'`로 중단됨. 변경 파일 `py_compile`과 `git diff --check`는 통과.
 
 ## 2026-06-21 KST — Query 이진 분류(bg/fg) 전환 주의사항

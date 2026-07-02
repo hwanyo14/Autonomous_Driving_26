@@ -705,6 +705,9 @@ class EfficientOCFLossMixin:
             "dbg_query_attn_bbox_inside_mass_min": z,
             "dbg_query_attn_bbox_inside_mass_max": z,
             "dbg_query_attn_bbox_outside_mass_mean": z,
+            "dbg_query_attn_bbox_soft_iou_mean": z,
+            "dbg_query_attn_bbox_soft_iou_min": z,
+            "dbg_query_attn_bbox_soft_iou_max": z,
             "dbg_query_attn_bbox_other_mass_mean": z,
             "dbg_query_attn_bbox_other_mass_max": z,
             "dbg_query_attn_bbox_unmatched_mass_mean": z,
@@ -818,6 +821,11 @@ class EfficientOCFLossMixin:
             union_sum_t1 = pred_tqp.new_zeros((t, 1))
         if k > 0:
             pred_tkp = pred_tqp.index_select(1, mq)
+            pred_raw_tknp = attn_weights_sel_tqnhw.index_select(1, mq).to(
+                device=pred_tqp.device, dtype=torch.float32
+            ).clamp_min(0.0).reshape(t, k, n_cam, p)
+            pred_soft_den_tk11 = pred_raw_tknp.amax(dim=(2, 3), keepdim=True).clamp_min(eps_v)
+            pred_soft_tknp = (pred_raw_tknp / pred_soft_den_tk11).clamp(0.0, 1.0)
             target_mask_tkp = gt_inst_mask_tnhw[:t].index_select(1, mi).reshape(t, k, p).to(
                 device=pred_tqp.device, dtype=torch.float32
             )
@@ -828,14 +836,23 @@ class EfficientOCFLossMixin:
             if not bool((target_sum_tk > 0.0).any().item()):
                 out["dbg_query_attn_bbox_empty_gt_mask"] = z.new_tensor(1.0)
             valid_tk = target_valid_tk & (target_sum_tk > 0.0)
-            valid_tk = valid_tk & torch.isfinite(pred_tkp).all(dim=-1)
+            valid_tk = valid_tk & torch.isfinite(pred_soft_tknp).all(dim=(2, 3))
             valid_f = valid_tk.to(torch.float32)
             matched_valid_cnt = valid_f.sum()
             if bool((matched_valid_cnt > 0).item()):
+                inter_tk = (pred_soft_tknp * target_mask_tkp.unsqueeze(2)).sum(dim=(2, 3))
+                pred_sum_tk = pred_soft_tknp.sum(dim=(2, 3))
+                target_sum_cam_tk = target_sum_tk * float(n_cam)
+                union_tk = (pred_sum_tk + target_sum_cam_tk - inter_tk).clamp_min(0.0)
+                soft_iou_tk = (inter_tk / union_tk.clamp_min(eps_v)).clamp(0.0, 1.0)
+                loss_tk = 1.0 - soft_iou_tk
+                matched_raw = (loss_tk * valid_f).sum() / matched_valid_cnt.clamp_min(1.0)
+                soft_iou_valid = soft_iou_tk[valid_tk]
+                out["dbg_query_attn_bbox_soft_iou_mean"] = soft_iou_valid.mean()
+                out["dbg_query_attn_bbox_soft_iou_min"] = soft_iou_valid.min()
+                out["dbg_query_attn_bbox_soft_iou_max"] = soft_iou_valid.max()
                 inside_mass_tk = (pred_tkp * target_mask_tkp).sum(dim=-1).clamp(0.0, 1.0)
                 outside_mass_tk = (1.0 - inside_mass_tk).clamp(0.0, 1.0)
-                loss_tk = -torch.log(inside_mass_tk.clamp_min(eps_v))
-                matched_raw = (loss_tk * valid_f).sum() / matched_valid_cnt.clamp_min(1.0)
                 inside_valid = inside_mass_tk[valid_tk]
                 outside_valid = outside_mass_tk[valid_tk]
                 out["dbg_query_attn_bbox_inside_mass_mean"] = inside_valid.mean()
@@ -856,7 +873,11 @@ class EfficientOCFLossMixin:
                     other_valid_f = other_valid_tk.to(torch.float32)
                     other_valid_cnt = other_valid_f.sum()
                     if bool((other_valid_cnt > 0).item()):
-                        other_mass_tk = (pred_tkp * other_mask_tkp).sum(dim=-1).clamp(0.0, 1.0)
+                        pred_soft_sum_tk = pred_soft_tknp.sum(dim=(2, 3)).clamp_min(eps_v)
+                        other_mass_tk = (
+                            (pred_soft_tknp * other_mask_tkp.unsqueeze(2)).sum(dim=(2, 3))
+                            / pred_soft_sum_tk
+                        ).clamp(0.0, 1.0)
                         if other_mode == "union_log":
                             other_loss_tk = -torch.log((1.0 - other_mass_tk).clamp_min(eps_v))
                         else:
@@ -875,10 +896,18 @@ class EfficientOCFLossMixin:
             out["dbg_query_attn_bbox_unmatched_count"] = z.new_tensor(float(u))
             if u > 0:
                 pred_tup = pred_tqp.index_select(1, uq)
-                union_mask_tup = union_mask_tp.unsqueeze(1)
-                union_mass_tu = (pred_tup * union_mask_tup).sum(dim=-1).clamp(0.0, 1.0)
+                pred_raw_tunp = attn_weights_sel_tqnhw.index_select(1, uq).to(
+                    device=pred_tqp.device, dtype=torch.float32
+                ).clamp_min(0.0).reshape(t, u, n_cam, p)
+                pred_soft_den_tu11 = pred_raw_tunp.amax(dim=(2, 3), keepdim=True).clamp_min(eps_v)
+                pred_soft_tunp = (pred_raw_tunp / pred_soft_den_tu11).clamp(0.0, 1.0)
+                pred_soft_sum_tu = pred_soft_tunp.sum(dim=(2, 3)).clamp_min(eps_v)
+                union_mass_tu = (
+                    (pred_soft_tunp * union_mask_tp.unsqueeze(1).unsqueeze(2)).sum(dim=(2, 3))
+                    / pred_soft_sum_tu
+                ).clamp(0.0, 1.0)
                 unmatched_valid_tu = (union_sum_t1.squeeze(-1) > 0.0).unsqueeze(1).expand(t, u)
-                unmatched_valid_tu = unmatched_valid_tu & torch.isfinite(pred_tup).all(dim=-1)
+                unmatched_valid_tu = unmatched_valid_tu & torch.isfinite(pred_soft_tunp).all(dim=(2, 3))
                 unmatched_valid_f = unmatched_valid_tu.to(torch.float32)
                 unmatched_valid_cnt = unmatched_valid_f.sum()
                 if bool((unmatched_valid_cnt > 0).item()):

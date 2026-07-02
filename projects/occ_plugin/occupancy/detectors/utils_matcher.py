@@ -333,7 +333,7 @@ class EfficientOCFMatcherMixin:
         ):
             return None, None
 
-        t_attn, q_count, _n_cam, h_attn, w_attn = [int(v) for v in query_attn_weights_tqnhw.shape]
+        t_attn, q_count, n_cam, h_attn, w_attn = [int(v) for v in query_attn_weights_tqnhw.shape]
         t_gt, n_inst, h_gt, w_gt = [int(v) for v in gt_inst_mask_tnhw.shape]
         if (
             t_attn <= 0
@@ -360,27 +360,27 @@ class EfficientOCFMatcherMixin:
             attn_sel_tqnhw = query_attn_weights_tqnhw[:t]
 
         eps_v = float(max(1e-12, eps))
-        pred_tqp = attn_sel_tqnhw.to(torch.float32).sum(dim=2).reshape(t, q_count, -1).clamp_min(0.0)
+        pred_tqcp = attn_sel_tqnhw.to(torch.float32).reshape(t, q_count, n_cam, -1).clamp_min(0.0)
 
         pred_norm_mode = str(pred_norm).lower()
         if pred_norm_mode == "sum":
-            pred_den_tq1 = pred_tqp.sum(dim=-1, keepdim=True)
-            pred_tqp = pred_tqp / pred_den_tq1.clamp_min(eps_v)
+            pred_den_tq11 = pred_tqcp.sum(dim=(2, 3), keepdim=True)
+            pred_tqcp = pred_tqcp / pred_den_tq11.clamp_min(eps_v)
         elif pred_norm_mode == "none":
-            pred_tqp = pred_tqp.clamp(0.0, 1.0)
+            pred_tqcp = pred_tqcp.clamp(0.0, 1.0)
         else:
-            pred_den_tq1 = pred_tqp.amax(dim=-1, keepdim=True)
-            pred_tqp = pred_tqp / pred_den_tq1.clamp_min(eps_v)
-        pred_tqp = pred_tqp.clamp(0.0, 1.0)
+            pred_den_tq11 = pred_tqcp.amax(dim=(2, 3), keepdim=True)
+            pred_tqcp = pred_tqcp / pred_den_tq11.clamp_min(eps_v)
+        pred_tqcp = pred_tqcp.clamp(0.0, 1.0)
 
-        gt_tnp = gt_inst_mask_tnhw[:t].to(device=pred_tqp.device, dtype=torch.float32).reshape(t, n_inst, -1)
-        valid_tn = gt_inst_valid_tn[:t].to(device=pred_tqp.device, dtype=torch.bool)
+        gt_tnp = gt_inst_mask_tnhw[:t].to(device=pred_tqcp.device, dtype=torch.float32).reshape(t, n_inst, -1)
+        valid_tn = gt_inst_valid_tn[:t].to(device=pred_tqcp.device, dtype=torch.bool)
         gt_sum_tn = gt_tnp.sum(dim=-1)
         valid_tn = valid_tn & (gt_sum_tn > 0.0)
 
-        inter_tqn = torch.einsum("tqp,tnp->tqn", pred_tqp, gt_tnp)
-        pred_sum_tq1 = pred_tqp.sum(dim=-1, keepdim=True)
-        gt_sum_t1n = gt_sum_tn[:, None, :]
+        inter_tqn = torch.einsum("tqcp,tnp->tqn", pred_tqcp, gt_tnp)
+        pred_sum_tq1 = pred_tqcp.sum(dim=(2, 3), keepdim=True).squeeze(-1)
+        gt_sum_t1n = gt_sum_tn[:, None, :] * float(n_cam)
         union_tqn = (pred_sum_tq1 + gt_sum_t1n - inter_tqn).clamp_min(0.0)
         iou_tqn = inter_tqn / union_tqn.clamp_min(eps_v)
         cost_tqn = (1.0 - iou_tqn).clamp(0.0, 1.0)
