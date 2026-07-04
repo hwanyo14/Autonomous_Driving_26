@@ -1434,7 +1434,8 @@ class LoadInstanceWithFlow(object):
                     continue
                 if self.use_lyft and key == 'height':
                     continue
-                results[key] = torch.cat(value, dim=0)
+                if isinstance(value, (list, tuple)) and all(torch.is_tensor(v) for v in value):
+                    results[key] = torch.cat(value, dim=0)
 
             return results
 
@@ -1614,6 +1615,7 @@ class LoadInstanceWithFlow(object):
                 continue
             if self.use_lyft and key == 'height':
                 continue
-            results[key] = torch.cat(value, dim=0)
+            if isinstance(value, (list, tuple)) and all(torch.is_tensor(v) for v in value):
+                results[key] = torch.cat(value, dim=0)
 
         return results

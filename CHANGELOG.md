@@ -1,5 +1,61 @@
 # Changelog
 
+## 2026-07-03 22:55 KST
+
+### Per-Camera Softargmax Top-K Lift
+
+**핵심 내용**: per-camera query attention softargmax를 sharpen하고, soft-lift center 선택을 top-1 camera에서 top-3 camera mass 가중평균으로 변경.
+
+**주요 변경사항**:
+- `utils_query_projection.py`: soft-lift 경로에 top-k camera 선택 helper 추가. raw camera attention mass 기준 top-3 유효 camera의 lifted center를 mass-normalized weight로 평균.
+- `efficientocf_config.py`, `base_config.py`, `base_config_no_pix.py`: `query_attn_softargmax_tau=0.5`, `query_attn_softargmax_camera_topk=3` 설정 연결.
+- depth loss의 camera target 선택은 기존 top-1 동작 유지.
+- 검증: 대상 Python 파일 `py_compile`, `git diff --check` 통과. 현재 shell Python에 `torch`가 없어 synthetic tensor smoke는 미실행.
+
+## 2026-07-03 10:44 KST
+
+### Per-Camera KL Query Attention BBox Loss
+
+**핵심 내용**: query attention bbox supervision을 per-camera flatten soft-IoU에서 `[Ncam,H,W]` 전체 분포 기준 KL supervision으로 변경하고, matcher metric을 `soft_iou`로 전환.
+
+**주요 변경사항**:
+- `utils_loss.py`: matched bbox loss를 `[Ncam,H*W]` 전체 probability KL(`target || pred`)로 계산. GT mask는 camera 축으로 broadcast하고 `target_sum * Ncam` 기준 정규화.
+- `utils_loss.py`: unmatched bbox loss도 `inverse_union_dist_thw`를 camera 축으로 broadcast한 per-camera KL로 복구. `other_weight` suppress는 유지하되 KL pred probability 기준 mass로 계산.
+- `base_config.py`: `query_attn_match_metric='inside_log'`를 `query_attn_match_metric='soft_iou'`로 변경.
+- 검증: `utils_loss.py`, `utils_matcher.py`, `base_config.py` `py_compile`, `git diff --check` 통과. 현재 shell Python에 `torch`가 없어 synthetic tensor smoke는 미실행.
+
+## 2026-07-02 17:44 KST
+
+### Query Size Debug Return Fix
+
+**핵심 내용**: `forward_train`에서 TensorBoard용 `query_size_dbg`를 loss aggregation에 넘기지만 `extract_feat_query` 반환값에서 받지 않아 발생한 `NameError` 수정.
+
+**주요 변경사항**:
+- `efficientocf.py`: `extract_feat_query` 반환 tuple 끝에 `query_size_dbg` 추가, `forward_train` unpack에 연결.
+- 검증: `efficientocf.py` `py_compile`, `git diff --check` 통과.
+
+## 2026-07-02 17:41 KST
+
+### LoadingInstance Cache Concat Guard
+
+**핵심 내용**: cached/regenerated instance loading 경로에서 tensor list가 아닌 스칼라 메타 값에 `torch.cat`을 호출해 DataLoader worker가 실패하던 문제 수정.
+
+**주요 변경사항**:
+- `loading_instance.py`: 결과 병합 루프에서 `list/tuple`이고 모든 원소가 tensor인 경우에만 `torch.cat` 수행. int 등 메타 값은 그대로 유지.
+- 검증: `loading_instance.py` `py_compile`, `git diff --check` 통과.
+
+## 2026-07-02 17:26 KST
+
+### Query Size Embedding & TensorBoard Debug
+
+**핵심 내용**: query attention hard pixel count와 query depth 기반 size scalar를 Gaussian head 입력 feature에 gated residual로 주입하는 ablation 옵션 추가.
+
+**주요 변경사항**:
+- `query_head.py`: hard threshold pixel count, depth-normalized `log1p` scalar, size MLP embedding, learnable gate 추가. size embedding은 Gaussian head 입력에만 적용.
+- `efficientocf.py`, `efficientocf_config.py`, `base_config.py`: `use_query_size_embedding` 및 threshold/ref depth/log alpha/gate init config 연결.
+- `utils_loss.py`: TensorBoard용 `dbg/query_size_*` 통계 보존. depth/pixel count min/max/mean, size embedding mean/var, 대상 query feature mean/var, gate 값 로깅.
+- 검증: 대상 Python 파일 `py_compile` 통과.
+
 ## 2026-07-02 12:59 KST
 
 ### Query Attention Per-Camera Soft-IoU

@@ -120,6 +120,69 @@ class EfficientOCFQueryProjectionMixin:
             "multi_cam_candidate_count": (candidate_count_tq > 1).to(torch.float32).sum(),
         }
 
+    @staticmethod
+    def _select_topk_cameras_by_mass(
+        cam_mass_tqn: torch.Tensor,
+        valid_mask_tqn: torch.Tensor,
+        topk: int = 3,
+    ):
+        if (
+            (not torch.is_tensor(cam_mass_tqn))
+            or (not torch.is_tensor(valid_mask_tqn))
+            or cam_mass_tqn.dim() != 3
+            or valid_mask_tqn.dim() != 3
+            or tuple(cam_mass_tqn.shape) != tuple(valid_mask_tqn.shape)
+        ):
+            return None
+        valid_mask_tqn = valid_mask_tqn.to(torch.bool)
+        cam_mass_tqn = cam_mass_tqn.to(torch.float32).clamp_min(0.0)
+        _t, _q, n_cam = [int(v) for v in cam_mass_tqn.shape]
+        k = max(1, min(int(topk), n_cam))
+
+        candidate_count_tq = valid_mask_tqn.to(torch.long).sum(dim=-1)
+        selected_valid_tq = candidate_count_tq > 0
+        masked_mass_tqn = cam_mass_tqn.masked_fill(~valid_mask_tqn, float("-inf"))
+        top_mass_tqk, selected_cam_idx_tqk = torch.topk(masked_mass_tqn, k=k, dim=-1)
+        selected_cam_valid_tqk = torch.gather(
+            valid_mask_tqn,
+            dim=-1,
+            index=selected_cam_idx_tqk,
+        ) & selected_valid_tq.unsqueeze(-1)
+
+        top_mass_tqk = torch.where(
+            selected_cam_valid_tqk,
+            top_mass_tqk.clamp_min(0.0),
+            torch.zeros_like(top_mass_tqk),
+        )
+        mass_sum_tq1 = top_mass_tqk.sum(dim=-1, keepdim=True)
+        valid_count_tq1 = selected_cam_valid_tqk.to(torch.float32).sum(dim=-1, keepdim=True)
+        uniform_weight_tqk = selected_cam_valid_tqk.to(torch.float32) / valid_count_tq1.clamp_min(1.0)
+        selected_cam_weight_tqk = torch.where(
+            mass_sum_tq1 > 0.0,
+            top_mass_tqk / mass_sum_tq1.clamp_min(1e-12),
+            uniform_weight_tqk,
+        )
+        selected_cam_weight_tqk = torch.where(
+            selected_cam_valid_tqk,
+            selected_cam_weight_tqk,
+            torch.zeros_like(selected_cam_weight_tqk),
+        )
+        selected_cam_idx_tq = torch.where(
+            selected_valid_tq,
+            selected_cam_idx_tqk[..., 0],
+            torch.zeros_like(selected_cam_idx_tqk[..., 0]),
+        )
+        return {
+            "selected_cam_idx_tq": selected_cam_idx_tq,
+            "selected_cam_idx_tqk": selected_cam_idx_tqk,
+            "selected_cam_weight_tqk": selected_cam_weight_tqk,
+            "selected_cam_valid_tqk": selected_cam_valid_tqk,
+            "selected_valid_tq": selected_valid_tq,
+            "selected_count": selected_valid_tq.to(torch.float32).sum(),
+            "selected_avg_count": selected_cam_valid_tqk.to(torch.float32).sum(dim=-1).mean(),
+            "multi_cam_candidate_count": (candidate_count_tq > 1).to(torch.float32).sum(),
+        }
+
     def _build_query_attn_soft_lift_pack(
         self,
         query_attn_weights_tqnhw: torch.Tensor,
@@ -330,25 +393,35 @@ class EfficientOCFQueryProjectionMixin:
                 lifted_valid_tqn[t_idx, q_idx, cam_idx] = torch.isfinite(present_xyz).all(dim=-1)
 
         cam_mass_tqn = attn_tqnhw.reshape(t_depth, q_count, n_cam, -1).sum(dim=-1).clamp_min(0.0)
-        selected_cam_pack = self._select_top1_camera_by_mass(
+        camera_topk = max(1, int(getattr(self, "query_attn_softargmax_camera_topk", 3)))
+        selected_cam_pack = self._select_topk_cameras_by_mass(
             cam_mass_tqn=cam_mass_tqn,
             valid_mask_tqn=lifted_valid_tqn,
+            topk=camera_topk,
         )
         if not isinstance(selected_cam_pack, dict):
             return None
         selected_cam_idx_tq = selected_cam_pack["selected_cam_idx_tq"]
-        selected_valid_tq = selected_cam_pack["selected_valid_tq"]
-        gather_idx_tq13 = selected_cam_idx_tq.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 3)
-        lifted_center_tq3 = lifted_center_tqn3.gather(2, gather_idx_tq13).squeeze(2)
-        lifted_valid_tq = selected_valid_tq.clone()
+        selected_cam_idx_tqk = selected_cam_pack["selected_cam_idx_tqk"]
+        selected_cam_weight_tqk = selected_cam_pack["selected_cam_weight_tqk"]
+        selected_cam_valid_tqk = selected_cam_pack["selected_cam_valid_tqk"]
+        gather_idx_tqk3 = selected_cam_idx_tqk.unsqueeze(-1).expand(-1, -1, -1, 3)
+        lifted_center_tqk3 = lifted_center_tqn3.gather(2, gather_idx_tqk3)
+        finite_lift_tqk = torch.isfinite(lifted_center_tqk3).all(dim=-1) & selected_cam_valid_tqk
+        selected_cam_weight_tqk = selected_cam_weight_tqk * finite_lift_tqk.to(torch.float32)
+        weight_sum_tq1 = selected_cam_weight_tqk.sum(dim=-1, keepdim=True)
+        selected_cam_weight_tqk = selected_cam_weight_tqk / weight_sum_tq1.clamp_min(1e-12)
+        lifted_valid_tq = weight_sum_tq1.squeeze(-1) > 0.0
+        lifted_center_tq3 = (lifted_center_tqk3 * selected_cam_weight_tqk.unsqueeze(-1)).sum(dim=2)
         finite_lift_tq = torch.isfinite(lifted_center_tq3).all(dim=-1)
         lifted_valid_tq = lifted_valid_tq & finite_lift_tq
         lifted_center_tq3 = torch.where(
             finite_lift_tq.unsqueeze(-1), lifted_center_tq3, torch.zeros_like(lifted_center_tq3)
         )
 
-        depth_expect_tq = depth_expect_tqn.gather(2, selected_cam_idx_tq.unsqueeze(-1)).squeeze(-1)
-        depth_valid_tq = selected_valid_tq & torch.isfinite(depth_expect_tq) & (depth_expect_tq > 0.0)
+        depth_expect_tqk = depth_expect_tqn.gather(2, selected_cam_idx_tqk)
+        depth_expect_tq = (depth_expect_tqk * selected_cam_weight_tqk).sum(dim=-1)
+        depth_valid_tq = lifted_valid_tq & torch.isfinite(depth_expect_tq) & (depth_expect_tq > 0.0)
         depth_mean = (
             depth_expect_tq[depth_valid_tq].mean()
             if bool(depth_valid_tq.any().item())
@@ -364,7 +437,10 @@ class EfficientOCFQueryProjectionMixin:
             "lifted_valid_tqn": lifted_valid_tqn,
             "lifted_valid_tq": lifted_valid_tq,
             "selected_cam_idx_tq": selected_cam_idx_tq,
-            "selected_cam_valid_tq": selected_valid_tq,
+            "selected_cam_idx_tqk": selected_cam_idx_tqk,
+            "selected_cam_weight_tqk": selected_cam_weight_tqk,
+            "selected_cam_valid_tqk": finite_lift_tqk,
+            "selected_cam_valid_tq": lifted_valid_tq,
             "attn_src_idx_t": attn_src_idx_t,
             "output_frame_indices_t": output_frame_indices,
             "query_output_global_frame_indices": output_frame_indices,
@@ -374,9 +450,11 @@ class EfficientOCFQueryProjectionMixin:
             "dbg_query_attn_soft_lift_valid_cam_count": lifted_valid_tqn.to(torch.float32).sum(),
             "dbg_query_attn_soft_lift_valid_query_count": lifted_valid_tq.to(torch.float32).sum(),
             "dbg_query_attn_soft_lift_selected_cam_count": selected_cam_pack["selected_count"],
+            "dbg_query_attn_soft_lift_selected_cam_avg_count": finite_lift_tqk.to(torch.float32).sum(dim=-1).mean(),
             "dbg_query_attn_soft_lift_multi_cam_candidate_count": selected_cam_pack["multi_cam_candidate_count"],
             "dbg_query_attn_soft_lift_depth_mean": depth_mean,
             "dbg_query_attn_softargmax_tau": center_feat_tqn2.new_tensor(float(self.query_attn_softargmax_tau)),
+            "dbg_query_attn_soft_lift_camera_topk": center_feat_tqn2.new_tensor(float(camera_topk)),
         }
 
     def _compute_query_depth_loss_from_match(

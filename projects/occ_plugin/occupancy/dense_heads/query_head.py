@@ -151,6 +151,21 @@ class QueryDepthHead(nn.Module):
         return self.mlp(query_feat_tqd)
     
 
+class QuerySizeEmbedding(nn.Module):
+    def __init__(self, embed_dim=128, gate_init=0.0):
+        super(QuerySizeEmbedding, self).__init__()
+        hidden_dim = max(16, int(embed_dim) // 4)
+        self.mlp = nn.Sequential(
+            nn.Linear(1, hidden_dim, bias=False),
+            nn.GELU(),
+            nn.Linear(hidden_dim, int(embed_dim), bias=False),
+        )
+        self.gate = nn.Parameter(torch.ones(1) * float(gate_init), requires_grad=True)
+
+    def forward(self, query_size_log_scalar_tq):
+        return self.mlp(query_size_log_scalar_tq.unsqueeze(-1))
+
+
 class TrajectoryHead(nn.Module):
     def __init__(self, input_dim=128, hidden_dim=128, out_dim=8):
         super(TrajectoryHead, self).__init__()
@@ -220,7 +235,12 @@ class QueryHead(nn.Module):
                  debug_query_objectness_vis_threshold=None,
                  debug_query_gaussian_vis_mode="ellipse",
                  debug_query_gaussian_prob_threshold=0.5,
-                 debug_query_gaussian_prob_alpha_scale=4.0):
+                 debug_query_gaussian_prob_alpha_scale=4.0,
+                 use_query_size_embedding=False,
+                 query_size_attn_threshold=0.5,
+                 query_size_depth_ref_m=20.0,
+                 query_size_log_alpha=10.0,
+                 query_size_gate_init=0.0):
         super(QueryHead, self).__init__()
         self.embed_dim = embed_dim
         self.num_past_frames = num_past_frames
@@ -321,6 +341,21 @@ class QueryHead(nn.Module):
                 f"got {self.query_cls_head_num_layers}"
             )
         self.query_cls_use_gaussian_params = bool(query_cls_use_gaussian_params)
+        self.use_query_size_embedding = bool(use_query_size_embedding)
+        self.query_size_attn_threshold = float(query_size_attn_threshold)
+        self.query_size_depth_ref_m = float(query_size_depth_ref_m)
+        self.query_size_log_alpha = float(query_size_log_alpha)
+        self.query_size_gate_init = float(query_size_gate_init)
+        if self.query_size_depth_ref_m <= 0.0:
+            raise ValueError(
+                "query_size_depth_ref_m must be positive, "
+                f"got {self.query_size_depth_ref_m}"
+            )
+        if self.query_size_log_alpha < 0.0:
+            raise ValueError(
+                "query_size_log_alpha must be non-negative, "
+                f"got {self.query_size_log_alpha}"
+            )
         if len(self.query_multi_gaussian_offset_max_m) != 3:
             raise ValueError(
                 "query_multi_gaussian_offset_max_m must be xyz tuple, "
@@ -429,6 +464,11 @@ class QueryHead(nn.Module):
                 hidden_dim=self.embed_dim,
                 out_dim=(self.query_traj_num_steps * 2),
             )
+        self.query_size_embedding = (
+            QuerySizeEmbedding(embed_dim=self.embed_dim, gate_init=self.query_size_gate_init)
+            if self.use_query_size_embedding else None
+        )
+        self.last_query_size_dbg = None
 
         # W,b of center-head final linear are scaled to widen initial center spread.
         center_last = self.center_head.mlp.net[-1]
@@ -571,6 +611,103 @@ class QueryHead(nn.Module):
             return query_feat_tqd.detach()
         return query_feat_tqd
 
+    @staticmethod
+    def _stats_dict(prefix, values, z):
+        if (not torch.is_tensor(values)) or values.numel() <= 0:
+            return {
+                f"{prefix}_min": z,
+                f"{prefix}_max": z,
+                f"{prefix}_mean": z,
+            }
+        vals = values.to(torch.float32)
+        valid = torch.isfinite(vals)
+        if not bool(valid.any().item()):
+            return {
+                f"{prefix}_min": z,
+                f"{prefix}_max": z,
+                f"{prefix}_mean": z,
+            }
+        vals = vals[valid]
+        return {
+            f"{prefix}_min": vals.min().detach(),
+            f"{prefix}_max": vals.max().detach(),
+            f"{prefix}_mean": vals.mean().detach(),
+        }
+
+    def compute_query_size_log_scalar(
+        self,
+        query_attn_weights_tqnhw,
+        query_depth_m_tq,
+    ):
+        if (
+            (not self.use_query_size_embedding)
+            or (not torch.is_tensor(query_attn_weights_tqnhw))
+            or query_attn_weights_tqnhw.dim() != 5
+            or (not torch.is_tensor(query_depth_m_tq))
+            or query_depth_m_tq.dim() != 2
+        ):
+            return None, None
+
+        t_attn, q_attn, _n_cam, h, w = [int(v) for v in query_attn_weights_tqnhw.shape]
+        t_depth, q_depth = [int(v) for v in query_depth_m_tq.shape]
+        t_count = min(t_attn, t_depth)
+        q_count = min(q_attn, q_depth)
+        if t_count <= 0 or q_count <= 0 or h <= 0 or w <= 0:
+            return None, None
+
+        attn = query_attn_weights_tqnhw[:t_count, :q_count].detach().to(torch.float32)
+        depth = query_depth_m_tq[:t_count, :q_count].detach().to(device=attn.device, dtype=torch.float32)
+        pixel_count_tqn = (attn > float(self.query_size_attn_threshold)).to(torch.float32).sum(dim=(-1, -2))
+        pixel_count_tq = pixel_count_tqn.max(dim=-1).values
+        area_norm = pixel_count_tq / float(h * w)
+        depth_scale = (depth.clamp_min(0.0) / float(self.query_size_depth_ref_m)).pow(2)
+        size_scalar_tq = area_norm * depth_scale
+        log_scalar_tq = torch.log1p(float(self.query_size_log_alpha) * size_scalar_tq)
+
+        z = log_scalar_tq.sum() * 0.0
+        dbg = {}
+        dbg.update(self._stats_dict("dbg_query_size_depth", depth, z))
+        dbg.update(self._stats_dict("dbg_query_size_pixel_count", pixel_count_tq, z))
+        dbg.update(self._stats_dict("dbg_query_size_log_scalar", log_scalar_tq, z))
+        return log_scalar_tq.to(dtype=query_attn_weights_tqnhw.dtype), dbg
+
+    def _apply_query_size_embedding(
+        self,
+        center_input_tqd,
+        present_local_idx,
+        query_size_log_scalar_tq=None,
+    ):
+        if (
+            (not self.use_query_size_embedding)
+            or self.query_size_embedding is None
+            or (not torch.is_tensor(query_size_log_scalar_tq))
+            or query_size_log_scalar_tq.dim() != 2
+        ):
+            self.last_query_size_dbg = None
+            return center_input_tqd[int(present_local_idx)]
+
+        q_feat = center_input_tqd[int(present_local_idx)]
+        if (
+            int(query_size_log_scalar_tq.shape[0]) <= int(present_local_idx)
+            or int(query_size_log_scalar_tq.shape[1]) != int(q_feat.shape[0])
+        ):
+            self.last_query_size_dbg = None
+            return q_feat
+
+        e_q = query_size_log_scalar_tq[int(present_local_idx)].to(device=q_feat.device, dtype=q_feat.dtype)
+        z_qd = self.query_size_embedding(e_q)
+        q_out = q_feat + self.query_size_embedding.gate.to(dtype=q_feat.dtype) * z_qd
+
+        z = q_feat.sum() * 0.0
+        self.last_query_size_dbg = {
+            "dbg_query_size_embedding_mean": z_qd.to(torch.float32).mean().detach(),
+            "dbg_query_size_embedding_var": z_qd.to(torch.float32).var(unbiased=False).detach(),
+            "dbg_query_size_target_feat_mean": q_feat.to(torch.float32).mean().detach(),
+            "dbg_query_size_target_feat_var": q_feat.to(torch.float32).var(unbiased=False).detach(),
+            "dbg_query_size_gate": self.query_size_embedding.gate.detach().reshape(()).to(torch.float32),
+        }
+        return q_out
+
     def _world_to_range_logits(self, centers_world: torch.Tensor) -> torch.Tensor:
         pc_min = centers_world.new_tensor(self.point_cloud_range[:3])
         extent = centers_world.new_tensor(self.spatial_extent3d).clamp_min(1e-6)
@@ -581,6 +718,7 @@ class QueryHead(nn.Module):
         self,
         center_input_tqd: torch.Tensor,
         centers_world: torch.Tensor,
+        query_size_log_scalar_tq=None,
     ):
         """
         Predict Gaussian-mixture parameters ONCE from a single frame's feature
@@ -631,7 +769,11 @@ class QueryHead(nn.Module):
 
         # Run the unified Gaussian head on the present-frame feature only.
         present_local_idx = self._resolve_present_query_local_idx(t_count)
-        center_input_qd = center_input_tqd[present_local_idx]  # [Q, D]
+        center_input_qd = self._apply_query_size_embedding(
+            center_input_tqd,
+            present_local_idx,
+            query_size_log_scalar_tq=query_size_log_scalar_tq,
+        )  # [Q, D]
 
         gaussian_logits_qg11 = self.gaussian_head(center_input_qd).reshape(q_count, g_count, 11)
         offset_logits_qg3 = gaussian_logits_qg11[..., 0:3]
@@ -678,6 +820,8 @@ class QueryHead(nn.Module):
         centers_world: torch.Tensor,
         detach_query_for_center: bool = None,
         defer_trajectory: bool = False,
+        query_size_log_scalar_tq=None,
+        query_size_dbg=None,
     ) -> dict:
         if not isinstance(outputs, dict):
             raise TypeError("outputs must be a dict returned by QueryHead.forward")
@@ -709,11 +853,30 @@ class QueryHead(nn.Module):
             mixture_sigmas_world_tqg3,
             mixture_quat_tqg4,
             mixture_weights_tqg,
-        ) = self._compute_gaussian_outputs(center_input_tqd, centers_world)
+        ) = self._compute_gaussian_outputs(
+            center_input_tqd,
+            centers_world,
+            query_size_log_scalar_tq=query_size_log_scalar_tq,
+        )
+        if isinstance(query_size_dbg, dict) or isinstance(self.last_query_size_dbg, dict):
+            merged_size_dbg = {}
+            if isinstance(query_size_dbg, dict):
+                merged_size_dbg.update(query_size_dbg)
+            if isinstance(self.last_query_size_dbg, dict):
+                merged_size_dbg.update(self.last_query_size_dbg)
+        else:
+            merged_size_dbg = None
         query_cls_logits_qc = outputs.get("query_cls_logits_qc", None)
         query_cls_scores_qc = outputs.get("query_cls_scores_qc", None)
         query_cls_scores_tqc = outputs.get("query_cls_scores_tqc", None)
         if self.query_cls_use_gaussian_params:
+            (
+                _raw_sigma_world_tq3,
+                cls_mix_centers_world_tqg3,
+                cls_mix_sigmas_world_tqg3,
+                cls_mix_quat_tqg4,
+                cls_mix_weights_tqg,
+            ) = self._compute_gaussian_outputs(center_input_tqd, centers_world)
             query_inst_tqd = outputs.get("query_inst_tqd", query_feat_tqd)
             (
                 query_cls_logits_qc,
@@ -723,10 +886,10 @@ class QueryHead(nn.Module):
                 query_inst_tqd=query_inst_tqd,
                 query_future_feat_tqd=query_feat_tqd,
                 centers_world_tq3=centers_world,
-                mixture_centers_world_tqg3=mixture_centers_world_tqg3,
-                mixture_sigmas_world_tqg3=mixture_sigmas_world_tqg3,
-                mixture_quat_tqg4=mixture_quat_tqg4,
-                mixture_weights_tqg=mixture_weights_tqg,
+                mixture_centers_world_tqg3=cls_mix_centers_world_tqg3,
+                mixture_sigmas_world_tqg3=cls_mix_sigmas_world_tqg3,
+                mixture_quat_tqg4=cls_mix_quat_tqg4,
+                mixture_weights_tqg=cls_mix_weights_tqg,
             )
 
         traj_motion_input_tqd2 = None
@@ -765,6 +928,7 @@ class QueryHead(nn.Module):
             "centers_world": centers_world,
             "center_logits": center_logits,
             "gaussian_sigmas_world": query_sigma_world_tq3,
+            "query_size_dbg": merged_size_dbg,
         })
         return outputs
 
@@ -1637,6 +1801,7 @@ class QueryHead(nn.Module):
             "centers_world": centers_world,
             "center_logits": center_logits,
             "gaussian_sigmas_world": query_sigma_world_tq3,
+            "query_size_dbg": self.last_query_size_dbg,
         }
         return outputs
 

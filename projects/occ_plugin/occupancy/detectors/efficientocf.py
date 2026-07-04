@@ -194,7 +194,12 @@ class EfficientOCF(
             debug_query_objectness_vis_threshold=self.debug_query_objectness_vis_threshold,
             debug_query_gaussian_vis_mode=self.debug_query_gaussian_vis_mode,
             debug_query_gaussian_prob_threshold=self.debug_query_gaussian_prob_threshold,
-            debug_query_gaussian_prob_alpha_scale=self.debug_query_gaussian_prob_alpha_scale)
+            debug_query_gaussian_prob_alpha_scale=self.debug_query_gaussian_prob_alpha_scale,
+            use_query_size_embedding=self.use_query_size_embedding,
+            query_size_attn_threshold=self.query_size_attn_threshold,
+            query_size_depth_ref_m=self.query_size_depth_ref_m,
+            query_size_log_alpha=self.query_size_log_alpha,
+            query_size_gate_init=self.query_size_gate_init)
         self.context_depth_proxy_head = nn.Conv2d(
             in_channels=int(context_feat_dim),
             out_channels=int(self.img_view_transformer.D),
@@ -984,11 +989,20 @@ class EfficientOCF(
                 self._last_query_attn_soft_lift_pack = query_attn_soft_lift_pack
         lifted_centers_world = self._last_query_attn_soft_lift_pack.get("lifted_center_world_tq3", None)
         lifted_valid_tq = self._last_query_attn_soft_lift_pack.get("lifted_valid_tq", None)
+        query_size_log_scalar_tq = None
+        query_size_dbg = None
+        if bool(getattr(self, "use_query_size_embedding", False)):
+            query_size_log_scalar_tq, query_size_dbg = self.query_head.compute_query_size_log_scalar(
+                query_attn_weights_tqnhw=query_attn_weights,
+                query_depth_m_tq=self._last_query_attn_soft_lift_pack.get("depth_expect_tq", None),
+            )
         query_head_outputs = self.query_head.apply_lifted_centers_to_outputs(
             query_head_outputs,
             lifted_centers_world,
             detach_query_for_center=self.query_center_loss_detach_query_feat,
             defer_trajectory=defer_trajectory,
+            query_size_log_scalar_tq=query_size_log_scalar_tq,
+            query_size_dbg=query_size_dbg,
         )
         centers_world = query_head_outputs["centers_world_tq3"]
         center_logits = query_head_outputs["center_logits_tq3"]
@@ -1009,6 +1023,7 @@ class EfficientOCF(
             query_present_local_idx = 0
         traj_offsets_fq2 = query_head_outputs.get("traj_offsets_fq2", None)
         traj_motion_input_tqd2 = query_head_outputs.get("traj_motion_input_tqd2", None)
+        query_size_dbg = query_head_outputs.get("query_size_dbg", None)
 
         present_centers_world_tq3 = centers_world.narrow(0, query_present_local_idx, 1).contiguous()
         present_sigmas_world_tq3 = None
@@ -1128,6 +1143,7 @@ class EfficientOCF(
             mixture_quat_traj_tqg,
             mixture_weights_traj_tqg,
             traj_motion_input_tqd2,
+            query_size_dbg,
         )
 
 
@@ -2079,6 +2095,7 @@ class EfficientOCF(
             mixture_quat_traj_tqg,
             mixture_weights_traj_tqg,
             traj_motion_input_tqd2,
+            query_size_dbg,
         ) = self.extract_feat_query(
             img_inputs_seq=img_inputs_seq,
             img_metas=img_metas,
@@ -2720,6 +2737,7 @@ class EfficientOCF(
             center_match_loss=center_match_loss,
             query_traj_loss=query_traj_loss,
             query_attn_cam_score_pack=query_attn_cam_score_pack,
+            query_size_dbg=query_size_dbg,
             centers_world=centers_world,
             centers_world_match_tq3=centers_world_match_tq3,
             centers_world_dt_gt2p_tq3=centers_world_dt_gt2p_tq3,

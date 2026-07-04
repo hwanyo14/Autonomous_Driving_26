@@ -107,7 +107,8 @@ MODEL_CFG_DEFAULTS = {
     "query_attn_cam_gaussian_truncate_sigma": 3.0,
     "query_attn_cam_target_binary_threshold": 0.5,
     "query_attn_cam_score_norm_mode": "exp_neg",
-    "query_attn_softargmax_tau": 1.0,
+    "query_attn_softargmax_tau": 0.5,
+    "query_attn_softargmax_camera_topk": 3,
     "query_depth_loss_weight": 1.0,
     "query_depth_label_smoothing": 0.0,
     "query_depth_soft_label_sigma_bins": 1.0,
@@ -115,6 +116,11 @@ MODEL_CFG_DEFAULTS = {
     "query_inst_depth_range_mode": "dbound",
     "query_inst_depth_min": 0.0,
     "query_inst_depth_max": 0.0,
+    "use_query_size_embedding": False,
+    "query_size_attn_threshold": 0.5,
+    "query_size_depth_ref_m": 20.0,
+    "query_size_log_alpha": 10.0,
+    "query_size_gate_init": 0.0,
 }
 
 DEBUG_CFG_DEFAULTS = {
@@ -340,6 +346,7 @@ def apply_model_cfg(self, cfg):
     self.query_attn_cam_target_binary_threshold = float(cfg["query_attn_cam_target_binary_threshold"])
     self.query_attn_cam_score_norm_mode = str(cfg["query_attn_cam_score_norm_mode"]).lower()
     self.query_attn_softargmax_tau = float(cfg["query_attn_softargmax_tau"])
+    self.query_attn_softargmax_camera_topk = int(cfg["query_attn_softargmax_camera_topk"])
     self.query_depth_loss_weight = float(cfg["query_depth_loss_weight"])
     self.query_depth_label_smoothing = float(cfg["query_depth_label_smoothing"])
     self.query_depth_soft_label_sigma_bins = float(cfg["query_depth_soft_label_sigma_bins"])
@@ -347,6 +354,11 @@ def apply_model_cfg(self, cfg):
     self.query_inst_depth_range_mode = str(cfg["query_inst_depth_range_mode"]).lower()
     self.query_inst_depth_min = float(cfg["query_inst_depth_min"])
     self.query_inst_depth_max = float(cfg["query_inst_depth_max"])
+    self.use_query_size_embedding = bool(cfg["use_query_size_embedding"])
+    self.query_size_attn_threshold = float(cfg["query_size_attn_threshold"])
+    self.query_size_depth_ref_m = float(cfg["query_size_depth_ref_m"])
+    self.query_size_log_alpha = float(cfg["query_size_log_alpha"])
+    self.query_size_gate_init = float(cfg["query_size_gate_init"])
 
     if self.center_only_mode:
         self.use_gmo_bce_loss = False

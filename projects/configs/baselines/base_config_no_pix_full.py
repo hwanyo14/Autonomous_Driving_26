@@ -120,8 +120,8 @@ bda_aug_conf = dict(
     flip_dy_ratio=0.5,
 )
 
-# train_capacity = 23930  # default: use all sequences
-train_capacity = 4000  # 3880
+train_capacity = 23930  # default: use all sequences
+# train_capacity = 4000  # 3880
 # train_capacity = 7  # 3880
 
 test_capacity = 5119  # default: use all sequences
@@ -384,7 +384,7 @@ model_cfg = dict(
     query_cls_match_cost_weight=0.3,
     query_center_match_cost_weight=10.0,
     query_temporal_offset_match_cost_weight=0.0,
-    query_bev_iou_match_cost_weight=0.3,
+    query_bev_iou_match_cost_weight=0.1,
     query_center_routed_loss_weight=0.3,
     query_depth_soft_label_sigma_bins=1.0,
     # --- trajectory: matched-query single-head path ---
@@ -413,7 +413,7 @@ model_cfg = dict(
     query_depth_loss_weight=1.0,
     query_attn_softargmax_tau=0.5,
     query_attn_softargmax_camera_topk=3,
-    use_query_size_embedding=True,
+    use_query_size_embedding=False,
     query_size_attn_threshold=0.5,
     query_size_depth_ref_m=20.0,
     query_size_log_alpha=10.0,

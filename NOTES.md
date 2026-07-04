@@ -1,5 +1,16 @@
 # NOTES
 
+## 2026-07-03 KST — Per-camera softargmax top-k lift 검증 주의
+
+- `query_attn_softargmax_tau=0.5`, `query_attn_softargmax_camera_topk=3`로 soft-lift center가 top-3 camera mass 가중평균을 사용한다. camera-sum image-plane center는 사용하지 않는다.
+- 현재 shell Python에는 `torch`가 없어 synthetic tensor smoke가 `ModuleNotFoundError: No module named 'torch'`로 중단됨. 실제 학습 env에서 작은 batch smoke test를 확인할 것.
+
+## 2026-07-03 KST — Per-camera KL query attention bbox 검증 주의
+
+- `loss_query_attn_bbox`는 이제 camera sum 없이 `[Ncam,H*W]` 전체 probability 분포에 대한 KL supervision이다. 기존 debug key 중 `dbg_query_attn_bbox_soft_iou_*`는 보조 진단값이며 loss 자체는 soft-IoU가 아니다.
+- `query_attn_bbox_unmatched_weight > 0`이면 `inverse_union_dist_thw`가 필요하다. target은 camera 축으로 broadcast해 `Ncam*H*W` 전체 합이 1이 되도록 정규화한다.
+- 현재 shell Python에는 `torch`가 없어 synthetic tensor smoke가 `ModuleNotFoundError: No module named 'torch'`로 중단됨. 실제 학습 env에서 작은 batch smoke test를 확인할 것.
+
 ## 2026-06-30 KST — Remaining loader pruning 메모
 
 - `segmentation_bev`는 test `simple_test`의 BEV metric에 필요하므로 test에서는 유지하고 train에서만 `load_segmentation_bev=False`로 차단했다.

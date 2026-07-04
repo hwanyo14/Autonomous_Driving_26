@@ -722,6 +722,7 @@ class EfficientOCFLossMixin:
 
         gt_inst_mask_tnhw = gt_attn_targets.get("gt_inst_mask_tnhw", None)
         gt_inst_valid_tn = gt_attn_targets.get("gt_inst_valid_tn", None)
+        inverse_union_dist_thw = gt_attn_targets.get("inverse_union_dist_thw", None)
         attn_t_idx_t = gt_attn_targets.get("attn_t_idx_t", None)
         if (
             (not torch.is_tensor(gt_inst_mask_tnhw))
@@ -741,6 +742,11 @@ class EfficientOCFLossMixin:
         t_attn, q_attn, n_cam, h_attn, w_attn = [int(v) for v in query_attn_weights_tqnhw.shape]
         t_gt, n_inst, h_gt, w_gt = [int(v) for v in gt_inst_mask_tnhw.shape]
         t_valid, n_valid = [int(v) for v in gt_inst_valid_tn.shape]
+        inv_shape_ok = torch.is_tensor(inverse_union_dist_thw) and inverse_union_dist_thw.dim() == 3
+        if inv_shape_ok:
+            t_inv, h_inv, w_inv = [int(v) for v in inverse_union_dist_thw.shape]
+        else:
+            t_inv, h_inv, w_inv = 0, h_attn, w_attn
         if (
             t_attn <= 0
             or q_attn <= 0
@@ -750,11 +756,12 @@ class EfficientOCFLossMixin:
             or (h_attn != h_gt)
             or (w_attn != w_gt)
             or (t_gt != t_valid)
+            or (inv_shape_ok and ((h_attn != h_inv) or (w_attn != w_inv)))
         ):
             out["dbg_query_attn_bbox_shape_invalid_skip"] = z.new_tensor(1.0)
             return out
 
-        t = min(t_attn, t_gt)
+        t = min(t_attn, t_gt, t_inv if inv_shape_ok else t_gt)
         if t <= 0:
             out["dbg_query_attn_bbox_shape_invalid_skip"] = z.new_tensor(1.0)
             return out
@@ -778,7 +785,6 @@ class EfficientOCFLossMixin:
             if unmatched_weight is None else unmatched_weight
         )
         other_w = float(getattr(self, "query_attn_bbox_other_weight", 0.0))
-        unmatched_mode = str(getattr(self, "query_attn_bbox_unmatched_mode", "inverse_union")).lower()
         other_mode = str(getattr(self, "query_attn_bbox_other_mode", "union")).lower()
 
         attn_tqhw = attn_weights_sel_tqnhw.to(torch.float32).sum(dim=2)
@@ -824,8 +830,8 @@ class EfficientOCFLossMixin:
             pred_raw_tknp = attn_weights_sel_tqnhw.index_select(1, mq).to(
                 device=pred_tqp.device, dtype=torch.float32
             ).clamp_min(0.0).reshape(t, k, n_cam, p)
-            pred_soft_den_tk11 = pred_raw_tknp.amax(dim=(2, 3), keepdim=True).clamp_min(eps_v)
-            pred_soft_tknp = (pred_raw_tknp / pred_soft_den_tk11).clamp(0.0, 1.0)
+            pred_prob_sum_tk11 = pred_raw_tknp.sum(dim=(2, 3), keepdim=True).clamp_min(eps_v)
+            pred_prob_tknp = pred_raw_tknp / pred_prob_sum_tk11
             target_mask_tkp = gt_inst_mask_tnhw[:t].index_select(1, mi).reshape(t, k, p).to(
                 device=pred_tqp.device, dtype=torch.float32
             )
@@ -836,22 +842,29 @@ class EfficientOCFLossMixin:
             if not bool((target_sum_tk > 0.0).any().item()):
                 out["dbg_query_attn_bbox_empty_gt_mask"] = z.new_tensor(1.0)
             valid_tk = target_valid_tk & (target_sum_tk > 0.0)
-            valid_tk = valid_tk & torch.isfinite(pred_soft_tknp).all(dim=(2, 3))
+            valid_tk = valid_tk & torch.isfinite(pred_prob_tknp).all(dim=(2, 3))
             valid_f = valid_tk.to(torch.float32)
             matched_valid_cnt = valid_f.sum()
             if bool((matched_valid_cnt > 0).item()):
-                inter_tk = (pred_soft_tknp * target_mask_tkp.unsqueeze(2)).sum(dim=(2, 3))
-                pred_sum_tk = pred_soft_tknp.sum(dim=(2, 3))
+                target_prob_tknp = (
+                    target_mask_tkp.unsqueeze(2)
+                    / (target_sum_tk[:, :, None, None] * float(n_cam)).clamp_min(eps_v)
+                ).expand(t, k, n_cam, p)
+                log_pred = torch.log(pred_prob_tknp.clamp_min(eps_v))
+                log_tgt = torch.log(target_prob_tknp.clamp_min(eps_v))
+                kl_tk = (target_prob_tknp * (log_tgt - log_pred)).sum(dim=(2, 3))
+                matched_raw = (kl_tk * valid_f).sum() / matched_valid_cnt.clamp_min(1.0)
+
+                inter_tk = (pred_prob_tknp * target_mask_tkp.unsqueeze(2)).sum(dim=(2, 3))
+                pred_sum_tk = pred_prob_tknp.sum(dim=(2, 3))
                 target_sum_cam_tk = target_sum_tk * float(n_cam)
                 union_tk = (pred_sum_tk + target_sum_cam_tk - inter_tk).clamp_min(0.0)
                 soft_iou_tk = (inter_tk / union_tk.clamp_min(eps_v)).clamp(0.0, 1.0)
-                loss_tk = 1.0 - soft_iou_tk
-                matched_raw = (loss_tk * valid_f).sum() / matched_valid_cnt.clamp_min(1.0)
                 soft_iou_valid = soft_iou_tk[valid_tk]
                 out["dbg_query_attn_bbox_soft_iou_mean"] = soft_iou_valid.mean()
                 out["dbg_query_attn_bbox_soft_iou_min"] = soft_iou_valid.min()
                 out["dbg_query_attn_bbox_soft_iou_max"] = soft_iou_valid.max()
-                inside_mass_tk = (pred_tkp * target_mask_tkp).sum(dim=-1).clamp(0.0, 1.0)
+                inside_mass_tk = inter_tk.clamp(0.0, 1.0)
                 outside_mass_tk = (1.0 - inside_mass_tk).clamp(0.0, 1.0)
                 inside_valid = inside_mass_tk[valid_tk]
                 outside_valid = outside_mass_tk[valid_tk]
@@ -859,10 +872,9 @@ class EfficientOCFLossMixin:
                 out["dbg_query_attn_bbox_inside_mass_min"] = inside_valid.min()
                 out["dbg_query_attn_bbox_inside_mass_max"] = inside_valid.max()
                 out["dbg_query_attn_bbox_outside_mass_mean"] = outside_valid.mean()
-                pred_entropy_valid = -(pred_tkp.clamp_min(eps_v) * pred_tkp.clamp_min(eps_v).log()).sum(dim=-1)
+                pred_entropy_valid = -(pred_prob_tknp.clamp_min(eps_v) * log_pred).sum(dim=(2, 3))
                 pred_entropy_terms.append(pred_entropy_valid[valid_tk])
-                target_prob_tkp = target_mask_tkp / target_sum_tk.unsqueeze(-1).clamp_min(eps_v)
-                target_entropy_valid = -(target_prob_tkp.clamp_min(eps_v) * target_prob_tkp.clamp_min(eps_v).log()).sum(dim=-1)
+                target_entropy_valid = -(target_prob_tknp.clamp_min(eps_v) * log_tgt).sum(dim=(2, 3))
                 target_entropy_terms.append(target_entropy_valid[valid_tk])
 
                 if other_w > 0.0:
@@ -873,11 +885,9 @@ class EfficientOCFLossMixin:
                     other_valid_f = other_valid_tk.to(torch.float32)
                     other_valid_cnt = other_valid_f.sum()
                     if bool((other_valid_cnt > 0).item()):
-                        pred_soft_sum_tk = pred_soft_tknp.sum(dim=(2, 3)).clamp_min(eps_v)
                         other_mass_tk = (
-                            (pred_soft_tknp * other_mask_tkp.unsqueeze(2)).sum(dim=(2, 3))
-                            / pred_soft_sum_tk
-                        ).clamp(0.0, 1.0)
+                            pred_prob_tknp * other_mask_tkp.unsqueeze(2)
+                        ).sum(dim=(2, 3)).clamp(0.0, 1.0)
                         if other_mode == "union_log":
                             other_loss_tk = -torch.log((1.0 - other_mass_tk).clamp_min(eps_v))
                         else:
@@ -888,6 +898,9 @@ class EfficientOCFLossMixin:
                         out["dbg_query_attn_bbox_other_mass_max"] = other_mass_valid.max()
 
         if unmatched_w > 0.0:
+            if (not inv_shape_ok) or t_inv < t:
+                out["dbg_query_attn_bbox_shape_invalid_skip"] = z.new_tensor(1.0)
+                return out
             matched_mask_q = torch.zeros((q_attn,), device=pred_tqp.device, dtype=torch.bool)
             if k > 0:
                 matched_mask_q[mq] = True
@@ -895,31 +908,35 @@ class EfficientOCFLossMixin:
             u = int(uq.numel())
             out["dbg_query_attn_bbox_unmatched_count"] = z.new_tensor(float(u))
             if u > 0:
-                pred_tup = pred_tqp.index_select(1, uq)
                 pred_raw_tunp = attn_weights_sel_tqnhw.index_select(1, uq).to(
                     device=pred_tqp.device, dtype=torch.float32
                 ).clamp_min(0.0).reshape(t, u, n_cam, p)
-                pred_soft_den_tu11 = pred_raw_tunp.amax(dim=(2, 3), keepdim=True).clamp_min(eps_v)
-                pred_soft_tunp = (pred_raw_tunp / pred_soft_den_tu11).clamp(0.0, 1.0)
-                pred_soft_sum_tu = pred_soft_tunp.sum(dim=(2, 3)).clamp_min(eps_v)
-                union_mass_tu = (
-                    (pred_soft_tunp * union_mask_tp.unsqueeze(1).unsqueeze(2)).sum(dim=(2, 3))
-                    / pred_soft_sum_tu
-                ).clamp(0.0, 1.0)
-                unmatched_valid_tu = (union_sum_t1.squeeze(-1) > 0.0).unsqueeze(1).expand(t, u)
-                unmatched_valid_tu = unmatched_valid_tu & torch.isfinite(pred_soft_tunp).all(dim=(2, 3))
+                pred_prob_sum_tu11 = pred_raw_tunp.sum(dim=(2, 3), keepdim=True).clamp_min(eps_v)
+                pred_prob_tunp = pred_raw_tunp / pred_prob_sum_tu11
+                target_tp = inverse_union_dist_thw[:t].reshape(t, p).to(device=pred_tqp.device, dtype=torch.float32)
+                target_sum_t1 = target_tp.sum(dim=-1, keepdim=True)
+                target_prob_tnp = (
+                    target_tp[:, None, :]
+                    / (target_sum_t1[:, None, :] * float(n_cam)).clamp_min(eps_v)
+                ).expand(t, n_cam, p)
+                target_prob_tunp = target_prob_tnp.unsqueeze(1).expand(t, u, n_cam, p)
+                unmatched_valid_tu = (target_sum_t1.squeeze(-1) > 0.0).unsqueeze(1).expand(t, u)
+                unmatched_valid_tu = unmatched_valid_tu & torch.isfinite(pred_prob_tunp).all(dim=(2, 3))
+                unmatched_valid_tu = unmatched_valid_tu & torch.isfinite(target_prob_tunp).all(dim=(2, 3))
                 unmatched_valid_f = unmatched_valid_tu.to(torch.float32)
                 unmatched_valid_cnt = unmatched_valid_f.sum()
                 if bool((unmatched_valid_cnt > 0).item()):
-                    if unmatched_mode == "inverse_union_log":
-                        unmatched_loss_tu = -torch.log((1.0 - union_mass_tu).clamp_min(eps_v))
-                    else:
-                        unmatched_loss_tu = union_mass_tu
-                    unmatched_raw = (unmatched_loss_tu * unmatched_valid_f).sum() / unmatched_valid_cnt.clamp_min(1.0)
+                    log_pred_u = torch.log(pred_prob_tunp.clamp_min(eps_v))
+                    log_tgt_u = torch.log(target_prob_tunp.clamp_min(eps_v))
+                    kl_tu = (target_prob_tunp * (log_tgt_u - log_pred_u)).sum(dim=(2, 3))
+                    unmatched_raw = (kl_tu * unmatched_valid_f).sum() / unmatched_valid_cnt.clamp_min(1.0)
+                    union_mass_tu = (
+                        pred_prob_tunp * union_mask_tp.unsqueeze(1).unsqueeze(2)
+                    ).sum(dim=(2, 3)).clamp(0.0, 1.0)
                     unmatched_mass_valid = union_mass_tu[unmatched_valid_tu]
                     out["dbg_query_attn_bbox_unmatched_mass_mean"] = unmatched_mass_valid.mean()
                     out["dbg_query_attn_bbox_unmatched_mass_max"] = unmatched_mass_valid.max()
-                    pred_entropy_unmatched = -(pred_tup.clamp_min(eps_v) * pred_tup.clamp_min(eps_v).log()).sum(dim=-1)
+                    pred_entropy_unmatched = -(pred_prob_tunp.clamp_min(eps_v) * log_pred_u).sum(dim=(2, 3))
                     pred_entropy_terms.append(pred_entropy_unmatched[unmatched_valid_tu])
 
         out["dbg_query_attn_bbox_matched_raw"] = matched_raw
@@ -2724,6 +2741,7 @@ class EfficientOCFLossMixin:
         center_match_loss,
         query_traj_loss,
         query_attn_cam_score_pack,
+        query_size_dbg,
         # Query predictions
         centers_world,
         centers_world_match_tq3,
@@ -2795,6 +2813,12 @@ class EfficientOCFLossMixin:
         losses["loss_query_attn_overlap"] = (
             query_attn_overlap_loss if torch.is_tensor(query_attn_overlap_loss) else z
         )
+        if isinstance(query_size_dbg, dict):
+            losses.update({
+                k: v
+                for k, v in query_size_dbg.items()
+                if torch.is_tensor(v) and (torch.is_floating_point(v) or torch.is_complex(v))
+            })
 
         # ---- Center match loss ----
         losses["loss_query_center_match"] = center_match_loss if center_match_loss is not None else z
@@ -3020,6 +3044,7 @@ class EfficientOCFLossMixin:
             and (not k.startswith("dbg_query_traj_"))
             and (not k.startswith("dbg_query_match_cost_"))
             and (not k.startswith("dbg_query_matched_center_"))
+            and (not k.startswith("dbg_query_size_"))
             and (not k.startswith("dbg_gmo_quality_"))
         ]:
             del losses[k]
