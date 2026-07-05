@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-07-04 15:49 KST
+
+### LoadInstanceWithFlow global_idx cat crash 수정
+
+**핵심 내용**: instance cache 사용 경로에서 scalar `global_idx`를 `torch.cat`하려다 DataLoader worker가 실패하는 문제 수정.
+
+**주요 변경사항**:
+- `loading_instance.py`: cache-hit/regenerate 후처리 루프의 cat 제외 key에 `global_idx` 추가.
+- 검증: `python -m py_compile projects/occ_plugin/datasets/pipelines/loading_instance.py`, `git diff --check` 통과.
+
+## 2026-07-04 15:19 KST
+
+### Learnable Query KV Downsampling
+
+**핵심 내용**: query transformer의 multi-resolution KV 생성에서 avg pooling을 경량 learnable convolution downsampling으로 교체.
+
+**주요 변경사항**:
+- `transformer.py`: `LightweightKVDownsample` 추가. downsample scale은 depthwise stride conv + pointwise 1x1 conv로 구성하고, 초기값은 기존 avg pooling + identity channel mixing에 가깝게 설정.
+- `transformer.py`: `kv_resolutions[-1]`을 full `context_seq` 해상도로 검증하고, 각 layer KV token을 learnable downsampler 출력으로 생성.
+- 검증: `python -m py_compile projects/occ_plugin/occupancy/image2bev/transformer.py` 통과. torch smoke는 현재 shell에 `torch`가 없어 실행하지 못함.
+
 ## 2026-06-30 13:12 KST
 
 ### Remaining Data Loader Pruning

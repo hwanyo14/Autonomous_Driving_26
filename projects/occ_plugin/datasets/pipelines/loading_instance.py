@@ -1429,7 +1429,7 @@ class LoadInstanceWithFlow(object):
                     'segmentation_instance3d', 'segmentation_cls_instance3d', 'gt_occ_inst',
                     'gt_instance_centers_world', 'gt_instance_centers_valid', 'gt_instance_ids',
                     'sequence_length', 'instance_dict', 'instance_map', 'input_dict',
-                    'egopose_list', 'ego2lidar_list', 'scene_token', 'instance'
+                    'egopose_list', 'ego2lidar_list', 'scene_token', 'instance', 'global_idx'
                 ]:
                     continue
                 if self.use_lyft and key == 'height':
@@ -1609,7 +1609,7 @@ class LoadInstanceWithFlow(object):
                 'segmentation_instance3d', 'segmentation_cls_instance3d', 'gt_occ_inst',
                 'gt_instance_centers_world', 'gt_instance_centers_valid', 'gt_instance_ids',
                 'sequence_length', 'instance_dict', 'instance_map', 'input_dict',
-                'egopose_list', 'ego2lidar_list', 'scene_token', 'instance'
+                'egopose_list', 'ego2lidar_list', 'scene_token', 'instance', 'global_idx'
             ]:
                 continue
             if self.use_lyft and key == 'height':

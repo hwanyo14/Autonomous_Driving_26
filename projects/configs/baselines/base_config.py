@@ -384,7 +384,7 @@ model_cfg = dict(
     query_cls_match_cost_weight=0.3,
     query_center_match_cost_weight=10.0,
     query_temporal_offset_match_cost_weight=0.0,
-    query_bev_iou_match_cost_weight=0.3,
+    query_bev_iou_match_cost_weight=0.1,
     query_center_routed_loss_weight=0.3,
     query_depth_soft_label_sigma_bins=1.0,
     # --- trajectory: matched-query single-head path ---
@@ -524,8 +524,8 @@ optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
 lr_config = dict(
     policy='CosineAnnealing',
     warmup='linear',
-    warmup_iters=4000,
-    # warmup_iters=800,
+    # warmup_iters=4000,
+    warmup_iters=800,
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
 )

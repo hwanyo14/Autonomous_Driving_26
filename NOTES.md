@@ -1,5 +1,12 @@
 # NOTES
 
+## 2026-07-04 KST — Learnable KV downsampling 메모
+
+- query transformer의 downsampling 대상은 `efficientocf.py`의 `_extract_depth_and_context_for_query()`에서 만든 `context_seq`가 맞다. `transformer.py`에서는 여기에 pos/cam/time embedding을 더한 뒤 cross-attention KV로 사용한다.
+- `kv_resolutions[-1]`은 full `context_seq` 해상도여야 한다. 현재 기본값은 `((14, 25), (28, 50), (56, 100))`이고 입력 `context_seq`도 `(56, 100)`이어야 한다.
+- learnable downsampler는 정수 배율만 지원한다. 비정수 target 해상도가 필요하면 별도 interpolation/resize 정책을 다시 정해야 한다.
+- 현재 shell Python에 `torch`가 없어 forward/backward smoke는 실행하지 못했고, `py_compile`만 통과했다.
+
 ## 2026-06-30 KST — Remaining loader pruning 메모
 
 - `segmentation_bev`는 test `simple_test`의 BEV metric에 필요하므로 test에서는 유지하고 train에서만 `load_segmentation_bev=False`로 차단했다.

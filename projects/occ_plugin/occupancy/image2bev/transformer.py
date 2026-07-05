@@ -33,6 +33,52 @@ class CrossAttentionModule(nn.Module):
         return attn_output, attn_weights
 
 
+class LightweightKVDownsample(nn.Module):
+    def __init__(self, channels, full_hw, target_hw):
+        super(LightweightKVDownsample, self).__init__()
+        self.full_hw = tuple(int(v) for v in full_hw)
+        self.target_hw = tuple(int(v) for v in target_hw)
+
+        full_h, full_w = self.full_hw
+        target_h, target_w = self.target_hw
+        if target_h == full_h and target_w == full_w:
+            self.downsample = nn.Identity()
+            return
+        if target_h > full_h or target_w > full_w:
+            raise ValueError(
+                f"target_hw must not exceed full_hw: target={self.target_hw}, full={self.full_hw}"
+            )
+        if full_h % target_h != 0 or full_w % target_w != 0:
+            raise ValueError(
+                "learnable KV downsampling requires integer scale: "
+                f"target={self.target_hw}, full={self.full_hw}"
+            )
+
+        stride = (full_h // target_h, full_w // target_w)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=stride, stride=stride, groups=channels, bias=False),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+        )
+        self._init_avg_identity()
+
+    def _init_avg_identity(self):
+        if isinstance(self.downsample, nn.Identity):
+            return
+        depthwise, pointwise = self.downsample
+        depthwise.weight.data.fill_(1.0 / float(depthwise.weight.shape[-2] * depthwise.weight.shape[-1]))
+        pointwise.weight.data.zero_()
+        diag = torch.arange(pointwise.weight.shape[0])
+        pointwise.weight.data[diag, diag, 0, 0] = 1.0
+
+    def forward(self, x):
+        x = self.downsample(x)
+        if int(x.shape[-2]) != self.target_hw[0] or int(x.shape[-1]) != self.target_hw[1]:
+            raise RuntimeError(
+                f"unexpected KV downsample shape: got {tuple(x.shape[-2:])}, expected {self.target_hw}"
+            )
+        return x
+
+
 class TransformerModule(nn.Module):
     def __init__(self, 
                  feat_dim, 
@@ -71,6 +117,7 @@ class TransformerModule(nn.Module):
         if self.num_layers <= 0:
             raise ValueError(f"num_layers must be positive, got {self.num_layers}")
         self.kv_resolutions = self._normalize_kv_resolutions(kv_resolutions)
+        self.kv_full_resolution = None if self.kv_resolutions is None else self.kv_resolutions[-1]
         self.num_cams = num_cams
         self.embed_dim = embed_dim
         self.max_time = max_time
@@ -112,6 +159,7 @@ class TransformerModule(nn.Module):
         self.query_id_embed = nn.Embedding(num_embeddings=self.num_queries, embedding_dim=self.embed_dim)
         self.cam_id_embed = nn.Embedding(num_embeddings=num_cams, embedding_dim=self.feat_dim)
         self.time_embed = nn.Embedding(num_embeddings=max_time, embedding_dim=self.feat_dim)
+        self.kv_downsamplers = self._build_kv_downsamplers()
 
         self.ca_layers = nn.ModuleList([
             CrossAttentionModule(
@@ -181,21 +229,32 @@ class TransformerModule(nn.Module):
                 raise ValueError(f"kv_resolutions must be positive, got {(h, w)}")
         return kv_resolutions
 
+    def _build_kv_downsamplers(self):
+        if self.kv_resolutions is None:
+            return None
+        return nn.ModuleList([
+            LightweightKVDownsample(
+                channels=self.feat_dim,
+                full_hw=self.kv_full_resolution,
+                target_hw=target_hw,
+            )
+            for target_hw in self.kv_resolutions
+        ])
+
     def _build_layer_kv_tokens(self, x, t, ncam, c, h, w):
         if self.kv_resolutions is None:
             s = int(ncam) * int(h) * int(w)
             return [x.reshape(t, s, c) for _ in range(self.num_layers)]
+        if (int(h), int(w)) != self.kv_full_resolution:
+            raise ValueError(
+                "input context_seq resolution must match kv_resolutions[-1]: "
+                f"got {(int(h), int(w))}, expected {self.kv_full_resolution}"
+            )
 
         x_hw = x.reshape(t, ncam, h, w, c).permute(0, 1, 4, 2, 3).reshape(t * ncam, c, h, w)
         layer_kv_tokens = []
-        for target_h, target_w in self.kv_resolutions:
-            if target_h == h and target_w == w:
-                pooled = x_hw
-            elif (target_h < h and target_w < w and h % target_h == 0 and w % target_w == 0):
-                kernel = (h // target_h, w // target_w)
-                pooled = F.avg_pool2d(x_hw, kernel_size=kernel, stride=kernel)
-            else:
-                pooled = F.adaptive_avg_pool2d(x_hw, output_size=(target_h, target_w))
+        for layer_idx, (target_h, target_w) in enumerate(self.kv_resolutions):
+            pooled = self.kv_downsamplers[layer_idx](x_hw)
             pooled = pooled.reshape(t, ncam, c, target_h, target_w)
             layer_kv_tokens.append(pooled.permute(0, 1, 3, 4, 2).reshape(t, ncam * target_h * target_w, c))
         return layer_kv_tokens
