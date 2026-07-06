@@ -85,6 +85,8 @@ class EfficientOCF(
         apply_visualization_cfg(self, visualization_cfg)
         self._dbg_printed_instance_img_seq_len_warning = False
         self._last_inst_match_result = None
+        self._last_query_offset_spread = None
+        self._last_query_size_aux_pred = None
         self._last_gt_instance_bev_feat_cache = None
         self._last_query_inst_depth_target_pack = None
         self._last_query_attn_soft_lift_pack = None
@@ -194,6 +196,9 @@ class EfficientOCF(
             query_multi_gaussian_softplus_bias_init=self.query_multi_gaussian_softplus_bias_init,
             query_multi_gaussian_weight_reg_loss_weight=self.query_multi_gaussian_weight_reg_loss_weight,
             query_multi_gaussian_weight_reg_target_sum=self.query_multi_gaussian_weight_reg_target_sum,
+            query_scale_spread_weight_mode=self.query_scale_spread_weight_mode,
+            query_scale_spread_vis_threshold=self.occ_score_threshold,
+            query_size_note_enabled=self.query_size_note_enabled,
             point_cloud_range=point_cloud_range,
             spatial_extent3d=self.spatial_extent3d,
             query_feat_cosine_threshold=self.query_feat_cosine_threshold,
@@ -335,6 +340,28 @@ class EfficientOCF(
             self.query_head.set_train_iteration(step, one_based=True)
         if hasattr(self, "transformer") and hasattr(self.transformer, "set_train_iteration"):
             self.transformer.set_train_iteration(step, one_based=True)
+
+    @torch.no_grad()
+    def _compute_query_attn_sigma_note(self, attn_tqnhw: torch.Tensor) -> torch.Tensor:
+        """
+        size note용 attention 폭: query별로 질량 최대 카메라를 골라 그 attention 분포의
+        가중 표준편차(σu, σv)를 계산. gaussian 가정 없음 — 2차 모멘트 통계량.
+        Returns: [T, Q, 2] (grid px 단위, no-grad)
+        """
+        t, q, n, h, w = [int(v) for v in attn_tqnhw.shape]
+        a = attn_tqnhw.to(torch.float32)
+        mass_tqn = a.sum(dim=(-1, -2))
+        c_star = mass_tqn.argmax(dim=-1)                                  # [T,Q]
+        gidx = c_star.view(t, q, 1, 1, 1).expand(-1, -1, 1, h, w)
+        a_c = a.gather(2, gidx).squeeze(2)                                # [T,Q,H,W]
+        p = a_c / a_c.sum(dim=(-1, -2), keepdim=True).clamp_min(1e-9)
+        uu = torch.arange(w, device=a.device, dtype=torch.float32).view(1, 1, 1, w)
+        vv = torch.arange(h, device=a.device, dtype=torch.float32).view(1, 1, h, 1)
+        mu_u = (p * uu).sum(dim=(-1, -2))
+        mu_v = (p * vv).sum(dim=(-1, -2))
+        var_u = (p * (uu - mu_u.view(t, q, 1, 1)) ** 2).sum(dim=(-1, -2))
+        var_v = (p * (vv - mu_v.view(t, q, 1, 1)) ** 2).sum(dim=(-1, -2))
+        return torch.stack((var_u.clamp_min(0.0).sqrt(), var_v.clamp_min(0.0).sqrt()), dim=-1)
 
     def _get_query_train_iteration(self, advance_if_unsynced: bool = False) -> int:
         if not self._train_iter_synced and advance_if_unsynced:
@@ -1084,6 +1111,12 @@ class EfficientOCF(
         query_future_feat_tqd = query_head_outputs["query_feat_tqd"]
         endpoint_deltas_qk2 = None
 
+        # size note용 attn 폭(σu,σv): 질량 최대 카메라 기준 가중 표준편차. no-grad —
+        # 크기 쪽지는 읽기 전용 신호(attention 왜곡 방지, query_head에서 재-detach됨).
+        size_note_attn_sigma_tq2 = None
+        if bool(getattr(self, "query_size_note_enabled", False)) and torch.is_tensor(query_attn_weights):
+            size_note_attn_sigma_tq2 = self._compute_query_attn_sigma_note(query_attn_weights)
+
         self._last_query_attn_soft_lift_pack = None
         if (
             torch.is_tensor(query_attn_weights)
@@ -1105,6 +1138,7 @@ class EfficientOCF(
             query_head_outputs,
             lifted_centers_world,
             detach_query_for_center=self.query_center_loss_detach_query_feat,
+            size_note_attn_sigma_tq2=size_note_attn_sigma_tq2,
         )
         centers_world = query_head_outputs["centers_world_tq3"]
         center_logits = query_head_outputs["center_logits_tq3"]
@@ -1113,6 +1147,8 @@ class EfficientOCF(
         mixture_sigmas_world_tqg3 = query_head_outputs["mixture_sigmas_world_tqg3"]
         mixture_yaw_tqg = query_head_outputs["mixture_yaw_tqg"]
         mixture_weights_tqg = query_head_outputs["mixture_weights_tqg"]
+        self._last_query_offset_spread = query_head_outputs.get("query_offset_spread_tq3", None)
+        self._last_query_size_aux_pred = query_head_outputs.get("query_size_aux_pred_tq2", None)
         query_present_local_idx = int(query_head_outputs.get("query_present_local_idx", 0))
         if int(centers_world.shape[0]) > 0:
             query_present_local_idx = max(
@@ -1263,7 +1299,8 @@ class EfficientOCF(
                                    img_metas=None, img_inputs_seq=None,
                                    future_egomotion=None, instance_img_debug_bundle=None,
                                    eval_mode="future", centers_future_tq3=None,
-                                   pred_occ_future=None, mix_future=None):
+                                   pred_occ_future=None, mix_future=None,
+                                   eval_cmp_pack=None):
         """Eval-time query debug visualization (opt-in via EOCF_EVAL_VIS=1).
 
         Reuses the SAME renderer as training (``query_head.maybe_save_query_debug_vis``)
@@ -1360,6 +1397,7 @@ class EfficientOCF(
                 point_conf_all=conf_seq,
                 point_class_ids_all=cls_seq,
                 query_vis_bundle=bundle_2d,
+                eval_cmp_pack=eval_cmp_pack,
             )
             # 3D mixture shape vis (학습 viz와 parity). 동일 renderer를 재사용하되 eval 전용
             # 하위 dir에 저장하고, occ threshold는 metric과 동일한 값(prob_threshold)으로 통일.
@@ -1753,8 +1791,11 @@ class EfficientOCF(
         def _pack(cm):
             return dict(hist_for_iou=cm,
                         hist_for_iou_bbox=np.zeros((2, 2), dtype=np.int64),
+                        hist_for_iou_bbox_rot=np.zeros((2, 2), dtype=np.int64),
                         height_l1=torch.tensor(0.0),
-                        iou_3d=float("nan"), recall_3d=float("nan"))
+                        iou_3d=float("nan"), iou_3d_bbox=float("nan"),
+                        iou_3d_bbox_rot=float("nan"),
+                        recall_3d=float("nan"))
         empty = _pack(np.zeros((2, 2), dtype=np.int64))
 
         # eval 시각화(EOCF_EVAL_VIS=1)일 때만 attn/cam-gaussian용 디버그 산출물도 함께 반환.
@@ -1917,21 +1958,16 @@ class EfficientOCF(
         if eval_mode == "present":
             pred_txyz = pred_occ3d.permute(2, 1, 0).unsqueeze(0).contiguous()  # [1,X,Y,Z]
 
-        # ---- eval-time query visualization (opt-in via EOCF_EVAL_VIS) ----
-        self._maybe_save_eval_query_vis(
-            pred_occ_prob=_pred_occ_vis, gt_inst=gt_inst, centers_world=centers_world,
-            present_idx=present_idx, cls_scores_qc=cls_scores_qc, bundle=bundle,
-            prob_threshold=thr, img_metas=img_metas,
-            img_inputs_seq=img_inputs_seq, future_egomotion=future_egomotion,
-            instance_img_debug_bundle=eval_instance_img_debug_bundle,
-            eval_mode=eval_mode, centers_future_tq3=centers_eval_tq3,
-            pred_occ_future=pred_occ_eval, mix_future=mix_future)
-
-        # ---- GT BEV movable occupancy from segmentation_bev ([..,T,Hb,Wb]) ----
-        gt = segmentation_bev
-        while gt.dim() > 3:                  # drop batch -> [T,Hb,Wb]
-            gt = gt[0]
-        gt = (gt > 0).to(pred_bev.device)
+        # ---- GT BEV movable occupancy: nusocc inst3d(gt_occ_inst)의 z-collapse ----
+        # 학습 dice(loss_gmo_dice)와 동일 소스(dense_inst_txyz; nohuman·query-class 필터 동일).
+        # segmentation_bev는 bbox-AABB 렌더링이라 nusocc GT가 아님 → bbox 메트릭 전용으로만 남김.
+        if torch.is_tensor(gt_inst):
+            gt = (gt_inst > 0).any(dim=-1).to(pred_bev.device)   # [T,X,Y]
+        else:
+            gt = segmentation_bev
+            while gt.dim() > 3:              # drop batch -> [T,Hb,Wb]
+                gt = gt[0]
+            gt = (gt > 0).to(pred_bev.device)
         pred_bev_t = pred_txyz.permute(0, 3, 2, 1).any(dim=1).contiguous()
 
         # BEV/3D 기하 정렬 (transpose, flipH, flipW): pred 그리드를 GT 방향에 맞춘다. 데이터 그리드가
@@ -1967,19 +2003,42 @@ class EfficientOCF(
         # legacy bbox-corrected formula, but on real 3D voxels:
         # (TP + bbox_FP) / (TP + FN + FP - bbox_FP).
         iou_3d, recall_3d = float("nan"), float("nan")
+        iou_3d_bbox = float("nan")
+        iou_3d_bbox_rot = float("nan")
         cm_bbox = np.zeros((2, 2), dtype=np.int64)
-        gt_bbox_src = self._eval_bbox_cls_occ_txyz(segmentation_cls_instance3d)
-        if not torch.is_tensor(gt_bbox_src):
-            gt_bbox_src = self._eval_bbox_occ_txyz(
-                segmentation=segmentation,
-                segmentation_instance3d=segmentation_instance3d,
-                gt_occ_inst=gt_occ_inst,
-                fallback_shape=(tuple(gt_occ.shape) if torch.is_tensor(gt_occ) else None),
-            )
+        cm_bbox_rot = np.zeros((2, 2), dtype=np.int64)
+        # bbox GT v2(annotation 재생성: 생성소멸·사람 필터 + rotated OBB) 우선 사용.
+        # 없으면 기존 bboxcls 캐시 fallback (rot 메트릭은 v2 전용이라 NaN 유지).
+        gt_bbox_rot_src = None
+        bbox_bev_vis = None
+        _bbox_v2 = self._eval_load_bbox_gt_v2(img_metas)
+        if isinstance(_bbox_v2, dict):
+            gt_bbox_src = _bbox_v2["aabb"]
+            gt_bbox_rot_src = _bbox_v2["rot"]
+        else:
+            gt_bbox_src = self._eval_bbox_cls_occ_txyz(segmentation_cls_instance3d)
+            if not torch.is_tensor(gt_bbox_src):
+                gt_bbox_src = self._eval_bbox_occ_txyz(
+                    segmentation=segmentation,
+                    segmentation_instance3d=segmentation_instance3d,
+                    gt_occ_inst=gt_occ_inst,
+                    fallback_shape=(tuple(gt_occ.shape) if torch.is_tensor(gt_occ) else None),
+                )
+        # dtype 강제 없음: v2는 uint8(메모리 1/8), fallback(bboxcls)은 long — 이후 연산은
+        # (>0)/(!=255) 뿐이라 dtype 무관.
         if torch.is_tensor(gt_bbox_src):
-            gt_bbox_src = gt_bbox_src.to(device=pred_occ3d.device, dtype=torch.long)
-        gt_occ_fg = self._eval_nusocc_3d_fg(gt_occ, device=pred_occ3d.device)
-        gt_occ_valid = self._eval_nusocc_3d_valid(gt_occ, device=pred_occ3d.device)
+            gt_bbox_src = gt_bbox_src.to(device=pred_occ3d.device)
+        if torch.is_tensor(gt_bbox_rot_src):
+            gt_bbox_rot_src = gt_bbox_rot_src.to(device=pred_occ3d.device)
+        # 3D nusocc GT = 학습 감독과 동일한 inst3d(dense_inst). raw gt_occ는 box 밖 잔여(평균 +29%)
+        # 와 생성소멸 미필터로 모델이 배우지 않는 voxel을 구조적 FN으로 깔아 사용 중단 (NOTES 2026-07-06).
+        # inst3d에는 255(ignore)가 없어 valid 마스크도 불필요.
+        if torch.is_tensor(gt_inst):
+            gt_occ_fg = (gt_inst > 0).to(device=pred_occ3d.device)
+            gt_occ_valid = None
+        else:
+            gt_occ_fg = self._eval_nusocc_3d_fg(gt_occ, device=pred_occ3d.device)
+            gt_occ_valid = self._eval_nusocc_3d_valid(gt_occ, device=pred_occ3d.device)
         if torch.is_tensor(gt_occ_fg) and gt_occ_fg.dim() == 4:
             align3d = getattr(self, "_eval_3d_align", None)
             if align3d is None:
@@ -2000,6 +2059,7 @@ class EfficientOCF(
                     if torch.is_tensor(gt_occ_valid) and gt_occ_valid.dim() == 4 else None
                 )
                 bbox3d_t = None
+                rot3d_t = None
                 if tuple(gt3d_t.shape[1:]) == tuple(pred_occ3d.shape):
                     if torch.is_tensor(gt_bbox_src) and gt_bbox_src.dim() == 4:
                         bbox3d_src_t = self._eval_mode_slice((gt_bbox_src > 0) & (gt_bbox_src != 255))
@@ -2007,10 +2067,22 @@ class EfficientOCF(
                             bbox3d_src_t, transpose, fh, fw, fz)
                         if torch.is_tensor(bbox3d_t):
                             bbox_bev_t = bbox3d_t.any(dim=1).contiguous()
+                            bbox_bev_vis = bbox_bev_t   # eval 비교 시각화(4행)용
                             t_bbox = min(int(pred_bev_t.shape[0]), int(bbox_bev_t.shape[0]))
                             if t_bbox > 0 and tuple(bbox_bev_t.shape[1:]) == tuple(pred_bev_t.shape[1:]):
                                 cm_bbox = self._binary_occ_cm(
                                     pred_bev_t[:t_bbox], bbox_bev_t[:t_bbox])
+                    # rotated-OBB GT: AABB와 동일한 align 잠금·규칙으로 2D CM 채점.
+                    if torch.is_tensor(gt_bbox_rot_src) and gt_bbox_rot_src.dim() == 4:
+                        rot3d_src_t = self._eval_mode_slice((gt_bbox_rot_src > 0) & (gt_bbox_rot_src != 255))
+                        rot3d_t = self._apply_3d_align_sequence(
+                            rot3d_src_t, transpose, fh, fw, fz)
+                        if torch.is_tensor(rot3d_t):
+                            rot_bev_t = rot3d_t.any(dim=1).contiguous()
+                            t_rot = min(int(pred_bev_t.shape[0]), int(rot_bev_t.shape[0]))
+                            if t_rot > 0 and tuple(rot_bev_t.shape[1:]) == tuple(pred_bev_t.shape[1:]):
+                                cm_bbox_rot = self._binary_occ_cm(
+                                    pred_bev_t[:t_rot], rot_bev_t[:t_rot])
                     t_eval = min(int(pred_txyz.shape[0]), int(gt3d_t.shape[0]))
                     if t_eval > 0:
                         pred_zyx_t = pred_txyz[:t_eval].permute(0, 3, 2, 1).contiguous()
@@ -2024,10 +2096,35 @@ class EfficientOCF(
                             ) else None
                             iou_3d, recall_3d = self._iou_recall_3d(
                                 pred_zyx_t, gt3d_t, bbox3d=bbox_arg, valid3d=valid_arg)
+                            # bbox 3D IoU(AABB/rot): 2D bbox 메트릭과 동일 GT를 3D 그대로 채점.
+                            # nusocc valid(255) 마스크·관용항 없음 — IoU2d(bbox_*)와 규칙 일치.
+                            if torch.is_tensor(bbox_arg):
+                                iou_3d_bbox, _ = self._iou_recall_3d(pred_zyx_t, bbox_arg)
+                            if torch.is_tensor(rot3d_t) and int(rot3d_t.shape[0]) >= t_eval:
+                                iou_3d_bbox_rot, _ = self._iou_recall_3d(
+                                    pred_zyx_t, rot3d_t[:t_eval])
+
+        # ---- eval-time query visualization (opt-in via EOCF_EVAL_VIS) ----
+        # metric 계산 뒤로 이동: 4행 비교(eval 실제 pred_bev_t vs aligned AABB GT)를
+        # 채점에 쓴 텐서 그대로 넘기기 위함 — threshold/정렬/기준프레임 정의상 동일.
+        self._maybe_save_eval_query_vis(
+            pred_occ_prob=_pred_occ_vis, gt_inst=gt_inst, centers_world=centers_world,
+            present_idx=present_idx, cls_scores_qc=cls_scores_qc, bundle=bundle,
+            prob_threshold=thr, img_metas=img_metas,
+            img_inputs_seq=img_inputs_seq, future_egomotion=future_egomotion,
+            instance_img_debug_bundle=eval_instance_img_debug_bundle,
+            eval_mode=eval_mode, centers_future_tq3=centers_eval_tq3,
+            pred_occ_future=pred_occ_eval, mix_future=mix_future,
+            eval_cmp_pack=(
+                dict(pred_bev_t=pred_bev_t.detach(), gt_bev_t=bbox_bev_vis.detach())
+                if torch.is_tensor(bbox_bev_vis) else None
+            ))
 
         return dict(hist_for_iou=cm_nusocc, hist_for_iou_bbox=cm_bbox,
+                    hist_for_iou_bbox_rot=cm_bbox_rot,
                     height_l1=torch.tensor(0.0),
-                    iou_3d=iou_3d, recall_3d=recall_3d)
+                    iou_3d=iou_3d, iou_3d_bbox=iou_3d_bbox,
+                    iou_3d_bbox_rot=iou_3d_bbox_rot, recall_3d=recall_3d)
 
     @staticmethod
     def _binary_occ_cm(pred_bin, gt_bin):
@@ -2220,6 +2317,72 @@ class EfficientOCF(
         else:
             return None
         return x.to(torch.long).contiguous()
+
+    @staticmethod
+    def _eval_sample_key_from_metas(img_metas):
+        """img_metas에서 <scene_token>_<lidar_token> 샘플 키 복원.
+        test pipeline의 Collect meta_keys('scene_token')에는 dataset이 넣은
+        present_scene_lidar_token(이미 결합형)이 들어있다."""
+        m = img_metas
+        m = getattr(m, "data", m)
+        while isinstance(m, (list, tuple)) and len(m) > 0:
+            m = m[0]
+            m = getattr(m, "data", m)
+        if not isinstance(m, dict):
+            return None
+        tok = m.get("scene_token", None)
+        if isinstance(tok, str) and "_" in tok:
+            return tok
+        lid = m.get("lidar_token", None)
+        if isinstance(tok, str) and isinstance(lid, str):
+            return tok + "_" + lid
+        return None
+
+    def _eval_load_bbox_gt_v2(self, img_metas):
+        """재생성 bbox GT v2 lazy-load (tools/gen_data/gen_bbox_gt_v2.py 산출물).
+
+        returns {"aabb": [T,X,Y,Z] long, "rot": [T,X,Y,Z] long} (값=cls id) 또는
+        파일 부재 시 None. 경로는 EOCF_BBOX_GT_V2_DIR로 override 가능.
+        """
+        import os
+        import numpy as np
+        key = self._eval_sample_key_from_metas(img_metas)
+        if key is None:
+            return None
+        cache = getattr(self, "_eval_bbox_v2_cache", None)
+        if isinstance(cache, tuple) and cache[0] == key:
+            return cache[1]
+        root = os.environ.get("EOCF_BBOX_GT_V2_DIR", "./data/efficientocf_bboxcls_v2/GMO")
+        x_dim = int(self.voxelizer.W)
+        y_dim = int(self.voxelizer.H)
+        z_dim = int(self.voxelizer.D)
+        out = {}
+        for name, sub in (("aabb", "segmentation_aabb"), ("rot", "segmentation_rot")):
+            p = os.path.join(root, sub, key + ".npz")
+            if not os.path.exists(p):
+                out = None
+                break
+            with np.load(p, allow_pickle=True) as z:
+                frames = list(z[sub + "_saved_list2"])
+            # cls id ≤ 10이라 uint8로 충분 — long 대비 GPU 메모리 1/8 (rot+aabb 합 ~150MB)
+            dense = torch.zeros((len(frames), x_dim, y_dim, z_dim), dtype=torch.uint8)
+            for t, rows in enumerate(frames):
+                a = np.asarray(rows)
+                if a.dtype == object:
+                    a = np.vstack(a) if a.size else np.zeros((0, 5), np.int64)
+                a = np.asarray(a, dtype=np.int64)
+                if a.size == 0 or a.ndim != 2 or a.shape[1] < 5:
+                    continue
+                keep = (
+                    (a[:, 0] >= 0) & (a[:, 0] < x_dim)
+                    & (a[:, 1] >= 0) & (a[:, 1] < y_dim)
+                    & (a[:, 2] >= 0) & (a[:, 2] < z_dim)
+                )
+                a = a[keep]
+                dense[t, a[:, 0], a[:, 1], a[:, 2]] = torch.from_numpy(a[:, 3]).to(torch.uint8)
+            out[name] = dense
+        self._eval_bbox_v2_cache = (key, out)
+        return out
 
     def _eval_bbox_cls_occ_txyz(self, segmentation_cls_instance3d=None):
         if segmentation_cls_instance3d is None:
@@ -2468,6 +2631,8 @@ class EfficientOCF(
             gt_instance_centers_world=None,
             gt_instance_centers_valid=None,
             gt_instance_ids=None,
+            gt_instance_sizes=None,
+            gt_instance_dims=None,
             img_metas=None,
             occ_dt=None,
             **kwargs,
@@ -2530,7 +2695,8 @@ class EfficientOCF(
                 self._dbg_printed_instance_img_seq_len_warning = True
 
         # Select using gt_occ(nuScenes-Occupancy) or segmentation(nuScenes) as GT
-        query_gt_occ, query_gmo_ids = self._select_query_gt_for_losses(
+        # 디버그 시각화 전용 GT (loss 미사용 — utils_gt_prep 주석 참조)
+        query_gt_occ, query_gmo_ids = self._select_query_gt_for_debug_vis(
             gt_occ=gt_occ,
             segmentation=segmentation,
         )
@@ -3140,6 +3306,31 @@ class EfficientOCF(
                 loss_weight=float(self.query_center_routed_loss_weight),
                 loss_type=self.query_center_match_loss_type,
             )
+
+        # forcing: one-sided spread reg pushing matched query spread to GT extent.
+        query_spread_loss = None
+        if float(getattr(self, "query_scale_spread_loss_weight", 0.0)) > 0.0:
+            query_spread_loss = self._compute_query_spread_reg_from_match(
+                query_spread_tq3=self._last_query_offset_spread,
+                inst_match_result=inst_match_result,
+                gt_instance_ids=gt_instance_ids,
+                gt_instance_sizes=gt_instance_sizes,
+                loss_weight=float(self.query_scale_spread_loss_weight),
+                target_frac=float(self.query_scale_spread_target_frac),
+                norm_mode=str(self.query_scale_spread_norm_mode),
+            )
+
+        # aux size head: matched query의 (w,l) 예측을 annotation 원본 치수로 회귀.
+        query_size_aux_pack = None
+        if float(getattr(self, "query_size_aux_loss_weight", 0.0)) > 0.0:
+            query_size_aux_pack = self._compute_query_size_aux_loss_from_match(
+                pred_dims_tq2=self._last_query_size_aux_pred,
+                inst_match_result=inst_match_result,
+                gt_instance_ids=gt_instance_ids,
+                gt_instance_dims=gt_instance_dims,
+                loss_weight=float(self.query_size_aux_loss_weight),
+                big_weight_cap=float(self.query_size_aux_big_weight_cap),
+            )
         query_traj_loss = self._compute_query_trajectory_loss_from_match(
             centers_world_tq3=centers_world_match_tq3,
             pred_traj_offsets_fq2=_traj_offsets_fq2,
@@ -3538,6 +3729,8 @@ class EfficientOCF(
             query_attn_bbox_loss=query_attn_bbox_loss,
             matched_gmo_loss=matched_gmo_loss,
             center_match_loss=center_match_loss,
+            query_spread_loss=query_spread_loss,
+            query_size_aux_pack=query_size_aux_pack,
             query_traj_loss=query_traj_loss,
             query_traj_refine_loss=query_traj_refine_loss,
             query_attn_cam_score_pack=query_attn_cam_score_pack,

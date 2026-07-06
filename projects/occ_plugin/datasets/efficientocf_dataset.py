@@ -475,6 +475,17 @@ class EfficientOCFDataset(NuScenesDataset):
                 logger.info('IOU (bbox-AABB) 2D Evaluation')
                 logger.info(res_table_b)
 
+        ''' calculate IOU 2D (bbox rotated-OBB GT, v2 캐시) '''
+        if results.get('hist_for_iou_bbox_rot'):
+            hist_bbox_rot = sum(results['hist_for_iou_bbox_rot'])
+            ious_bbox_rot = cm_to_ious(hist_bbox_rot)
+            res_table_r, res_dic_r = format_iou_results(ious_bbox_rot, return_dic=True)
+            for key, val in res_dic_r.items():
+                eval_results['IOU_bbox_rot_{}'.format(key)] = val
+            if logger is not None:
+                logger.info('IOU (bbox rotated-OBB) 2D Evaluation')
+                logger.info(res_table_r)
+
         ''' calculate height metric '''
         if results.get('height_l1'):
             height_l1 = sum(results['height_l1'])
@@ -486,9 +497,13 @@ class EfficientOCFDataset(NuScenesDataset):
             # eval_results['VPQ'] = vpq_sum/results['vpq_len']
             eval_results['VPQ'] = (vpq_sum/results['vpq_len'])[0]
 
-        '''calculate 3d metric (nusocc occupancy GT)'''
+        '''calculate 3d metric (nusocc occupancy GT / bbox-AABB GT)'''
         if results.get('iou_3d'):
-            eval_results['IOU_3d'] = sum(results['iou_3d']) / len(results['iou_3d'])
+            eval_results['IOU_3d_nusocc'] = sum(results['iou_3d']) / len(results['iou_3d'])
+        if results.get('iou_3d_bbox'):
+            eval_results['IOU_3d_bbox_aabb'] = sum(results['iou_3d_bbox']) / len(results['iou_3d_bbox'])
+        if results.get('iou_3d_bbox_rot'):
+            eval_results['IOU_3d_bbox_rot'] = sum(results['iou_3d_bbox_rot']) / len(results['iou_3d_bbox_rot'])
         if results.get('recall_3d'):
             eval_results['Recall_3d'] = sum(results['recall_3d']) / len(results['recall_3d'])
 

@@ -18,6 +18,7 @@
 ├── data/  # 외부 데이터와 전처리 캐시를 가리키는 심볼릭 링크 모음
 │   ├── efficientocf -> /home/user/jhh/Projects/EfficientOCF/data/efficientocf  # OCF instance/flow 전처리 캐시
 │   ├── efficientocf_bboxcls -> /home/user/jhh/Projects/EOCF_qg_distil_dev/data/efficientocf_bboxcls  # bbox/class 기반 segmentation 캐시
+│   ├── efficientocf_bboxcls_v2/  # (로컬 생성) val 전용 bbox GT v2 — GMO/segmentation_{aabb,rot}/ [x,y,z,cls,inst]; gen_bbox_gt_v2.py 산출물
 │   ├── nuScenes-Occupancy -> /home/user/jhh/Datasets/nuScenes-Occupancy-v0.1/  # nuScenes occupancy GT
 │   ├── nuScenes-Occupancy_inst3d -> /home/user/jhh/Projects/EOCF_qpa_gmms_consist_aux_occ/data/nuScenes-Occupancy_inst3d  # GT 3D instance occupancy 캐시
 │   ├── nuscenes -> /home/user/jhh/Datasets/nuscenes/  # nuScenes 원본 데이터
@@ -38,11 +39,14 @@
 │   │   │       ├── seg_cosine_200e.py  # segmentation용 cosine 200epoch 템플릿
 │   │   │       └── seg_cosine_50e.py  # segmentation용 cosine 50epoch 템플릿
 │   │   ├── baselines/
-│   │   │   ├── shape_guide.py  # 현재 주력 config; semantic cls를 binary {0=bg,1=fg}로 통합한 shape-guide 실험 설정
-│   │   │   ├── shape_guide_128.py  # shape_guide 변형; 학습 occ-loss 격자를 128x128x20으로 올린 실험 설정
-│   │   │   ├── shape_guide_128_dice.py  # 128 변형; occ에 dice(tversky FP-heavy) 추가, weight_mode='ones'(opacity 없음)
-│   │   │   ├── shape_guide_128_dice_weight.py  # 128_dice에서 weight_mode='sigmoid'(opacity 부활)만 바꾼 단일변수 실험
-│   │   │   └── test.py  # 평가용 config (test pipeline/dataset 설정)
+│   │   │   ├── full.py  # 전체 train셋 학습 config
+│   │   │   ├── subset.py  # 4000-sample subset 학습 config (빠른 실험용 베이스)
+│   │   │   ├── subset_scale.py  # subset + spread forcing 1차(σ-포함 메트릭, σ-loophole로 무효 판명)
+│   │   │   ├── subset_scale_offset.py  # subset + offset-only spread forcing (weight-loophole로 무압력 판명, NOTES 2026-07-02)
+│   │   │   ├── subset_scale_offset_we.py  # offset-only + 'visible' soft gate + 'violators' 정규화 (weight-loophole 봉쇄판)
+│   │   │   ├── subset_attn.py  # subset과 값 동일; camera-attn loss 카메라간 픽셀좌표 충돌 fix 검증용 (NOTES/CHANGELOG 2026-07-02)
+│   │   │   ├── subset_attn_cover.py  # subset_attn + attn σ-matching(폭 감독, loss_query_attn_sigma) 활성 — 크기-무시 고정폭 블롭 교정 (NOTES/CHANGELOG 2026-07-02)
+│   │   │   └── subset_attn_cover_size.py  # cover + size note("크기 쪽지": aux size head + σ/depth 성분을 gaussian head 입력에 주입) — 큰 객체 shape 1단계 (NOTES/CHANGELOG 2026-07-05)
 │   │   └── datasets/
 │   │       └── custom_nus-3d.py  # MMDet3D 기반 nuScenes 3D dataset/pipeline 기본 템플릿
 │   └── occ_plugin/  # mmdetection3d plugin 진입점; datasets/models/hooks/ops 등록
@@ -153,7 +157,9 @@
     ├── dist_train.sh  # torch.distributed.run 기반 분산 학습 실행기
     ├── test.py  # config/checkpoint 로드 후 custom test API를 호출하는 평가 엔트리포인트
     ├── train.py  # config 로드, plugin import, runner 구성 후 custom train API를 호출하는 학습 엔트리포인트
+    ├── dbg_probe/  # 체크포인트 오프라인 진단 프로브 모음 (spread/feature/attn/BEV 크기 분석 + BEV 비교 플롯); 사용법은 내부 README.md
     ├── gen_data/
+    │   ├── gen_bbox_gt_v2.py  # val 전용 bbox GT v2 재생성기 (AABB+rotated OBB, [x,y,z,cls,inst], 생성소멸·사람 필터 상속)
     │   ├── gen_depth_gt.py  # nuScenes lidar를 카메라로 투영해 depth GT bin 파일 생성
     │   └── verify_and_merge_occ_cls_inst.py  # sparse class/instance occupancy 캐시 정합성 검증과 병합 도구
     └── misc/

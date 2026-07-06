@@ -229,9 +229,11 @@ class EfficientOCFGTPrepMixin:
         out[ignore_mask] = ig
         return out
 
-    def _select_query_gt_for_losses(self, gt_occ, segmentation):
+    def _select_query_gt_for_debug_vis(self, gt_occ, segmentation):
         """
-        Select supervision source for query losses.
+        Select the scene-occupancy GT shown in query debug visualization.
+        (이름 주의: 과거엔 query loss GT 선택용이었으나, 현재 이 출력의 유일한
+        소비처는 maybe_save_query_debug_vis — gradient 경로에 쓰이지 않음.)
         """
         if self.use_segmentation_as_query_gt and (segmentation is not None):
             # segmentation은 bbox volume 기반이라 non-zero를 occupied(1)로 이진화해서 사용.

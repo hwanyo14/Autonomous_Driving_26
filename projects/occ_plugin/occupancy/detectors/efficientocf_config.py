@@ -122,6 +122,30 @@ MODEL_CFG_DEFAULTS = {
     # occupancy 합성 방식: 'poisson'(기존) p=1-exp(-Σ w·G) / 'union'(GUIDE) p=1-Π(1-w·G).
     # 'union'은 weight_mode='sigmoid'(α∈[0,1] opacity)와 함께 써야 함.
     "query_multi_gaussian_occ_combine_mode": "poisson",
+    # --- Per-query spread forcing (large-object coverage) ---
+    # matched query의 OFFSET-only 분산(가우시안 중심 분포, σ 제외)을 GT half-extent의
+    # target_frac까지 끌어올리는 one-sided(부족할 때만) 정칙항. σ-blob 대신 offset을
+    # 움직이게 강제해 collapsed-to-car-size 평형을 깸. GT extent = voxel-AABB(max-over-frames).
+    "query_scale_spread_loss_weight": 0.0,
+    "query_scale_spread_target_frac": 0.5,
+    # spread 메트릭의 가우시안 가중: 'raw'(기존, 정규화 w 그대로 — 낮은 w '유령' 가우시안이
+    #   메트릭을 채우는 weight-loophole 있음, 2026-07-02 dbg 실측상 사실상 무압력) /
+    #   'visible'(w_eff=1-exp(-w), poisson 단일 가우시안 피크 점유 기여 — 점유에 실제
+    #   나타나는 질량만 집계, target을 채우려면 고-w 가우시안을 멀리 보내야 함).
+    "query_scale_spread_weight_mode": "raw",
+    # 정칙항 정규화: 'matched'(기존, matched 전체 mean — 위반자 소수면 1/K 희석) /
+    #   'violators'(deficit>0 쿼리 수로 나눔 — 희소 대형 객체의 gradient 크기 보존).
+    "query_scale_spread_norm_mode": "matched",
+    # --- size note ("크기 쪽지", 2026-07-05) ---
+    # gaussian head 입력에 [logσu, logσv, log d, log w_pred, log l_pred] 5성분을
+    # zero-init 투영으로 additive 주입 (σ=attn 폭, d=center 거리, w/l=aux head 예측).
+    # 전부 detach — head gradient가 attention/depth/aux로 역류 못 함. head 파라미터
+    # 수가 바뀌므로(aux MLP+proj) 기존 checkpoint와 호환 안 됨 → from-scratch 전용.
+    "query_size_note_enabled": False,
+    # aux size head L1 (matched만, GT=annotation 원본 w,l — gt_instance_dims 플러밍 필요).
+    "query_size_aux_loss_weight": 0.0,
+    # 크기-비례 가중 상한: weight = clamp(max(w,l)/2m, 1, cap) — 버스(l~12m)는 cap배.
+    "query_size_aux_big_weight_cap": 4.0,
     # eval occupancy를 학습과 정렬: True(기본)면 16개 mixture를 그대로 splat(union over queries,
     # occ_combine_mode 적용, yaw 살림). False면 16개를 평균낸 단일 ellipsoid로 찍음.
     # mixture 텐서가 없는 모델은 simple_test의 use_mix 가드가 자동으로 단일 ellipsoid로 fallback.
@@ -161,6 +185,15 @@ MODEL_CFG_DEFAULTS = {
     "query_attn_bbox_camera_reduce_mode": "camera_aggregated_first",
     "query_attn_bbox_unmatched_mode": "inverse_union",
     "query_attn_bbox_other_mode": "union",
+    # --- attention sigma-matching (폭 감독; 2026-07-02 실측 근거) ---
+    # inside-mass는 총량만 봐서 attn 폭이 크기 무관 고정(σ 8~14px, 마스크는 1.7~6.3px)이 됨.
+    # matched query의 attn 2차 모멘트(σ_u,σ_v)를 GT cam 마스크의 σ에 log-ratio 회귀.
+    # 위치(1차 모멘트)는 loss에 미포함 → center 경로 무접촉. 0.0=off(기존 동작).
+    "query_attn_sigma_match_loss_weight": 0.0,
+    # warmup: 이 iter 전에는 계산 안 함 (center/attn이 자리 잡은 뒤 개입, 8GPU subset 기준 1 epoch≈500).
+    "query_attn_sigma_match_start_iter": 0,
+    # σ 추정이 노이즈인 초소형 마스크 제외 (px).
+    "query_attn_sigma_match_min_mask_px": 4,
     "query_attn_match_cost_weight": 0.0,
     "query_attn_match_metric": "soft_iou",
     "query_attn_match_pred_norm": "amax",
@@ -381,6 +414,25 @@ def apply_model_cfg(self, cfg):
     self.query_multi_gaussian_weight_reg_loss_weight = float(cfg["query_multi_gaussian_weight_reg_loss_weight"])
     self.query_multi_gaussian_weight_reg_target_sum = float(cfg["query_multi_gaussian_weight_reg_target_sum"])
     self.query_multi_gaussian_occ_combine_mode = str(cfg["query_multi_gaussian_occ_combine_mode"]).lower()
+    self.query_scale_spread_loss_weight = float(cfg["query_scale_spread_loss_weight"])
+    self.query_scale_spread_target_frac = float(cfg["query_scale_spread_target_frac"])
+    self.query_scale_spread_weight_mode = str(cfg["query_scale_spread_weight_mode"]).lower()
+    if self.query_scale_spread_weight_mode not in ("raw", "visible"):
+        raise ValueError(
+            f"query_scale_spread_weight_mode must be 'raw'|'visible', got {self.query_scale_spread_weight_mode}"
+        )
+    self.query_scale_spread_norm_mode = str(cfg["query_scale_spread_norm_mode"]).lower()
+    if self.query_scale_spread_norm_mode not in ("matched", "violators"):
+        raise ValueError(
+            f"query_scale_spread_norm_mode must be 'matched'|'violators', got {self.query_scale_spread_norm_mode}"
+        )
+    self.query_size_note_enabled = bool(cfg["query_size_note_enabled"])
+    self.query_size_aux_loss_weight = float(cfg["query_size_aux_loss_weight"])
+    if self.query_size_aux_loss_weight < 0.0:
+        raise ValueError(f"query_size_aux_loss_weight must be >= 0, got {self.query_size_aux_loss_weight}")
+    if self.query_size_aux_loss_weight > 0.0 and not self.query_size_note_enabled:
+        raise ValueError("query_size_aux_loss_weight > 0 requires query_size_note_enabled=True (aux head 모듈이 note에 포함됨)")
+    self.query_size_aux_big_weight_cap = max(1.0, float(cfg["query_size_aux_big_weight_cap"]))
     self.query_eval_occ_use_mixture = bool(cfg["query_eval_occ_use_mixture"])
     self.occ_score_threshold = float(cfg["occ_score_threshold"])
     self.fg_score_threshold = float(cfg["fg_score_threshold"])
@@ -405,6 +457,13 @@ def apply_model_cfg(self, cfg):
     self.query_attn_bbox_camera_reduce_mode = str(cfg["query_attn_bbox_camera_reduce_mode"]).lower()
     self.query_attn_bbox_unmatched_mode = str(cfg["query_attn_bbox_unmatched_mode"]).lower()
     self.query_attn_bbox_other_mode = str(cfg["query_attn_bbox_other_mode"]).lower()
+    self.query_attn_sigma_match_loss_weight = float(cfg["query_attn_sigma_match_loss_weight"])
+    if self.query_attn_sigma_match_loss_weight < 0.0:
+        raise ValueError(
+            f"query_attn_sigma_match_loss_weight must be >= 0, got {self.query_attn_sigma_match_loss_weight}"
+        )
+    self.query_attn_sigma_match_start_iter = max(0, int(cfg["query_attn_sigma_match_start_iter"]))
+    self.query_attn_sigma_match_min_mask_px = max(1, int(cfg["query_attn_sigma_match_min_mask_px"]))
     self.query_attn_match_cost_weight = float(cfg["query_attn_match_cost_weight"])
     self.query_attn_match_metric = str(cfg["query_attn_match_metric"]).lower()
     self.query_attn_match_pred_norm = str(cfg["query_attn_match_pred_norm"]).lower()

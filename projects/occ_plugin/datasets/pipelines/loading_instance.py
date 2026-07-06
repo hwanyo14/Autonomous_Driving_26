@@ -545,6 +545,7 @@ class LoadInstanceWithFlow(object):
         """
         frame_center_maps = []
         all_instance_ids = set()
+        max_extent_by_id = {}
 
         for rows in sparse_seq_rows:
             arr = np.asarray(rows)
@@ -573,7 +574,15 @@ class LoadInstanceWithFlow(object):
                 pts = xyz[inst == iid]
                 if pts.shape[0] == 0:
                     continue
-                cur[int(iid)] = ((pts.min(axis=0) + pts.max(axis=0)) * 0.5).astype(np.float32, copy=False)
+                pmin = pts.min(axis=0)
+                pmax = pts.max(axis=0)
+                cur[int(iid)] = ((pmin + pmax) * 0.5).astype(np.float32, copy=False)
+                # Per-instance voxel-AABB extent (span), tracked as the MAX over all
+                # frames so the size target recovers the best-visibility extent
+                # (per-frame occlusion shrinks the span). Same id space as centers.
+                ext = (pmax - pmin).astype(np.float32, copy=False)
+                prev_ext = max_extent_by_id.get(int(iid))
+                max_extent_by_id[int(iid)] = ext if prev_ext is None else np.maximum(prev_ext, ext)
 
             frame_center_maps.append(cur)
             all_instance_ids.update(cur.keys())
@@ -584,6 +593,7 @@ class LoadInstanceWithFlow(object):
 
         centers_voxel = np.zeros((t_len, n_inst, 3), dtype=np.float32)
         valid_mask = np.zeros((t_len, n_inst), dtype=np.bool_)
+        sizes_voxel = np.zeros((n_inst, 3), dtype=np.float32)
 
         if n_inst > 0:
             id_to_col = {int(iid): idx for idx, iid in enumerate(instance_ids.tolist())}
@@ -592,16 +602,49 @@ class LoadInstanceWithFlow(object):
                     col = id_to_col[int(iid)]
                     centers_voxel[t, col] = c_xyz
                     valid_mask[t, col] = True
+            for iid, ext in max_extent_by_id.items():
+                col = id_to_col.get(int(iid))
+                if col is not None:
+                    sizes_voxel[col] = ext
 
         centers_world = centers_voxel * self.resolution[:3].reshape(1, 1, 3) + self.start_position[:3].reshape(1, 1, 3)
         centers_world = centers_world.astype(np.float32, copy=False)
         centers_world[~valid_mask] = 0.0
 
+        # Per-instance size = voxel-AABB span in meters, aligned to instance_ids.
+        # (extent is a span, so only scale by resolution; no start_position offset.)
+        sizes_world = (sizes_voxel * self.resolution[:3].reshape(1, 3)).astype(np.float32, copy=False)
+
         return (
             torch.from_numpy(centers_world),
             torch.from_numpy(valid_mask),
             torch.from_numpy(instance_ids),
+            torch.from_numpy(sizes_world),
         )
+
+    @staticmethod
+    def build_instance_dims_targets(instance_dict, instance_ids):
+        """
+        annotation 원본 box 치수(w,l)를 grid instance id 순서(instance_ids)에 정렬해 반환.
+        회전과 무관한 진짜 크기 — gt_instance_sizes(voxel-AABB, 회전 시 부풀려짐)와 달리
+        aux size head의 회귀 target용. id 미해결 슬롯은 0(=무효 표시, 소비측에서 >0 게이트).
+        Returns: [N, 2] float32 (w, l)
+        """
+        n = int(instance_ids.shape[0]) if instance_ids is not None else 0
+        dims = torch.zeros((n, 2), dtype=torch.float32)
+        if n == 0 or not isinstance(instance_dict, dict):
+            return dims
+        id_to_col = {int(v): i for i, v in enumerate(instance_ids.tolist())}
+        for anno in instance_dict.values():
+            col = id_to_col.get(int(anno.get('instance_id', -1)))
+            if col is None:
+                continue
+            size = anno.get('size', None)
+            if size is None or len(size) < 2:
+                continue
+            dims[col, 0] = float(size[0])
+            dims[col, 1] = float(size[1])
+        return dims
 
     # def __call__(self, results):
     #     assert 'attribute_label' not in results.keys()
@@ -1382,10 +1425,13 @@ class LoadInstanceWithFlow(object):
                 results['segmentation_instance3d'] = torch.cat(segmentation_instance3d_list, dim=0).long()
                 if segmentation_instance3d_sparse_list is None:
                     raise ValueError("segmentation_instance3d sparse list is missing while cache is used")
-                centers_world, centers_valid, instance_ids = self.build_instance_center_world_targets(segmentation_instance3d_sparse_list)
+                centers_world, centers_valid, instance_ids, instance_sizes = self.build_instance_center_world_targets(segmentation_instance3d_sparse_list)
                 results['gt_instance_centers_world'] = centers_world
                 results['gt_instance_centers_valid'] = centers_valid
                 results['gt_instance_ids'] = instance_ids
+                results['gt_instance_sizes'] = instance_sizes
+                results['gt_instance_dims'] = self.build_instance_dims_targets(
+                    results.get('instance_dict'), instance_ids)
                 if self.load_segmentation_cls_instance3d:
                     segmentation_cls_sparse_list = load_segmentation_cls_sparse_list_or_raise()
                     self._validate_segmentation_cls_instance3d_alignment(
@@ -1417,7 +1463,7 @@ class LoadInstanceWithFlow(object):
                     'sample_token', 'centerness', 'offset', 'flow_bev', 'time_receptive_field', "indices",
                     'segmentation', 'segmentation_bev', 'instance_bev', 'attribute_label',
                     'segmentation_instance3d', 'segmentation_cls_instance3d', 'gt_occ_inst',
-                    'gt_instance_centers_world', 'gt_instance_centers_valid', 'gt_instance_ids',
+                    'gt_instance_centers_world', 'gt_instance_centers_valid', 'gt_instance_ids', 'gt_instance_sizes', 'gt_instance_dims',
                     'sequence_length', 'instance_dict', 'instance_map', 'input_dict',
                     'egopose_list', 'ego2lidar_list', 'scene_token', 'instance', 'global_idx'
                 ]:
@@ -1537,10 +1583,13 @@ class LoadInstanceWithFlow(object):
         results['instance_bev'] = torch.cat(results['instance_bev'], dim=0)
         if self.load_segmentation_instance3d:
             results['segmentation_instance3d'] = torch.cat(results['segmentation_instance3d'], dim=0).long()
-            centers_world, centers_valid, instance_ids = self.build_instance_center_world_targets(segmentation_instance3d_sparse_list)
+            centers_world, centers_valid, instance_ids, instance_sizes = self.build_instance_center_world_targets(segmentation_instance3d_sparse_list)
             results['gt_instance_centers_world'] = centers_world
             results['gt_instance_centers_valid'] = centers_valid
             results['gt_instance_ids'] = instance_ids
+            results['gt_instance_sizes'] = instance_sizes
+            results['gt_instance_dims'] = self.build_instance_dims_targets(
+                results.get('instance_dict'), instance_ids)
             if self.load_segmentation_cls_instance3d:
                 segmentation_cls_sparse_list = load_segmentation_cls_sparse_list_or_raise()
                 self._validate_segmentation_cls_instance3d_alignment(
@@ -1590,7 +1639,7 @@ class LoadInstanceWithFlow(object):
                 'sample_token', 'centerness', 'offset', 'flow_bev', 'time_receptive_field', "indices",
                 'segmentation', 'segmentation_bev', 'instance_bev', 'attribute_label',
                 'segmentation_instance3d', 'segmentation_cls_instance3d', 'gt_occ_inst',
-                'gt_instance_centers_world', 'gt_instance_centers_valid', 'gt_instance_ids',
+                'gt_instance_centers_world', 'gt_instance_centers_valid', 'gt_instance_ids', 'gt_instance_sizes', 'gt_instance_dims',
                 'sequence_length', 'instance_dict', 'instance_map', 'input_dict',
                 'egopose_list', 'ego2lidar_list', 'scene_token', 'instance', 'global_idx'
             ]:

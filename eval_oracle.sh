@@ -8,9 +8,9 @@ set -euo pipefail
 
 # ----- 대상 config / checkpoint / GPU -----
 CONFIG=./projects/configs/baselines/full.py
-CHECKPOINT=./work_dirs/full/epoch_12_lss_only.pth
+CHECKPOINT=./work_dirs/full/latest.pth
 GPUS=8
-export PORT=30091              
+export PORT=50091
 
 # ----- 평가 동작 (baseline과 동일하게 맞춰 공정 비교) -----
 export EOCF_EVAL_MODE=1            # 0=present / 1=future. baseline과 동일하게 future.

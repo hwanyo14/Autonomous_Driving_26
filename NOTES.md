@@ -1,5 +1,149 @@
 # NOTES
 
+## 2026-07-06 KST — bbox v2 배선 후 알아둘 것
+- **v2 로드는 detector-side lazy-load** (`_eval_load_bbox_gt_v2`): test Collect meta의 `scene_token`이 present `<scene>_<lidar>` 결합키라는 사실에 의존. dataset이 이 키 규약을 바꾸면 v2 로드가 조용히 실패(fallback으로 넘어감) — eval 로그에서 `IoU2d(bbox_rot)`가 NaN이면 이 경로부터 의심할 것.
+- **v2 커버리지는 val 5119뿐** (train 키 없음) — train-time eval hook은 val이라 문제 없音. 기존 29k 캐시(train+val)와 달리 train 샘플로 simple_test를 돌리면 fallback(구 bboxcls)으로 감.
+- **기존 bboxcls의 box 누락, val에서 13/30으로 재측정** (v2==loader 정합 확인 과정에서 발견; 이전 5/39는 train+val 혼합 표본) — 패턴상 소멸-유지(frozen pose) 미반영이 주원인으로 보임. 구 캐시 기반 bbox 수치는 이 정도로 과소평가였음.
+- **재압축 완료** (int64 비압축 129G → int32 compressed **7.4G**): logs/recompress_bboxv2.log. eval 로더는 dtype 무관.
+- rot GT의 OBB 채움 여유는 반voxel(`half + res/2`) — inst3d 커버 ~98–100%. 더 후하게 = gen 스크립트에서 `res/2`→`res`.
+
+## 2026-07-06 KST — 남아있는 legacy/흔적 목록 (이번에 안 지운 것) + v2 캐시 주의
+- **지운 것**: `compute_gmo_dice_loss`(query_head, 미호출), `_select_query_gt_for_losses`→`_select_query_gt_for_debug_vis` rename. **남긴 것(의도적)**: ① `*_ori.py` 3종(보존본, registry 미등록) ② loading_instance.py 640~1010행 주석 블록(옛 __call__ 보존) ③ `height_l1` 배관(항상 0.0 — eval 결과에 Height_L1로 나오지만 무의미) ④ `use_segmentation_as_query_gt` config 플래그(효과는 디버그 vis의 GT 선택뿐) ⑤ eval의 gt_occ/segmentation_bev fallback 경로(gt_inst 부재 시 안전망) ⑥ 학습 매칭의 bboxcls fallback(gt_occ_inst 부재 시).
+- **v2 캐시 (`data/efficientocf_bboxcls_v2`)**: rot의 inst3d 커버가 97.8~100%로 100%가 아닐 수 있음 — annotation box가 타이트해서 nusocc 경계 voxel이 OBB(+반voxel 여유) 밖으로 나가는 케이스. 관용(Recall) GT로 쓸 때 이 ~2%는 관용 못 받음. 더 후하게 하려면 gen 스크립트의 `half + res/2`를 `half + res`로. AABB 쪽은 100%.
+- **필터의 진짜 위치**: 사람 제외는 config `class_names`(ped 미포함)로 dataset instance_dict에서 이미 배제, 생성소멸·저가시성(visibility==1)은 `record_instance`가 skip → v2 생성기는 rasterize만 함. 즉 학습 GT(gt_instance_dims 등 instance_dict 파생물)와 규칙 원천이 동일.
+
+## 2026-07-06 KST — [실측] gt_occ ↔ inst3d/bbox 불일치 + 승인 대기 중인 실행 계획 2단계
+- **실측 (12샘플, present 프레임 raw↔캐시 항등좌표 대조)**: inst3d ⊂ gt_occ 100% / inst3d ⊂ bbox 100%(80프레임) / **gt_occ movable의 평균 29%(최악 70%)가 inst3d·bbox 어디에도 없음**(box 밖 잔여 — box 통째 drop된 물체 voxel로 추정). gt_occ는 생성소멸 필터도 없음(raw). → 현 IoU3d(nusocc)/Recall_3d는 모델이 절대 예측 못 하는 구조적 FN을 깔고 채점 중(IoU3d 0.03대의 원인 일부). inst3d는 생성소멸 사실상 필터됨(5/200 노이즈).
+- **1단계 ✅ 적용 완료 (2026-07-06, CHANGELOG 참조)**: simple_test 3D GT를 `(gt_inst>0)`으로 교체, valid 마스크 제거. nusocc 계열 3개 메트릭 전부 학습 GT와 통일됨. 이후 eval의 IoU3d/Recall_3d는 이전 로그와 비교 금지.
+- **2단계 계획 (bbox 재생성, val 5119샘플만)**: `tools/gen_data/gen_bbox_rot_gt.py` 신설 → `data/efficientocf_bboxcls_rot_v2/GMO/segmentation_rot/` per-frame `[x,y,z,cls,inst]`. get_label의 visible_instance_set(생성소멸)+query_class_ids 화이트리스트(ped·barrier 차단), rasterize만 point-in-OBB로 교체(z축 회전만이라 2D 회전 검사면 충분). 이후 로더 옵션 추가 + simple_test에 IoU2d/IoU3d(bbox_rot) 배선(기존 bbox_aabb 경로 복제 수준). 미결정: AABB 캐시도 v2로 재생성해 기존 오염(생성소멸 누수·box 누락) 제거할지 여부.
+
+## 2026-07-06 KST — bbox 계열 메트릭의 생성소멸 누수 + rot 캐시(efficientocf_bboxcls_rot) 파악
+- **bbox GT(bboxcls 캐시) 오염 정밀 재측정 (39샘플, ped 효과 분리 후)**: ① 생성소멸 누수(ped 제외 후에도 미래-신규 box) **5/39** — t≥3에서만 등장, box 1개(2~5k voxel)씩. ② 진짜 box 누락(ped 포함해도 없음) **5/39** — 단일 프레임 대형 box 누락 3건(7~31k voxel) + 전 시퀀스 누락 2건(pc_range 경계 물체). ⚠️ 초기 20샘플 스캔의 일부 "누수"는 ped box였음(bbox만 ped 제외하고 loader는 ped 포함이라 생긴 허상) — 비교 시 반드시 양쪽 클래스 기준 통일할 것. cls-only 캐시라 eval 시점 instance 필터 불가 → 근본 해결은 annotation 기반 재생성. nusocc inst3d는 5/200(거의 무결). **시각화: work_dirs/gt_align_vis/figA·figB·figC.png** (gt_occ 잔여 / 생성소멸 누수 / box 누락).
+- **rot 캐시 구조** (`data/efficientocf_bboxcls_rot/GMO`, 29049 files): ① `segmentation` [x,y,z,cls] = **rotated(OBB) rasterize** (AABB 대비 voxel ~절반 — 회전 반영 확인) ② `instance_rotation` per-frame [inst_id, cls, yaw(rad), quaternion w,x,y,z] ③ `instance_bev` [x,y,inst_id]. **rotation 값 있음** ✓.
+- **rot 캐시 필터 상태**: ⚠️ 클래스에 **1(barrier) 포함** — GMO 외 클래스 유입, 사용 시 query_class_ids 화이트리스트 필터 필수(현 로더의 exclude(7,)만으론 부족). ped(7) 존재 — 기존 `_filter_sparse_rows_by_class` 재사용으로 제거 가능 ✓. **생성소멸 미적용**(140/200 샘플에 미래-신규 instance).
+- **rot 생성소멸 필터 가능성**: 2D는 가능 — `instance_bev`(id) + `instance_rotation`(id→cls 맵)으로 "t<time_receptive_field에 등장한 id만 유지" + ped/barrier id 제거. **3D는 `segmentation`에 per-voxel inst id가 없어 직접 불가** — ① instance_bev footprint로 z-컬럼 제거(겹침 box 과제거 위험), ② [x,y,z,cls,inst] 형태로 캐시 재생성(정공법) 중 택일 필요.
+
+## 2026-07-06 KST — eval GT 지형도 (IoU2d(nusocc) GT 교체 시 확정한 사실)
+- **GT 3계열 정리**: ① `gt_occ_inst`(data/nuScenes-Occupancy_inst3d, sparse [x,y,z,cls,inst] 512×512×40) = 진짜 nusocc per-instance voxel — 학습 dice·이번 교체 후 IoU2d(nusocc)·매칭 center의 소스. ② `segmentation`/`segmentation_bev`/`segmentation_cls_instance3d`(bboxcls 캐시) = **bbox AABB rasterize** (회전 코너를 min/max로 뭉갬) — IoU2d(bbox_aabb)·Recall3d 관용항 전용. ③ `gt_occ`(nuScenes-Occupancy dense semantic) = IoU3d/Recall3d의 3D GT.
+- **필터 일치**: gt_occ_inst는 로드에서 pedestrian(cls7) 제거(`exclude_occ_class_ids`), detector `_prepare_gt_occ_inst_primary_targets`에서 query_class_ids 필터 → 학습 dice와 eval GT가 완전 동일 경로. 단 **생성소멸(`visible_instance_set`, 미래 신규 instance 제거) 필터는 bbox 렌더링(`get_label`) 전용** — gt_occ_inst sparse에는 그 필터가 없음(캐시 원본 그대로). 학습 dice도 같은 무필터 dense를 쓰므로 train/eval 일관은 유지되나, bbox 메트릭과 nusocc 메트릭의 instance 모집단이 미래 프레임에서 다를 수 있음을 기억할 것.
+- **rotated bbox 메트릭 추가 시**: yaw는 어떤 캐시에도 없음. `instance_dict` annotation(translation/rotation quaternion/size) → `get_poly_region`식 egopose+ego2lidar 변환으로 회전 코너를 얻고 point-in-OBB로 rasterize해야 함 (AABB min/max로 채우면 기존 캐시와 동일해져 무의미). 생성소멸·pedestrian 필터는 `get_label` 규칙 재사용.
+- **IoU2d(nusocc) 수치 단절**: 2026-07-06 이후 로그의 IoU2d(nusocc)는 이전 로그와 비교 금지(GT 교체). nusocc는 표면 sparse — bbox-AABB 대비 GT 양이 작아 수치가 내려가는 게 정상.
+
+## 2026-07-05 KST — [probe 실측] cover ep15 feature도 크기 정보 없음 (자연 유입 가설 기각)
+- 보류됐던 검증 완료 (per-sample 240s 타임아웃 버전, tools/dbg_probe/probe_feat_size.py 변형): cover ep15 matched query feature 133쌍, **best R²=-0.005, spearman≈0** (옛 모델 0.06과 동일하게 없음). bin별 예측이 buses 포함 전부 ~2.5m로 붕괴.
+- **해석**: "cover로 attention이 객체를 커버하면 feature에 크기가 자연 유입된다" 가설 기각 — query feature는 attention 가중 **평균**이라 커버리지가 좋아져도 면적/extent 정보가 평균에서 소실됨(instance-pool 0.015와 같은 원리). σ-matching의 eval 이득은 feature "순도"(배경 오염 감소) 경로였지 크기 유입 경로가 아니었던 것.
+- **함의 (size note 실험 해석 기준)**: 진행 중인 subset_attn_cover_size에서 ① `dbg_query_size_aux_l1_big`이 내려가면 = "감독하면 배운다"(자연 발생만 없던 것), ② 안 내려가면 = content feature로는 크기 불가가 **감독 유무 모두에서 확정** → 기하 성분(σu,σv,d)만 유효, 다음 수 = 렌더-recall + 기하 성분 중심 재설계.
+- 참고: 학습 첫 iter smoke 통과 (`loss_query_size_aux: 2.98`, NaN 없음, live log = logs/subset_attn_cover_size/20260704_235120.log — 23:51 run이 본편, 23:53 중복 launch는 정리됨).
+
+## 2026-07-05 KST — size note 구현 관련 주의 (subset_attn_cover_size)
+- **from-scratch 전용**: aux head+note proj로 query_head 파라미터가 늘어 기존 ckpt 로드 불가(strict=False면 새 모듈만 랜덤 초기화되나 의도적 사용 금지). resume는 같은 config 내에서만.
+- **note는 zero-init이라 초반 무영향**: 학습 초반 `loss_query_size_aux`만 내려가고 gaussian 분포 변화는 note_proj가 0에서 벗어난 뒤(수백 iter+) 시작 — 초반 BEV가 안 변해도 버그 아님.
+- **벌리는 힘 없음이 의도**: 이번 run은 "쪽지만"(입력). 기대 경로 = 기존 matched-GMO dice가 크기 아는 head를 상대로 FN을 조임. 버스가 부분 개선에 그치면 그 갭이 렌더-recall(후속 스테이지)의 몫 — nusocc GT의 끝단 구멍 때문에 dice 압력이 약한 건 여전함을 기억할 것.
+- **dbg 읽는 법**: `dbg_query_size_aux_l1_big`(>6m 쌍) — 초기 ~8-10(예측 2m vs 버스 12m 수준)에서 내려가야 정상. `pair_count` 대비 `big_count`로 대형 쌍 등장 빈도 감시(subset에서 ~3%). l1_big이 안 내려가면 feature에 크기 신호가 정말 없는 것 → 기하 성분(σ,d)만 남고 aux는 무용 — 그때 기하 성분의 기여를 ablation으로 분리할 것.
+- **σ 성분은 no-grad·질량최대 캠 기준**: 학습·추론 공용 경로(apply_lifted 호출부)에서 계산되므로 eval에서도 동일 동작. attention 질량이 극소인 query는 σ가 노이즈지만 note가 detach라 학습 안정성엔 무해.
+- **gt_instance_dims=0은 무효 마커**: annotation 미해결 instance(id 불일치 등)는 (0,0) — aux loss가 max(w,l)>0.05 게이트로 제외. 다른 config는 Collect에 안 실어 무영향.
+
+## 2026-07-04 KST — ✅ cover eval 승리로 cls 우려 해소 + 매칭 수 해석 정정
+- **eval (사용자 실행, cover 진행 중 1536/5119 시점 대조)**: cover가 **전 지표 우세** — IoU3d 0.0271 vs 0.0257(+5%), Recall3d 0.2479 vs 0.2336(+6%), IoU2d(bbox) 0.1213 vs 0.1206(동등+). → **cls +21%/focal +17.5% loss 격차는 eval 무해로 판정** (캘리브레이션 이동일 뿐). cover = 기하·loss·eval 3면 모두 확정 성공.
+- **정정 (매칭 수 133 vs 89)**: 헝가리안은 유효 GT 수만큼 전부 매칭함(사용자 지적이 맞음 — 거리 게이트 `query_match_center_gate_radius_m`는 코드에 있으나 0.0=off, recruit도 off). 프로브 간 쌍 수 차이는 **각자 dataset을 다시 뽑아 랜덤 aug가 달랐던 측정 노이즈** (샘플별 양방향 요동으로 확인). "cover가 매칭을 더 한다"는 해석 철회.
+- **⚠️ 프로브 방법론 교훈**: 두 모델 비교 시 **데이터를 한 번 뽑아 같은 배치를 양쪽에** 넣을 것 (cap_we_bev.py 방식). 각자 fetch하면 aug가 달라져 bin 평균/쌍 수가 흔들림 — run 내부 상관(spearman)은 유효하나 cross-run 절대값 비교는 오염됨.
+
+## 2026-07-04 KST — ✅ cover(σ-matching) 완주 최종 판정: 크기 추종 확립, 다음 단계 GO
+- **ep15 기하 (probe: dbg_out/attn_geom_cover_ep15.json, n=133)**: σ 크기 순위상관 **u 0.578 / v 0.803** (궤적 ep2 0.37/0.63 → ep5 0.47/0.73 → ep15 — 계속 상승, 대조군 ep15는 0.21/0.31). ratio 중앙값 2.13→**1.50**, x-large bin은 **0.95(사실상 목표 도달)**. small bin σ 5.5px — 우려했던 feature 해상도 바닥(~8px)보다 **아래로 조여짐**(바닥이 생각보다 낮음). inside_mass 0.57, 올바른 캠 질량 0.95/0.999 — 전 위생 지표 최고치.
+- **⚠️ watch**: large bin(σ_mask~6px)이 ep5 13.1px→ep15 16.8px로 튐(ratio 2.76, n=24) — 다른 bin 전부 개선인데 이 bin만 역행. 샘플 구성 노이즈 가능성이 크나 재프로브 시 확인할 것.
+- **cls +21%/focal +17.5% 열세의 해석**: cover가 **matched 쌍 133 vs 대조군 89 (+49%)** — cls loss는 matched=fg/unmatched=bg 구성에 의존하므로 **값 직접 비교가 불공정**(더 많은 쌍을 매칭하는 것 자체는 recall 관점 이득). 실질 악화 여부는 **eval IoU가 최종 심판** — 다음 단계 전 run_eval 권장. focal도 매칭↑로 fg 렌더 시도가 늘며 per-voxel 벌점이 늘어나는 구성 효과 가능성.
+- **σ loss 0.35 정체 해석**: 잔여 ratio(small 3.5/mid 2.4)와 정합 — 정체가 아니라 완만한 수렴 중, 바닥 아직 아님.
+- **GO 결정**: 크기 신호(σ_attn)가 attention 기하에 확립됨 → 다음 단계 = ① σ×depth→size embedding(head 입력 concat, detach), ② 렌더-recall forcing(matched instance FN-only, violators 정규화), ③ attn 계열 config에 `gt_instance_sizes` 플러밍 추가(현재 미포함 확인됨). head 입력 차원 변경이라 from-scratch run.
+
+## 2026-07-03 KST — ✅ cover(σ-matching) ep5 관문 통과: attn 폭이 크기를 추종하기 시작, side-effect 0
+- **ep5 vs ep5 동일-epoch 대조 (단일변수=σ loss; probe 데이터 dbg_out/attn_geom_{cover,attnfix}_ep5.json)**: σ 크기 순위상관 u축 0.286→**0.469**, v축 0.419→**0.728**. ratio(σ_attn/σ_mask): small 7.5→**4.0**, mid 3.9→3.2, large 2.5→2.1, x-large 1.3→1.25 — **큰 오차 구간일수록 세게 교정**되는 log-ratio 설계 그대로. inside_mass도 0.43→0.49 부수 개선.
+- **궤적**: cover ep2→ep5 spearman 0.37/0.63→0.47/0.73 (계속 상승), σ loss 0.81→0.49 (붕괴 없이 하강). 대조군은 15 epoch 수렴해도 0.21/0.31 — σ 감독 없이는 절대 안 생기는 신호임이 재확인.
+- **가드**: center_match 차이 ep4~6에서 −1.0~+0.3% (무손상, ep6엔 오히려 우세), dice는 전 구간 cover가 1~2% 우세(배경 오염 감소 부수효과 추정). 비용은 attn_bbox +2~3%뿐.
+- **잔여 한계**: small 객체 σ 7.3px vs 목표 1.7px — feature 유사도 길이(~8px) 바닥에 걸리는 중일 가능성(예견됨). 순서/상관은 확보됐으므로 σ×depth 크기 신호로는 사용 가능 전망. mean ratio의 outlier(마스크 σ floor 걸린 초소형 쌍)는 중앙값으로 볼 것.
+- **다음 관문**: cover 완주(ep15) 후 최종 프로브 → 통과 시 size embedding(σ×depth→head 입력, gt_instance_sizes 플러밍을 attn 계열 config에 추가 필요) + 렌더-recall forcing 구현 단계로.
+
+## 2026-07-03 KST — ✅ subset_attn(collision fix) 완주 판정: 전면 개선, 이후 실험 베이스로 확정
+- **로그 (정확한 ablation = fl25_sz06 ep15 vs subset_attn ep15, attn fix만 차이)**: center_match **−15.9%**(1.556→1.308), cls −16.3%, **focal −17.7%**, attn_bbox −7.9%(정의가 더 엄격한데도), dice −3.1%, depth −3.1%, total −5.7% — **전 항목 개선, 역행 0개**. 격차는 ep3부터 15까지 전 구간 일정(수렴해도 안 좁혀짐 = 구조적 개선). buggy subset_scale_offset과의 ep11 비교도 같은 결론(center −17.1%). 개선이 attn 항목에 국한되지 않음 = **매칭 cost 정확화의 연쇄 효과** — "loss 부풀림 2.2%p뿐"이라는 사전 예측은 matcher 경로를 과소평가했던 것.
+- **ep15 attn 기하 probe (tools/dbg_probe/probe_attn_geometry.py 변형)**: 올바른 카메라 질량 80%→**93%(중앙값 99.8%)**, 마스크 안 질량 44%→**54%**, collision 크레딧 의존 0.022→0.006(소멸). 단 **폭은 여전히 크기-무시**(σ_attn 8.8~17px, spearman 0.21/0.31 — fix-only로 15 epoch 수렴해도 크기 추종은 절대 안 생김을 확인). ↔ cover는 ep2(σ loss 500 iter)에 이미 spearman 0.37/0.63 — **σ-matching 없이는 자연 발생하지 않는 신호**라는 대조 증거.
+- **결론**: 이후 모든 실험 베이스 config = subset_attn 계열. 폭 감독(cover)의 필요성도 대조로 재확인.
+
+## 2026-07-03 KST — 🔴 [dbg 실측] _we visible-gate spread도 우회당함 (3번째 loophole: flag-pole)
+- **측정**: subset_scale_offset_we ep10, matched 158쌍 forward (scratchpad `probe_we_spread.py`, 데이터 `dbg_out/we_spread_ep10.json`).
+- **결과**: visible spread ≈ 5m로 **크기 무관 균일**(corr spearman 0.017), deficit>0 **0%** → loss가 ep3부터 0.003→0.0004로 조용했던 이유 = 만족이 아니라 **우회**. 결정적 변화: **가시(w>0.75) 가우시안이 1.5~1.8개/48로 급감**(기존 raw run은 5~9개), 그 가시 1~2개가 **반경 ~9m**(기존 1.3~3.7m)에 배치됨.
+- **메커니즘 = flag-pole gaming**: gate 통과 가우시안 1~2개를 멀리(9m) 꽂으면 visible-gate 2nd-moment는 target을 초과 충족. σ가 작으면 렌더 FP 비용(dice)은 voxel 몇 개 수준으로 미미한데 spread 메트릭 보상은 r² 가중이라 큼. 나머지 질량은 gate 아래(w<0.75)로 내려가 union 겹침으로 점유를 만듦 — 예견했던 '아령'+'전원-비가시' 도망의 조합.
+- **교훈 (3연속 우회: σ-loophole → ghost/weight-loophole → flag-pole)**: 48-DOF mixture의 **내부 통계량**(모멘트류)을 forcing target으로 주면 점유에 안 보이는/저비용 자유도로 반드시 우회함(Goodhart). **다음 forcing은 렌더된 점유 자체에 걸어야 함** — matched instance별 one-sided recall(FN) 항 (matched_gmo 경로/128³ voxelizer 재사용, 버스 voxel을 실제로 덮어야만 감소 → 우회 불가). 기존 gmo dice는 FP/FN 균형이라 희소 대형의 FN을 못 조임 — FN-only + 크기/violator 가중 별도 항 필요.
+- _we run 자체는 spread loss가 관성 0이라 baseline과 사실상 동일 학습(dice/focal 동등 확인) — 계속 돌릴 가치는 낮음.
+
+## 2026-07-02 KST — [probe 실측] attn 기하: 중심·카메라는 정확, 폭이 크기-무시 고정 블롭 → σ-matching 구현
+- **측정 (ep10, matched 148쌍, scratchpad `probe_attn_geometry.py`, 데이터 `dbg_out/attn_geom_ep10.json`)**: ① attn 질량 80%(중앙값 90%)가 GT-가시 카메라에 위치(카메라 선택 OK). ② 마스크 안 질량 44%(56% 배경 유출). ③ σ_attn/σ_mask = 2.4~3.1배 — 퍼짐 자체는 마스크보다 넓음. ④ **σ_attn이 크기 무관 8~14px 고정**(마스크 σ는 1.7→6.3px로 크기 추종) → corr(σ×depth, GT크기) spearman **0.004**. ⑤ collision 버그 inside_mass 부풀림 실측 **2.2%p**(0.457→0.436) — per-cam fix 단독의 학습 영향은 미미할 것(수정의 가치는 정확성+per-cam 감독의 기반).
+- **해석**: "중심 응집"이 아니라 **크기-무시 고정폭 블롭**. 1차 모멘트(위치)는 center/depth/inside 3방향 감독인데 2차 모멘트(폭)는 어떤 loss에도 없음 → 폭이 feature 유사도 길이(~8px) 기본값에 정착. inside-mass는 '총량' 채점이라 마스크 안 웅크리기가 합법(마스크가 클수록 오히려 느슨), other-suppress(0.3)도 '남의 마스크' 금지일 뿐 폭 하한 없음.
+- **조치 = σ-matching 구현(CHANGELOG 참조)**: `loss_query_attn_sigma` — 폭만 log-ratio 회귀, 위치 무접촉. `subset_attn_cover.py`에서 weight 0.25/start_iter 500 활성, 그 외 config는 0.0=off.
+- ⚠️ **주의/한계**: (a) 조임의 바닥이 feature 유사도 길이에 걸릴 수 있음 — 자전거(마스크 1.7px)는 8→2px까지 못 갈 수 있고 부분 수렴도 정상, ratio_u/v가 1.0 근처가 아니라 1.5쯤에서 멈춰도 크기 '순위'가 생기면 성공. (b) σ만 맞추면 아령형 분포도 σ는 맞음 — size 용도(σ만 읽음)로는 무해, 모양 문제 생기면 정규화 soft-IoU/dice로 승급. (c) 가림/잘림 마스크는 σ_mask 과소 → min_px(4) 게이트만 있고 border-touch 제외는 미구현. (d) static_graph DDP: start_iter 게이트가 그래프를 바꾸지만 기존 손실들도 iter별 분기(z-tie 패턴)라 동일 패턴 — 첫 500 iter 전후 DDP 에러 없는지 확인.
+- **부수 기대효과(실측 전 가설)**: 조이면 query feature의 배경 오염(56%)↓ → cls under-confidence(NOTES 6/16)·depth 노이즈·인접 instance 혼선 개선 여지. center는 depth 정화로 오히려 좋아질 수도.
+
+## 2026-07-02 KST — 🔴 camera-attn loss 카메라간 픽셀좌표 충돌(collision) 버그 및 수정
+- **버그**: `_compute_query_attn_bbox_loss`/매칭 cost 둘 다 예측 attn을 카메라 축 `sum`, GT를 카메라 축 `any`로 눌러 `H×W`로 비교 — 서로 다른 카메라의 같은 배열 인덱스 `(h,w)`가 같은 슬롯으로 취급됨. 카메라 extrinsic/intrinsic 자체는 GT 투영(`_project_gt_instances_to_cam_masks`)과 예측 attention(transformer cross-attn, 카메라별 pos embedding)에 다 올바르게 들어가지만, 마지막 비교 단계에서 "몇 번 카메라인지" 정보가 사라지는 구조였음.
+- **수정**: `(Ncam,H,W)`를 통째로 flatten(`p=Ncam*H*W`)해서 비교하도록 `utils_loss.py`/`utils_matcher.py` 변경. GT 타겟 빌더는 이미 카메라별 마스크(`gt_inst_cam_mask_tnnhw`)를 만들어 반환하고 있었는데 소비하는 쪽이 OR'd 버전(`gt_inst_mask_tnhw`)만 쓰고 있었던 것 — 빌더 자체는 무수정, 소비부만 교체.
+- ⚠️ **fix 이전에 학습된 checkpoint의 attn 관련 head/weight는 이 버그 하에서 학습된 것** — fix 이후 이어서 학습(resume)하면 loss 정의가 바뀌어 misalignment 가능. `subset_attn.py`(신규, subset.py와 동일값)로 처음부터 새로 학습해서 검증할 것.
+- ⚠️ **미검증**: 합성 텐서 단위테스트만 통과(scratchpad `test_attn_fix.py`), 실제 forward/학습 smoke 미실행. 첫 학습 step에서 `loss_query_attn_bbox`/`dbg_query_attn_bbox_inside_mass_mean` 등이 NaN/shape-error 없이 나오는지 확인 필요.
+- **후속 논의 (미구현)**: `inside_mass`(=`-log(Σ pred·gt_mask)`) 손실은 pred가 sum-to-1 분포라 "마스크 안 어딘가에 몰아넣기만 하면" 만족되고 마스크 전체를 덮도록(spread) 유도하는 항이 없음 — 실제로 관찰되는 point-concentration 경향의 원인일 수 있음. 대안(BCE/Focal/Tversky류 per-pixel independent 감독 등)은 아래 "camera-attn map spread" 항목 참고, 아직 미구현.
+
+## 2026-07-02 KST — 🔴 [probe 실측] ep10 query feature에 크기 정보 사실상 없음 (사용자 가설 확인)
+- **방법**: subset_scale_offset ep10, matched query feature(`query_feat_tqd`, D=96) 137쌍(14샘플)에서 GT half-extent(log) ridge 회귀, 샘플 단위 group 5-fold CV, λ 스윕(1~2e4) + shuffled-label 컨트롤. 스크립트 scratchpad `probe_feat_size.py`, 데이터 `dbg_out/feat_probe_ep10.npz`.
+- **결과**: best groupCV **R²=0.06** (λ=100, 컨트롤 -0.13), Spearman≈0.11, big-vs-small 분류 acc 0.62 < 다수클래스 baseline 0.77. per-bin 예측이 tiny/car/truck/bus 전부 log-half≈0.86(≈2.4m, 승용차)으로 **일괄 수렴** — 버스(진값 5m)도 2.4m로 예측.
+- **해석**: 선형 프로브 기준 ep10 feature는 크기를 못 담고 있음(하한이므로 비선형 가능성은 남지만 신호가 chance 수준). cls도 binary(fg/bg)라 크기/클래스 감독이 전무했던 상태 — "요구된 적 없음"과 "지금 없음"이 둘 다 사실로 확정. **추론 시 크기-조건부 행동이 현재로선 불가능** → 유령 loophole이 없었더라도 spread 규제가 즉시 작동하긴 어려웠을 것.
+- **matched 쌍에서 bus/trailer는 4/137(2.9%)** — 데이터 불균형 정량치. `_we` 학습으로 spread gradient가 feature까지 흐르면 구분 표현이 생겨야 하며, **N epoch 후 이 프로브 재실행으로 R² 상승 여부가 "피쳐가 크기를 배우는 중인가"의 직접 지표**. R²가 안 오르고 loss_query_spread가 높게 정체하면 oversampling(버스/트레일러 포함 샘플)·클래스 감독 부활 등 데이터/감독 대응 필요.
+
+## 2026-07-02 KST — 'visible' spread gate (`_we` config) 관련 주의
+- **tau=0.1 하드코딩** (query_head.py gate). gate가 너무 가파르면(∵ w가 임계 근처에 몰릴 때) gradient 소실, 너무 완만하면 유령 재유입 — 문제 시 config 승격 검토.
+- **vis_threshold = occ_score_threshold(0.75) 재사용**: occ 임계를 바꾸면 spread gate도 같이 움직임(의도된 커플링 — "점유에 보이는 것"의 정의 통일).
+- **초기 학습**: w 균일(~0.5)이면 gate도 균일 → spread = unweighted RMS(≈init 산포 4~5m)라 초반 폭주 없음. weight 분화가 진행되며 gate가 조여지고 그때부터 실질 압력 발생 → `loss_query_spread`가 **초반 0 근처였다가 중반에 올라올 수 있음**(σ-metric 때의 "즉시 0"과 다른 패턴, 버그 아님).
+- **모니터링**: ① `loss_query_spread`가 0으로 즉시 붕괴하지 않는지(또 loophole이면 재붕괴), ② dice/focal이 baseline 대비 안 밀리는지(이번엔 진짜 압력이라 trade-off 가능), ③ N epoch 후 dbg forward(scratchpad `dbg_offset_spread.py` 재사용, **vis 게이트 끄고**)로 corr(GT size, visible-spread)>0 확인. ④ 위반자 정규화라 loss 스케일이 이전 run보다 큼(수십 배) — 곡선 비교 시 스케일 주의.
+- **d(loss)/d(w_visible)>0 부작용**: 중심 근처 가시 가우시안의 w를 살짝 낮추는 방향도 존재(spread 분모 축소) — dice가 반대 압력이라 실害 가능성 낮지만 w 붕괴 모니터.
+
+## 2026-07-02 KST — 🔴 [dbg 실측] offset-only spread 정칙항 = 사실상 무압력 (weight-loophole 확인)
+- **측정 방법**: subset_scale_offset ep1/ep10 ckpt를 동일 학습 샘플 5개(큰 객체 포함)에 forward, `_last_query_offset_spread`·`_last_inst_match_result`·mixture 텐서 캡처. 결과물 `work_dirs/subset_scale_offset/dbg_analysis/bev_weight_loophole.png`, 스크립트 scratchpad `dbg_offset_spread.py`.
+- **핵심 실측 (matched 42쌍)**: offset spread(xy)가 **크기와 무관하게 전부 ~3.5m** — corr(GT half, spread) = 0.03(ep1) / **-0.15(ep10)**. 자전거(half 1.0m)도 3.4~4.1m(target의 7~8배), 버스(half 6.7m)도 3.5m(target 3.35m의 1.04배). **모든 쌍이 이미 deficit=0** → 정칙항 gradient 없음.
+- **원인 = weight-loophole (σ-loophole의 weight 버전)**: spread 메트릭 `√(Σw_sur·off²)`의 w_sur는 정규화 weight라, **낮은 weight의 '유령' gaussian이 멀리 흩어져 있으면 메트릭은 충족**되지만 점유에는 안 나타남. 실제 ep10에서 개별 가시 gaussian(1-exp(-w)>0.5)은 5~9/48개뿐이고 그 반경 r_vis는 승용차 1.3~3.7m, **버스도 2.8m(car-size)**. ep1은 weight 미분화(w~0.5 균일, init 산포 4~5m) 상태였고 spread는 그때 이미 target 초과 → epoch1 초 loss 급감은 "정칙항이 offset을 벌린 것"이 아니라 init 산포가 원래 큰 것.
+- **함의**: (1) 이미지 피쳐 구분력 문제라고 단정 불가 — 제약 자체가 공허(vacuous)해서 피쳐에 요구된 적이 없음. (2) **계속 학습해도 안 변함** (deficit≈0, plateau). (3) occupancy 손실은 baseline(fl25_sz06)과 동등(dice +0.01, focal은 더 좋음) — 정칙항이 무해했던 이유도 무압력이라서.
+- **수정 방향(합의 전)**: spread 메트릭의 weight를 **splat-가시 질량으로 교체** — w_eff = 1-exp(-w) (poisson 단일 gaussian 피크 기여)로 2nd-moment 계산. 그러면 target을 채우려면 **높은 weight gaussian을 실제로 멀리 보내야** 하고(점유에 나타남), 작은 객체는 target이 작아 이미 충족 → 자동 크기-선택적. gradient가 offset과 weight(opacity) 양쪽으로 흐름 = "작은 객체는 opacity 떨구기" 아이디어의 올바른 방향 버전.
+- ⚠️ dbg forward 부작용: 학습 vis 게이트가 열려 `vis/20260702_100726/`에 iter_005040 태그 stray PNG 21개가 남음(10:26 mtime, 삭제 권한 없어 방치). 재실행 시 visualization cfg를 꺼야 함. 또 dbg는 GPU당 ~27GB 점유 — 이 서버는 GPU당 학습 job 4개(70~160GB) 공유 중이므로 **실행 전 nvidia-smi 확인 필수**.
+
+## 2026-07-01 KST — ✅ [제거] scale head / Lreg / budget 커플링 완전 삭제 (forcing-only만 남음)
+- forcing-only 확정으로 scale head 계열(예측·Lreg·천장 커플링)이 dead code가 되어 **코드에서 전면 제거**함. repo 전체 잔존 심볼 0 검증.
+- ⚠️ 따라서 **아래 scale head/Lreg/커플링 관련 주의 항목들(예측 under-size, detach, off_floor, DDP placeholder for scale head, 커플링 z 등)은 전부 무효**. 지금 남은 건 **forcing(spread 정칙항, offset-only 메트릭) + `gt_instance_sizes` 플러밍**뿐.
+- 현재 큰 객체 메커니즘 = **고정 전역 캡(offset_max 12 / sigma_max 3·0.6) + spread 정칙항이 offset을 GT extent까지 밂**. scale 예측/천장 없음. eval도 offset head가 학습된 대로 뱉음(별도 scale 불필요).
+- 재활성(explicit scale + 커플링) 원하면 CHANGELOG 2026-06-30~07-01 항목 참조해 재구현해야 함(코드 제거됨).
+
+## 2026-07-01 KST — ⚠️ spread forcing 메트릭 = offset-only (σ 제외) 주의
+- **왜 바꿈**: 첫 forcing run(subset_scale) 실측상 `loss_query_spread`≈0(미작동). 메트릭 `query_sigma`가 σ 포함이라 모델이 **σ만 키워** target 충족(σ-loophole). → 메트릭을 **offset-only 분산** `√(Σw·offset²)`(가우시안 중심 분포, σ 무관)로 교체. 이러면 σ 키워도 페널티 안 줄어 **offset을 움직여야만** 감소.
+- **어디**: `query_head.apply_lifted_centers_to_outputs`가 `query_offset_spread_tq3` 노출 → `efficientocf._last_query_offset_spread` 캐시 → `_compute_query_spread_reg_from_match(query_spread_tq3=...)`. gradient가 offset head로만 흐름(σ head 0) — E2E 검증.
+- ⚠️ **가중치 무변경**: weight 0.2·frac 0.5·mean 정규화 다 그대로(단일변수=메트릭만 교체). active config=`subset_scale_offset.py`(별도 work_dir).
+- ⚠️ **희석 미해결(의도)**: 버스 희소 → mean-over-matched로 gradient/K 희석 여전. offset-metric으로 돌려서 버스 여전히 약하면 **그때** 크기가중(`Σsize·under/Σsize`)이나 weight↑ 추가. 지금은 단일변수로 효과 격리.
+- ⚠️ **center 흔들림**: center 아직 학습 중(center_match 하강 중). spread는 자기-center 기준 "크기"만 강제 → 위치는 center_match, footprint는 Tversky가 잡음. 초반 노이즈 심하면 spread warmup(늦게 켜기) 고려.
+- ⚠️ **옛 query_sigma 메트릭 경로 제거**됨(offset-only가 코드 기본). 첫 step에서 `loss_query_spread`가 이번엔 **0이 아니게** 뜨는지(작동 신호) 확인할 것.
+
+## 2026-07-01 KST — ⚠️ forcing(spread 정칙항 `loss_query_spread`) 주의
+- **왜 필요**: budget 커플링은 **천장만** 옮김. `offset_max=12`라 천장은 버스를 원래 안 막았으니 커플링만으론 버스 안 커짐(실측: 다 차 크기로 collapse). collapsed init + 약한 FN gradient로 가우시안이 차 크기 평형에 갇혀서, **밖으로 미는 항**(spread 정칙항)이 있어야 평형이 옮겨짐.
+- **(현재 active) subset_scale = forcing-only**: 사용자 결정으로 **천장 커플링·scale head/Lreg OFF**(`use_query_scale_loss=False`,`query_scale_couple_budget=False`). offset/sigma 캡은 **기존 전역 고정(12/3·0.6)** 그대로고 **spread 정칙항(0.2)만** 작동. spread 타겟은 GT voxel-AABB라 scale head 불필요. 커플링/Lreg는 코드로 존재하나 flag OFF(재활성 가능). → 즉 지금 버스는 "고정 12m 천장 + forcing이 GT extent까지 밂"으로 커짐.
+- **메커니즘**: matched query의 `query_sigma_world`(2nd-moment 반경, 프레임 평균)를 `0.5·GT_half_extent`까지 끌어올리는 one-sided relu. query_sigma가 offset²를 포함하므로 σ(캡)보다 **offset이 커져 가우시안이 분산**됨.
+- ⚠️ **over-spread 재발 위험**: spread를 밀므로 Tversky FP와 길항. 안전장치 = one-sided(부족할 때만)+matched-only+GT target detach+`frac=0.5`(보수적). **그래도 `frac`↑나 weight↑ 시 카펫 재발 가능** → `loss_gmo_dice`/over-coverage·차 IoU를 함께 모니터. 재발 시 frac/weight↓.
+- ⚠️ **scale head는 여전히 Lreg-only**: spread 정칙항의 gradient는 offset/σ head로만 흐름(천장 off_max_q·GT target 모두 detached). scale head는 Lreg(L1)만 받음 — 검증으로 grad 분리 확인.
+- ⚠️ **query_sigma는 blob도 키울 수 있음**: σ(캡 sigma_max_q)로도 query_sigma가 부분 충족 가능 → 분산 대신 blob 성장 여지. Tversky FP가 박스 밖 spill을 막아 형상은 잡지만, 만약 "큰 blob"으로 나오면 target을 query_sigma 대신 **offset-spread(중심 분포 std)** 로 바꾸는 것 고려.
+- ⚠️ **eval엔 spread 항 없음**(train-only). eval은 예측 size→천장 + 학습된 spread 거동으로 작동. 그래서 scale head(Lreg) 예측이 정확해야 eval 천장이 제대로 열림.
+- gather는 `_gather_matched_gt_sizes`(Lreg와 공유, id 매칭). 첫 학습 step에서 `loss_query_scale`·`loss_query_spread` 둘 다 emit되는지·OOM·over-spread 거동 확인할 것.
+
+## 2026-06-30 KST — ⚠️ per-query instance-scale head / Lreg / budget 커플링 주의 (subset_scale ON)
+- **무엇**: query당 (world x/y/z) extent 예측 head + Lreg(L1 to matched GT voxel-AABB span) + 그 (detached) 예측으로 가우시안 offset/sigma budget을 per-query 설정(큰 객체↑/작은 객체 floor). `subset_scale.py`에 `use_query_scale_loss/query_scale_couple_budget=True`(weight 0.3). 메커니즘 전말은 CHANGELOG 2026-06-30 항목.
+- ⚠️ **size 타겟 = voxel-AABB span**(진짜 box 아님): occupancy GT voxel에서 뽑은 span이라 **occlusion/range-clip 시 과소측정** 가능 → max-over-frames로 완화했지만 완전히 못 없앰. 모니터: 예측 `scale`이 클래스별로 버스>차>보행자 순서로 벌어지는지(Lreg가 수렴해도 under-size면 큰 객체 budget이 덜 큼). 안 되면 진짜 nuScenes `size`(loading_instance.py:344, 현재 미사용) plumbing 검토.
+- ⚠️ **z는 sigma_z=0.6 캡 유지 + z-offset(전역 ±2.0)으로 커버**. 가우시안 중심은 `point_cloud_range` z=[-5,3]로 **하드 클램프**(query_head.py mixture_centers 직후) → 지면 위 3.5m급은 OK지만 **매우 높거나 들린 객체는 z=+3에서 잘릴 수 있음**. 단 타겟이 voxel(=in-range)에서 와서 보통은 자기-정합. 별도 z 데이터 precheck는 미실행(타겟이 범위 내라 self-consistent).
+- ⚠️ **scale은 budget에서 detach** → scale head는 **Lreg로만** 학습. weight 0.3이 underfit면 큰 객체 budget이 floor에 갇힘 → weight↑ 검토. 반대로 occupancy loss는 offset/sigma head로만 흐름(기존과 동일).
+- ⚠️ **budget은 전역 캡 안쪽 layer(min)** + off_floor(2,2,0.4) 하한. 작은 객체(보행자)는 floor에 머물러 sigma_z range가 0이 될 수 있음(sigma_max_q==sigma_min) → sigma 학습 정지(무해, sigma_min이 sane minimum). 
+- ⚠️ **DDP static_graph**: Lreg helper가 `scale.sum()*0` placeholder를 항상 포함해 zero-match 배치에서도 scale head가 grad를 받음(없으면 'param did not receive grad'). center_only_mode/q=0 극단 엣지에선 placeholder 없이 z로 떨어짐(다른 loss도 degenerate라 허용).
+- ⚠️ **eval 자동 전파**: 커플된 mixture offset/sigma가 그대로 33-tuple→simple_test/oracle에 흐름(scale은 dict/캐시로만 전달, 33-tuple 미변경이라 위치불변 unpack 안전). oracle 매칭 동기화 불필요(매칭 입력 무변).
+- ⚠️ **미검증**: 전체 모델 build + forward smoke는 미실행(데이터/GPU 필요). py_compile·config 로드·핵심 수식 단위테스트만 통과. 첫 학습 step에서 `loss_query_scale` emit·shape·OOM 확인할 것.
+
+
 ## 2026-06-30 KST — ⚠️ Oracle 매칭 train-faithful 복제 유지보수 주의
 - `_eval_train_faithful_inst_match`는 `forward_train`의 매칭 orchestration을 **복제**한 것(공유 메서드 아님 — 사용자가 학습 forward 무수정을 선택). 따라서 **`forward_train`의 매칭 준비 로직이 바뀌면 이 메서드도 손으로 동기화**해야 함. 동기화 안 하면 oracle이 학습과 달라짐.
 - 동기화 체크포인트: GT prep(intersection/history_all_valid 필터), trajectory/vis slice, full center pack, ego-align(`_align_geom_pack`)·`_prepend_past_frames`, `use_full7_temporal_sup` 분기, `pool_gt_instance_context_features`+id reindex, `_select_matching_feature_frames`, `_match_queries_to_gt_instances` 인자/가중치, 그리고 `extract_feat_query` 반환 tuple 인덱스(feat_out[2,4,5,6,7,12,14,15,17,23~32]).
