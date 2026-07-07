@@ -607,6 +607,200 @@ class EfficientOCFLossMixin:
             err_tk = torch.abs(pred_tk3 - gt_tk3).sum(dim=-1)
         return ((err_tk * valid_f).sum() / valid_cnt.clamp_min(1.0)) * float(loss_weight)
 
+    @staticmethod
+    def _normalize_gt_instance_ids(iids):
+        if isinstance(iids, (list, tuple)):
+            iids = iids[0] if len(iids) >= 1 else None
+        if not torch.is_tensor(iids):
+            return None
+        if iids.dim() == 2 and iids.shape[0] == 1:
+            iids = iids[0]
+        if iids.dim() != 1:
+            return None
+        return iids.contiguous()
+
+    @staticmethod
+    def _normalize_gt_instance_sizes(sizes):
+        if isinstance(sizes, (list, tuple)):
+            sizes = sizes[0] if len(sizes) >= 1 else None
+        if not torch.is_tensor(sizes):
+            return None
+        if sizes.dim() == 3 and sizes.shape[0] == 1:
+            sizes = sizes[0]
+        if sizes.dim() != 2 or int(sizes.shape[-1]) != 3:
+            return None
+        return sizes.contiguous()
+
+    def _gather_matched_gt_sizes(self, inst_match_result, gt_instance_ids, gt_instance_sizes, device):
+        """
+        Return (matched_query_idx_k [K], gt_size_k3 [K,3]) for matched pairs whose GT
+        instance id resolves in the dataloader sizes, else (None, None). GT size is
+        keyed by gt_ids_n[matched_inst_idx] so alignment holds under any matcher
+        filtering/reordering. Shared by the scale (Lreg) and spread losses.
+        """
+        if not isinstance(inst_match_result, dict):
+            return None, None
+        mq = inst_match_result.get("matched_query_idx", None)
+        mi = inst_match_result.get("matched_inst_idx", None)
+        gt_ids_n = inst_match_result.get("gt_ids_n", None)
+        if (
+            (not torch.is_tensor(mq)) or (not torch.is_tensor(mi))
+            or (not torch.is_tensor(gt_ids_n))
+            or mq.numel() <= 0 or mq.numel() != mi.numel()
+        ):
+            return None, None
+        ids_raw = self._normalize_gt_instance_ids(gt_instance_ids)
+        sizes_raw = self._normalize_gt_instance_sizes(gt_instance_sizes)
+        if (ids_raw is None) or (sizes_raw is None) or int(ids_raw.shape[0]) != int(sizes_raw.shape[0]):
+            return None, None
+        n_count = int(gt_ids_n.shape[0])
+        mq = mq.to(device=device, dtype=torch.long)
+        mi = mi.to(device=device, dtype=torch.long)
+        gt_ids_n = gt_ids_n.to(device=device, dtype=torch.long)
+        ids_raw = ids_raw.to(device=device, dtype=torch.long)
+        sizes_raw = sizes_raw.to(device=device, dtype=torch.float32)
+        keep = (mi >= 0) & (mi < n_count)
+        if not bool(keep.any().item()):
+            return None, None
+        mq = mq[keep]
+        mi = mi[keep]
+        matched_ids_k = gt_ids_n.index_select(0, mi)                       # [K] matched instance ids
+        eq_kn = matched_ids_k.view(-1, 1) == ids_raw.view(1, -1)           # [K, N0]
+        has_k = eq_kn.any(dim=1)                                           # [K]
+        if not bool(has_k.any().item()):
+            return None, None
+        mq = mq[has_k]
+        col_k = eq_kn[has_k].to(torch.float32).argmax(dim=1)               # [K] row into sizes_raw
+        gt_size_k3 = sizes_raw.index_select(0, col_k)                      # [K, 3]
+        return mq, gt_size_k3
+
+    def _compute_query_spread_reg_from_match(
+        self,
+        query_spread_tq3,
+        inst_match_result: dict = None,
+        gt_instance_ids=None,
+        gt_instance_sizes=None,
+        loss_weight: float = 0.0,
+        target_frac: float = 0.5,
+        norm_mode: str = "matched",
+    ):
+        """
+        Forcing: one-sided spread regularizer. Pushes each matched query's OFFSET-only
+        spread (2nd-moment of the gaussian CENTERS, sigma excluded; mean over frames)
+        UP to target_frac * matched GT half-extent. Excluding sigma forces the model to
+        MOVE the offsets (distribute the 48 gaussians) instead of growing a sigma blob
+        (the sigma-only loophole that made the earlier query_sigma metric a no-op). Only
+        under-spread is penalized (relu) → outward pressure for large objects without
+        inducing over-spread (Tversky still caps FP). xy uses the max axis (yaw/ego-
+        transpose safe); z separate. Gradient flows to the offset head (GT target detached).
+        norm_mode: 'matched'(기존) = mean over ALL matched — 위반자가 소수(희소 대형)면
+        1/K로 희석. 'violators' = deficit>0인 쿼리 수로 정규화 — 위반자당 gradient 보존
+        (충족 쿼리는 기여 0이라 편향 없음).
+        """
+        if float(loss_weight) <= 0.0:
+            return None
+        if (not torch.is_tensor(query_spread_tq3)) or query_spread_tq3.dim() != 3:
+            return None
+        mq, gt_size_k3 = self._gather_matched_gt_sizes(
+            inst_match_result, gt_instance_ids, gt_instance_sizes, query_spread_tq3.device)
+        if (mq is None) or (gt_size_k3 is None):
+            return None
+        q_count = int(query_spread_tq3.shape[1])
+        keep = (mq >= 0) & (mq < q_count)
+        if not bool(keep.any().item()):
+            return None
+        mq = mq[keep]
+        gt_size_k3 = gt_size_k3[keep]
+        spread_k3 = query_spread_tq3.mean(dim=0).index_select(0, mq).to(torch.float32)  # [K,3]
+        half_k3 = 0.5 * gt_size_k3.detach()
+        tgt_xy = float(target_frac) * half_k3[:, :2].amax(dim=-1)           # [K]
+        tgt_z = float(target_frac) * half_k3[:, 2]                          # [K]
+        act_xy = spread_k3[:, :2].amax(dim=-1)                             # [K]
+        act_z = spread_k3[:, 2]                                            # [K]
+        under = torch.relu(tgt_xy - act_xy) + torch.relu(tgt_z - act_z)    # [K]
+        if str(norm_mode).lower() == "violators":
+            denom = (under > 0).to(under.dtype).sum().clamp_min(1.0)
+            return (under.sum() / denom) * float(loss_weight)
+        return under.mean() * float(loss_weight)
+
+    def _compute_query_size_aux_loss_from_match(
+        self,
+        pred_dims_tq2,
+        inst_match_result: dict = None,
+        gt_instance_ids=None,
+        gt_instance_dims=None,
+        loss_weight: float = 0.0,
+        big_weight_cap: float = 4.0,
+    ):
+        """
+        aux size head 감독: matched query의 (w,l) 예측을 annotation 원본 box 치수에 L1 회귀.
+        GT = gt_instance_dims (회전 무관 진짜 크기, loading_instance.build_instance_dims_targets).
+        크기-비례 가중 = clamp(max(w,l)/2m, 1, cap) — 희소한 대형 객체(버스 2.9%)의
+        gradient 희석 방지 (_we violators 논리의 연속형 버전). dims=0(무효) 쌍은 제외.
+        Returns: dict(loss, dbg_l1_mean, dbg_l1_big, dbg_pair_count, dbg_big_count) or None
+        """
+        if float(loss_weight) <= 0.0:
+            return None
+        if (not torch.is_tensor(pred_dims_tq2)) or pred_dims_tq2.dim() != 3 or int(pred_dims_tq2.shape[-1]) != 2:
+            return None
+        if not isinstance(inst_match_result, dict):
+            return None
+        mq = inst_match_result.get("matched_query_idx", None)
+        mi = inst_match_result.get("matched_inst_idx", None)
+        gt_ids_n = inst_match_result.get("gt_ids_n", None)
+        if (
+            (not torch.is_tensor(mq)) or (not torch.is_tensor(mi)) or (not torch.is_tensor(gt_ids_n))
+            or mq.numel() <= 0 or mq.numel() != mi.numel()
+        ):
+            return None
+        ids_raw = self._normalize_gt_instance_ids(gt_instance_ids)
+        dims_raw = gt_instance_dims
+        if isinstance(dims_raw, (list, tuple)):
+            dims_raw = dims_raw[0] if len(dims_raw) >= 1 else None
+        if torch.is_tensor(dims_raw) and dims_raw.dim() == 3 and dims_raw.shape[0] == 1:
+            dims_raw = dims_raw[0]
+        if (
+            (ids_raw is None) or (not torch.is_tensor(dims_raw)) or dims_raw.dim() != 2
+            or int(dims_raw.shape[-1]) != 2 or int(ids_raw.shape[0]) != int(dims_raw.shape[0])
+        ):
+            return None
+        device = pred_dims_tq2.device
+        mq = mq.to(device=device, dtype=torch.long)
+        mi = mi.to(device=device, dtype=torch.long)
+        gt_ids_n = gt_ids_n.to(device=device, dtype=torch.long)
+        ids_raw = ids_raw.to(device=device, dtype=torch.long)
+        dims_raw = dims_raw.to(device=device, dtype=torch.float32)
+        n_count = int(gt_ids_n.shape[0])
+        q_count = int(pred_dims_tq2.shape[1])
+        keep = (mi >= 0) & (mi < n_count) & (mq >= 0) & (mq < q_count)
+        if not bool(keep.any().item()):
+            return None
+        mq, mi = mq[keep], mi[keep]
+        matched_ids_k = gt_ids_n.index_select(0, mi)
+        eq_kn = matched_ids_k.view(-1, 1) == ids_raw.view(1, -1)
+        has_k = eq_kn.any(dim=1)
+        if not bool(has_k.any().item()):
+            return None
+        mq = mq[has_k]
+        col_k = eq_kn[has_k].to(torch.float32).argmax(dim=1)
+        gt_k2 = dims_raw.index_select(0, col_k)                            # [K,2] (w,l)
+        valid_k = gt_k2.max(dim=-1).values > 0.05                          # dims=0 → 무효
+        if not bool(valid_k.any().item()):
+            return None
+        mq, gt_k2 = mq[valid_k], gt_k2[valid_k]
+        pred_k2 = pred_dims_tq2.mean(dim=0).index_select(0, mq).to(torch.float32)
+        l1_k = torch.abs(pred_k2 - gt_k2.detach()).sum(dim=-1)             # [K]
+        w_k = (gt_k2.max(dim=-1).values / 2.0).clamp(1.0, float(big_weight_cap)).detach()
+        loss = (l1_k * w_k).sum() / w_k.sum().clamp_min(1.0) * float(loss_weight)
+        big_mask = gt_k2.max(dim=-1).values > 6.0                           # 대형(버스/트레일러)
+        return {
+            "loss": loss,
+            "dbg_l1_mean": l1_k.detach().mean(),
+            "dbg_l1_big": l1_k.detach()[big_mask].mean() if bool(big_mask.any().item()) else l1_k.new_tensor(0.0),
+            "dbg_pair_count": l1_k.new_tensor(float(l1_k.numel())),
+            "dbg_big_count": l1_k.new_tensor(float(int(big_mask.sum()))),
+        }
+
     def _compute_query_center_match_dbg_from_match(
         self,
         centers_world_tq3: torch.Tensor,
@@ -1837,6 +2031,11 @@ class EfficientOCFLossMixin:
             "dbg_query_attn_bbox_other_mass_max": z,
             "dbg_query_attn_bbox_unmatched_mass_mean": z,
             "dbg_query_attn_bbox_unmatched_mass_max": z,
+            "loss_query_attn_sigma": z,
+            "dbg_query_attn_sigma_raw": z,
+            "dbg_query_attn_sigma_valid_count": z,
+            "dbg_query_attn_sigma_ratio_u": z,
+            "dbg_query_attn_sigma_ratio_v": z,
         }
         if (not torch.is_tensor(query_attn_weights_tqnhw)) or query_attn_weights_tqnhw.dim() != 5:
             out["dbg_query_attn_bbox_shape_invalid_skip"] = z.new_tensor(1.0)
@@ -1845,13 +2044,13 @@ class EfficientOCFLossMixin:
             out["dbg_query_attn_bbox_shape_invalid_skip"] = z.new_tensor(1.0)
             return out
 
-        gt_inst_mask_tnhw = gt_attn_targets.get("gt_inst_mask_tnhw", None)
+        gt_inst_cam_mask_tnnhw = gt_attn_targets.get("gt_inst_cam_mask_tnnhw", None)
         gt_inst_valid_tn = gt_attn_targets.get("gt_inst_valid_tn", None)
         attn_t_idx_t = gt_attn_targets.get("attn_t_idx_t", None)
         if (
-            (not torch.is_tensor(gt_inst_mask_tnhw))
+            (not torch.is_tensor(gt_inst_cam_mask_tnnhw))
             or (not torch.is_tensor(gt_inst_valid_tn))
-            or gt_inst_mask_tnhw.dim() != 4
+            or gt_inst_cam_mask_tnnhw.dim() != 5
             or gt_inst_valid_tn.dim() != 2
         ):
             out["dbg_query_attn_bbox_shape_invalid_skip"] = z.new_tensor(1.0)
@@ -1864,7 +2063,7 @@ class EfficientOCFLossMixin:
             matched_inst_idx = torch.empty((0,), device=query_attn_weights_tqnhw.device, dtype=torch.long)
 
         t_attn, q_attn, n_cam, h_attn, w_attn = [int(v) for v in query_attn_weights_tqnhw.shape]
-        t_gt, n_inst, h_gt, w_gt = [int(v) for v in gt_inst_mask_tnhw.shape]
+        t_gt, n_inst, n_cam_gt, h_gt, w_gt = [int(v) for v in gt_inst_cam_mask_tnnhw.shape]
         t_valid, n_valid = [int(v) for v in gt_inst_valid_tn.shape]
         if (
             t_attn <= 0
@@ -1872,6 +2071,7 @@ class EfficientOCFLossMixin:
             or n_cam <= 0
             or t_gt <= 0
             or n_inst < 0
+            or (n_cam != n_cam_gt)
             or (h_attn != h_gt)
             or (w_attn != w_gt)
             or (t_gt != t_valid)
@@ -1891,7 +2091,10 @@ class EfficientOCFLossMixin:
             attn_weights_sel_tqnhw = query_attn_weights_tqnhw.index_select(0, attn_t_idx)
         else:
             attn_weights_sel_tqnhw = query_attn_weights_tqnhw[:t]
-        p = int(h_attn * w_attn)
+        # Flatten (cam, h, w) jointly instead of summing over cam first: each camera's
+        # pixels keep their own slot in p, so two different cameras can never collide on
+        # the same array index (see NOTES.md 2026-07-02 camera-collision fix).
+        p = int(n_cam * h_attn * w_attn)
         eps_v = float(getattr(self, "query_attn_bbox_eps", 1e-6) if eps is None else eps)
         eps_v = max(eps_v, 1e-12)
         total_w = float(
@@ -1906,8 +2109,7 @@ class EfficientOCFLossMixin:
         unmatched_mode = str(getattr(self, "query_attn_bbox_unmatched_mode", "inverse_union")).lower()
         other_mode = str(getattr(self, "query_attn_bbox_other_mode", "union")).lower()
 
-        attn_tqhw = attn_weights_sel_tqnhw.to(torch.float32).sum(dim=2)
-        attn_tqp = attn_tqhw.reshape(t, q_attn, p)
+        attn_tqp = attn_weights_sel_tqnhw.to(torch.float32).reshape(t, q_attn, p)
         attn_denom_tq1 = attn_tqp.sum(dim=-1, keepdim=True).clamp_min(eps_v)
         pred_tqp = attn_tqp / attn_denom_tq1
         if not bool(torch.isfinite(pred_tqp).all().item()):
@@ -1937,7 +2139,7 @@ class EfficientOCFLossMixin:
         union_mask_tp = None
         union_sum_t1 = None
         if n_inst > 0:
-            gt_mask_tnp = gt_inst_mask_tnhw[:t].reshape(t, n_inst, p).to(device=pred_tqp.device, dtype=torch.float32)
+            gt_mask_tnp = gt_inst_cam_mask_tnnhw[:t].reshape(t, n_inst, p).to(device=pred_tqp.device, dtype=torch.float32)
             valid_mask_tn1 = gt_inst_valid_tn[:t].to(device=pred_tqp.device, dtype=torch.bool).unsqueeze(-1)
             union_mask_tp = (gt_mask_tnp * valid_mask_tn1.to(torch.float32)).amax(dim=1)
             union_sum_t1 = union_mask_tp.sum(dim=-1, keepdim=True)
@@ -1946,7 +2148,7 @@ class EfficientOCFLossMixin:
             union_sum_t1 = pred_tqp.new_zeros((t, 1))
         if k > 0:
             pred_tkp = pred_tqp.index_select(1, mq)
-            target_mask_tkp = gt_inst_mask_tnhw[:t].index_select(1, mi).reshape(t, k, p).to(
+            target_mask_tkp = gt_inst_cam_mask_tnnhw[:t].index_select(1, mi).reshape(t, k, p).to(
                 device=pred_tqp.device, dtype=torch.float32
             )
             target_valid_tk = gt_inst_valid_tn[:t].index_select(1, mi).to(
@@ -1993,6 +2195,68 @@ class EfficientOCFLossMixin:
                         other_mass_valid = other_mass_tk[other_valid_tk]
                         out["dbg_query_attn_bbox_other_mass_mean"] = other_mass_valid.mean()
                         out["dbg_query_attn_bbox_other_mass_max"] = other_mass_valid.max()
+
+                # ---- sigma-matching (2nd-moment only): attention의 '폭'을 GT 마스크 폭에 회귀 ----
+                # inside-mass는 총량(마스크 안 질량)만 보고 폭에 무관심 → 폭이 감독 없는 자유변수가 되어
+                # 크기 무관 고정폭 블롭이 됨(2026-07-02 실측: σ_attn 8~14px 평평 vs σ_mask 1.7~6.3px).
+                # 1차 모멘트(위치)는 loss에 안 들어가므로 center 예측 경로는 무접촉 — 폭만 감독.
+                sigma_w = float(getattr(self, "query_attn_sigma_match_loss_weight", 0.0))
+                if sigma_w > 0.0 and bool((matched_valid_cnt > 0).item()):
+                    start_iter = int(getattr(self, "query_attn_sigma_match_start_iter", 0))
+                    cur_iter = int(self._get_query_train_iteration(advance_if_unsynced=False))
+                    if cur_iter >= start_iter:
+                        min_px = float(getattr(self, "query_attn_sigma_match_min_mask_px", 4))
+                        attn_tknhw = attn_weights_sel_tqnhw.to(torch.float32).index_select(1, mq)
+                        mask_tknhw = gt_inst_cam_mask_tnnhw[:t].index_select(1, mi).to(
+                            device=pred_tqp.device, dtype=torch.float32
+                        )
+                        mask_px_tkn = mask_tknhw.sum(dim=(-1, -2))                  # [t,k,n]
+                        c_star_tk = mask_px_tkn.argmax(dim=-1)                       # GT 마스크가 가장 큰 카메라
+                        gidx = c_star_tk.view(t, k, 1, 1, 1).expand(-1, -1, 1, h_attn, w_attn)
+                        attn_tkhw = attn_tknhw.gather(2, gidx).squeeze(2)            # [t,k,h,w]
+                        mask_tkhw = mask_tknhw.gather(2, gidx).squeeze(2)
+                        mask_px_tk = mask_px_tkn.gather(-1, c_star_tk.unsqueeze(-1)).squeeze(-1)
+                        attn_cam_sum_tk = attn_tkhw.sum(dim=(-1, -2))
+                        attn_all_sum_tk = attn_tknhw.sum(dim=(-1, -2, -3)).clamp_min(eps_v)
+                        # gate: 마스크가 σ 추정 가능한 크기(min_px)이고, attention 질량이 그 카메라에
+                        # 실제로 있을 때만(5% 미만이면 σ가 노이즈) — 아니면 기여 0.
+                        sigma_valid_tk = (
+                            valid_tk
+                            & (mask_px_tk >= min_px)
+                            & ((attn_cam_sum_tk / attn_all_sum_tk) >= 0.05)
+                        )
+                        if bool(sigma_valid_tk.any().item()):
+                            uu = torch.arange(w_attn, device=pred_tqp.device, dtype=torch.float32).view(1, 1, 1, w_attn)
+                            vv = torch.arange(h_attn, device=pred_tqp.device, dtype=torch.float32).view(1, 1, h_attn, 1)
+
+                            def _axis_sigma(p_tkhw):
+                                mu_u = (p_tkhw * uu).sum(dim=(-1, -2))
+                                mu_v = (p_tkhw * vv).sum(dim=(-1, -2))
+                                var_u = (p_tkhw * (uu - mu_u.view(t, k, 1, 1)) ** 2).sum(dim=(-1, -2))
+                                var_v = (p_tkhw * (vv - mu_v.view(t, k, 1, 1)) ** 2).sum(dim=(-1, -2))
+                                return var_u.clamp_min(0.0).sqrt(), var_v.clamp_min(0.0).sqrt()
+
+                            p_attn = attn_tkhw / attn_cam_sum_tk.view(t, k, 1, 1).clamp_min(eps_v)
+                            p_mask = (mask_tkhw / mask_px_tk.view(t, k, 1, 1).clamp_min(eps_v)).detach()
+                            sig_att_u, sig_att_v = _axis_sigma(p_attn)
+                            sig_msk_u, sig_msk_v = _axis_sigma(p_mask)
+                            # log-ratio 회귀: scale-free(자전거/버스 동일 벌점 스케일).
+                            # floor 0.25px: 1px 폭 마스크의 σ=0 → log 폭주 방지.
+                            sig_floor = 0.25
+                            err_tk = (
+                                (sig_att_u.clamp_min(sig_floor).log() - sig_msk_u.clamp_min(sig_floor).log()) ** 2
+                                + (sig_att_v.clamp_min(sig_floor).log() - sig_msk_v.clamp_min(sig_floor).log()) ** 2
+                            )
+                            sv_f = sigma_valid_tk.to(torch.float32)
+                            sv_cnt = sv_f.sum()
+                            sigma_raw = (err_tk * sv_f).sum() / sv_cnt.clamp_min(1.0)
+                            out["loss_query_attn_sigma"] = sigma_raw * sigma_w
+                            out["dbg_query_attn_sigma_raw"] = sigma_raw
+                            out["dbg_query_attn_sigma_valid_count"] = sv_cnt
+                            ru = (sig_att_u.clamp_min(sig_floor) / sig_msk_u.clamp_min(sig_floor))[sigma_valid_tk]
+                            rv = (sig_att_v.clamp_min(sig_floor) / sig_msk_v.clamp_min(sig_floor))[sigma_valid_tk]
+                            out["dbg_query_attn_sigma_ratio_u"] = ru.mean()
+                            out["dbg_query_attn_sigma_ratio_v"] = rv.mean()
 
         if unmatched_w > 0.0:
             matched_mask_q = torch.zeros((q_attn,), device=pred_tqp.device, dtype=torch.bool)
@@ -2461,9 +2725,36 @@ class EfficientOCFLossMixin:
             pair_chunk_size=int(pair_chunk_size),
         ).to(torch.float32)
 
-        gt_ids = pair_gt_ids_k.to(device=mixture_centers_world_tqg3.device, dtype=torch.long)
+        gt_tk1zyx = self._build_grouped_pair_lowres_gt(
+            gt_occ_txyz=gt_occ_txyz,
+            pair_gt_ids_k=pair_gt_ids_k,
+            t_count=T,
+            pred_spatial=tuple(int(v) for v in pred_tk1zyx.shape[-3:]),
+            pair_chunk_size=int(pair_chunk_size),
+        )
+        if gt_tk1zyx is None:
+            return None, None, None
+        return pred_tk1zyx, gt_tk1zyx, valid_tk
+
+    def _build_grouped_pair_lowres_gt(
+        self,
+        gt_occ_txyz: torch.Tensor,
+        pair_gt_ids_k: torch.Tensor,
+        t_count: int,
+        pred_spatial,
+        pair_chunk_size: int = 8,
+    ):
+        """[T,X,Y,Z] instance-id dense에서 matched id별 GT mask를 pred 격자([T,K,1,Z,Y,X])로 빌드.
+        pred voxelize와 분리되어 있어 같은 pred에 대해 GT 소스(inst3d/bbox)만 바꿔 재호출 가능."""
+        if (not torch.is_tensor(gt_occ_txyz)) or gt_occ_txyz.dim() != 4:
+            return None
+        T = int(min(t_count, gt_occ_txyz.shape[0]))
+        K = int(pair_gt_ids_k.numel())
+        if T <= 0 or K <= 0:
+            return None
+        gt_ids = pair_gt_ids_k.to(device=gt_occ_txyz.device, dtype=torch.long)
         gt_occ_sel = gt_occ_txyz[:T]
-        pred_spatial = tuple(int(v) for v in pred_tk1zyx.shape[-3:])
+        pred_spatial = tuple(int(v) for v in pred_spatial)
         full_spatial = (int(gt_occ_sel.shape[3]), int(gt_occ_sel.shape[2]), int(gt_occ_sel.shape[1]))
         gt_voxels_per_pair = int(gt_occ_sel.numel())
         # Avoid materializing the full [T,K,X,Y,Z] one-vs-instance tensor on GPU.
@@ -2489,10 +2780,10 @@ class EfficientOCFLossMixin:
                 gt_chunk_lowres = gt_chunk_tk1zyx.to(pool_dtype)
             gt_chunks.append(gt_chunk_lowres.to(torch.float32))
         if len(gt_chunks) != int((K + gt_chunk_size - 1) // gt_chunk_size):
-            return None, None, None
+            return None
         gt_tk1zyx = torch.cat(gt_chunks, dim=1) if len(gt_chunks) > 1 else gt_chunks[0]
         gt_tk1zyx = self._maybe_apply_query_gmo_soft_gt(gt_tk1zyx)
-        return pred_tk1zyx, gt_tk1zyx, valid_tk
+        return gt_tk1zyx
 
     def _compute_matched_query_sequence_iou_scores(
         self,
@@ -2716,11 +3007,22 @@ class EfficientOCFLossMixin:
         mixture_yaw_tqg: torch.Tensor = None,
         mixture_weights_tqg: torch.Tensor = None,
         pair_chunk_size: int = 8,
+        gt_bbox_aabb_txyz: torch.Tensor = None,
+        focal_inst3d_weight: float = 1.0,
+        focal_bbox_weight: float = 0.0,
         eps: float = 1e-6,
     ) -> dict:
+        # focal(occ) GT 혼합: pair별 focal = inst3d_w*focal(gt_occ_inst3d) + bbox_w*focal(AABB bbox).
+        # gt_bbox_aabb_txyz는 gt_occ_inst와 동일 id 공간의 [T,X,Y,Z] dense여야 하며(v3 캐시),
+        # dice(tversky)는 기존대로 inst3d GT만 사용한다.
         z = centers_world_tq3.sum() * 0.0
         loss_type = str(loss_type).lower()
         loss_key = "loss_gmo_focal" if loss_type in ("balanced_focal", "focal") else "loss_gmo_bce"
+        use_bbox_gt = (
+            torch.is_tensor(gt_bbox_aabb_txyz)
+            and gt_bbox_aabb_txyz.dim() == 4
+            and float(focal_bbox_weight) > 0.0
+        )
         out = {
             "dbg_gmo_bce_pair_count": z,
             "dbg_gmo_bce_lowres_x": z,
@@ -2731,6 +3033,10 @@ class EfficientOCFLossMixin:
             "dbg_gmo_dice_alpha": z.new_tensor(float(tversky_alpha)),
             "dbg_gmo_dice_beta": z.new_tensor(float(tversky_beta)),
         }
+        if use_bbox_gt:
+            out["dbg_gmo_focal_inst3d"] = z
+            out["dbg_gmo_focal_bbox"] = z
+            out["dbg_gmo_focal_bbox_pair_count"] = z
         out[loss_key] = z
         if loss_key == "loss_gmo_focal":
             out["dbg_gmo_bce_alias"] = z
@@ -2807,6 +3113,18 @@ class EfficientOCFLossMixin:
             )
             if pred_tk1zyx is None:
                 return out
+            gt_bbox_tk1zyx = None
+            if use_bbox_gt:
+                # pred voxelize는 위에서 1회 완료 — GT lowres만 bbox 소스로 재빌드.
+                gt_bbox_tk1zyx = self._build_grouped_pair_lowres_gt(
+                    gt_occ_txyz=gt_bbox_aabb_txyz[:T].to(device=gt_occ_txyz.device, dtype=torch.long),
+                    pair_gt_ids_k=pair_gt_ids,
+                    t_count=T,
+                    pred_spatial=tuple(int(v) for v in pred_tk1zyx.shape[-3:]),
+                    pair_chunk_size=int(pair_chunk_size),
+                )
+            dbg_focal_inst3d_vals = []
+            dbg_focal_bbox_vals = []
             for k in range(int(mq.numel())):
                 p = pred_tk1zyx[:, k:k + 1].clamp(float(eps), 1.0 - float(eps))
                 t = gt_tk1zyx[:, k:k + 1].clamp(0.0, 1.0)
@@ -2820,6 +3138,30 @@ class EfficientOCFLossMixin:
                     focal_alpha=float(focal_alpha),
                     eps=float(eps),
                 )
+                if use_bbox_gt and (gt_bbox_tk1zyx is not None):
+                    t_bbox = gt_bbox_tk1zyx[:, k:k + 1].clamp(0.0, 1.0)
+                    # whole-box in-range 규칙으로 box가 프레임째 drop된 경우(bbox GT 빈 프레임인데
+                    # inst3d GT는 있음) 그 프레임은 bbox 항에서 제외 — 빈 GT로 0-감독하는 오류 방지.
+                    bbox_frame_ok = (t_bbox.flatten(1).sum(dim=1) > 0) | (t.flatten(1).sum(dim=1) <= 0)
+                    valid_mask_bbox = valid_mask & bbox_frame_ok[:, None, None, None, None, None]
+                    pair_loss_bbox = self._compute_balanced_binary_pair_loss(
+                        pred_occ=p,
+                        gt_occ=t_bbox,
+                        valid_mask=valid_mask_bbox,
+                        loss_type=loss_type,
+                        focal_gamma=float(focal_gamma),
+                        focal_alpha=float(focal_alpha),
+                        eps=float(eps),
+                    )
+                    if (pair_loss is not None) and (pair_loss_bbox is not None):
+                        dbg_focal_inst3d_vals.append(pair_loss.detach())
+                        dbg_focal_bbox_vals.append(pair_loss_bbox.detach())
+                        pair_loss = (
+                            float(focal_inst3d_weight) * pair_loss
+                            + float(focal_bbox_weight) * pair_loss_bbox
+                        )
+                    elif pair_loss_bbox is not None:
+                        pair_loss = pair_loss_bbox
                 if pair_loss is not None:
                     pair_losses.append(pair_loss)
                 if compute_dice:
@@ -2843,6 +3185,8 @@ class EfficientOCFLossMixin:
                     if dice_loss is not None:
                         dice_pair_losses.append(dice_loss)
         else:
+            dbg_focal_inst3d_vals = []
+            dbg_focal_bbox_vals = []
             for k in range(int(mq.numel())):
                 q_idx = int(mq[k].item())
                 inst_id = int(pair_gt_ids[k].item())
@@ -2869,6 +3213,36 @@ class EfficientOCFLossMixin:
                     focal_alpha=float(focal_alpha),
                     eps=float(eps),
                 )
+                if use_bbox_gt:
+                    t_cnt = int(min(T, gt_bbox_aabb_txyz.shape[0]))
+                    gt_bbox_sel = gt_bbox_aabb_txyz[:t_cnt].to(device=p.device, dtype=torch.long)
+                    gt_bbox_k = (gt_bbox_sel == inst_id).permute(0, 3, 2, 1).unsqueeze(1).to(torch.float32)
+                    if tuple(gt_bbox_k.shape[-3:]) != tuple(p.shape[-3:]):
+                        gt_bbox_k = F.adaptive_max_pool3d(gt_bbox_k, output_size=p.shape[-3:])
+                    gt_bbox_k = self._maybe_apply_query_gmo_soft_gt(gt_bbox_k).clamp(0.0, 1.0)
+                    bbox_frame_ok = (
+                        (gt_bbox_k.flatten(1).sum(dim=1) > 0)
+                        | (t[:t_cnt].flatten(1).sum(dim=1) <= 0)
+                    )
+                    valid_mask_bbox = valid_mask[:t_cnt] & bbox_frame_ok[:, None, None, None, None]
+                    pair_loss_bbox = self._compute_balanced_binary_pair_loss(
+                        pred_occ=p[:t_cnt],
+                        gt_occ=gt_bbox_k,
+                        valid_mask=valid_mask_bbox,
+                        loss_type=loss_type,
+                        focal_gamma=float(focal_gamma),
+                        focal_alpha=float(focal_alpha),
+                        eps=float(eps),
+                    )
+                    if (pair_loss is not None) and (pair_loss_bbox is not None):
+                        dbg_focal_inst3d_vals.append(pair_loss.detach())
+                        dbg_focal_bbox_vals.append(pair_loss_bbox.detach())
+                        pair_loss = (
+                            float(focal_inst3d_weight) * pair_loss
+                            + float(focal_bbox_weight) * pair_loss_bbox
+                        )
+                    elif pair_loss_bbox is not None:
+                        pair_loss = pair_loss_bbox
                 if pair_loss is not None:
                     pair_losses.append(pair_loss)
                 if compute_dice:
@@ -2902,6 +3276,11 @@ class EfficientOCFLossMixin:
             out["loss_gmo_dice"] = torch.stack(dice_pair_losses, dim=0).mean() * float(dice_loss_weight)
         if loss_key == "loss_gmo_focal":
             out["dbg_gmo_bce_alias"] = out[loss_key].detach()
+        if use_bbox_gt:
+            if len(dbg_focal_inst3d_vals) > 0:
+                out["dbg_gmo_focal_inst3d"] = torch.stack(dbg_focal_inst3d_vals, dim=0).mean()
+                out["dbg_gmo_focal_bbox"] = torch.stack(dbg_focal_bbox_vals, dim=0).mean()
+            out["dbg_gmo_focal_bbox_pair_count"] = centers_world_tq3.new_tensor(float(len(dbg_focal_bbox_vals)))
         out["dbg_gmo_bce_pair_count"] = centers_world_tq3.new_tensor(float(len(pair_losses)))
         out["dbg_gmo_bce_lowres_x"] = centers_world_tq3.new_tensor(float(low_x))
         out["dbg_gmo_bce_lowres_y"] = centers_world_tq3.new_tensor(float(low_y))
@@ -3103,6 +3482,8 @@ class EfficientOCFLossMixin:
         query_attn_bbox_loss,
         matched_gmo_loss,
         center_match_loss,
+        query_spread_loss,
+        query_size_aux_pack,
         query_traj_loss,
         query_traj_refine_loss,
         query_attn_cam_score_pack,
@@ -3178,6 +3559,21 @@ class EfficientOCFLossMixin:
 
         # ---- Center match loss ----
         losses["loss_query_center_match"] = center_match_loss if center_match_loss is not None else z
+        # ---- Per-query spread regularizer (forcing) ----
+        losses["loss_query_spread"] = query_spread_loss if query_spread_loss is not None else z
+        # ---- aux size head (size note) ----
+        if isinstance(query_size_aux_pack, dict):
+            losses["loss_query_size_aux"] = query_size_aux_pack["loss"]
+            losses["dbg_query_size_aux_l1_mean"] = query_size_aux_pack["dbg_l1_mean"]
+            losses["dbg_query_size_aux_l1_big"] = query_size_aux_pack["dbg_l1_big"]
+            losses["dbg_query_size_aux_pair_count"] = query_size_aux_pack["dbg_pair_count"]
+            losses["dbg_query_size_aux_big_count"] = query_size_aux_pack["dbg_big_count"]
+        else:
+            losses["loss_query_size_aux"] = z
+            losses["dbg_query_size_aux_l1_mean"] = z
+            losses["dbg_query_size_aux_l1_big"] = z
+            losses["dbg_query_size_aux_pair_count"] = z
+            losses["dbg_query_size_aux_big_count"] = z
         center_match_dbg = self._compute_query_center_match_dbg_from_match(
             centers_world_tq3=centers_world_match_tq3,
             inst_match_result=inst_match_result,
@@ -3733,6 +4129,7 @@ class EfficientOCFLossMixin:
             and (not k.startswith("dbg_query_match_"))  # match_cost_* + coverage (center_err/far_gt/spread)
             and (not k.startswith("dbg_query_matched_center_"))
             and (not k.startswith("dbg_query_depth_"))  # depth-head perf (acc/err/entropy)
+            and (not k.startswith("dbg_gmo_focal_"))  # focal GT 혼합 모니터 (inst3d/bbox/pair_count)
         ]:
             del losses[k]
         self._namespace_dbg_logs(losses)

@@ -224,24 +224,25 @@ class EfficientOCFMatcherMixin:
         if not isinstance(gt_attn_targets, dict):
             return None, None
 
-        gt_inst_mask_tnhw = gt_attn_targets.get("gt_inst_mask_tnhw", None)
+        gt_inst_cam_mask_tnnhw = gt_attn_targets.get("gt_inst_cam_mask_tnnhw", None)
         gt_inst_valid_tn = gt_attn_targets.get("gt_inst_valid_tn", None)
         attn_t_idx_t = gt_attn_targets.get("attn_t_idx_t", None)
         if (
-            (not torch.is_tensor(gt_inst_mask_tnhw))
-            or gt_inst_mask_tnhw.dim() != 4
+            (not torch.is_tensor(gt_inst_cam_mask_tnnhw))
+            or gt_inst_cam_mask_tnnhw.dim() != 5
             or (not torch.is_tensor(gt_inst_valid_tn))
             or gt_inst_valid_tn.dim() != 2
         ):
             return None, None
 
-        t_attn, q_count, _n_cam, h_attn, w_attn = [int(v) for v in query_attn_weights_tqnhw.shape]
-        t_gt, n_inst, h_gt, w_gt = [int(v) for v in gt_inst_mask_tnhw.shape]
+        t_attn, q_count, n_cam, h_attn, w_attn = [int(v) for v in query_attn_weights_tqnhw.shape]
+        t_gt, n_inst, n_cam_gt, h_gt, w_gt = [int(v) for v in gt_inst_cam_mask_tnnhw.shape]
         if (
             t_attn <= 0
             or q_count <= 0
             or t_gt <= 0
             or n_inst <= 0
+            or n_cam != n_cam_gt
             or h_attn != h_gt
             or w_attn != w_gt
             or int(gt_inst_valid_tn.shape[0]) != t_gt
@@ -262,7 +263,9 @@ class EfficientOCFMatcherMixin:
             attn_sel_tqnhw = query_attn_weights_tqnhw[:t]
 
         eps_v = float(max(1e-12, eps))
-        pred_tqp = attn_sel_tqnhw.to(torch.float32).sum(dim=2).reshape(t, q_count, -1).clamp_min(0.0)
+        # Flatten (cam, h, w) jointly instead of summing over cam first — keeps each
+        # camera's pixels in their own slot (see NOTES.md 2026-07-02 camera-collision fix).
+        pred_tqp = attn_sel_tqnhw.to(torch.float32).reshape(t, q_count, -1).clamp_min(0.0)
 
         pred_norm_mode = str(pred_norm).lower()
         if pred_norm_mode == "sum":
@@ -275,7 +278,7 @@ class EfficientOCFMatcherMixin:
             pred_tqp = pred_tqp / pred_den_tq1.clamp_min(eps_v)
         pred_tqp = pred_tqp.clamp(0.0, 1.0)
 
-        gt_tnp = gt_inst_mask_tnhw[:t].to(device=pred_tqp.device, dtype=torch.float32).reshape(t, n_inst, -1)
+        gt_tnp = gt_inst_cam_mask_tnnhw[:t].to(device=pred_tqp.device, dtype=torch.float32).reshape(t, n_inst, -1)
         valid_tn = gt_inst_valid_tn[:t].to(device=pred_tqp.device, dtype=torch.bool)
         gt_sum_tn = gt_tnp.sum(dim=-1)
         valid_tn = valid_tn & (gt_sum_tn > 0.0)
@@ -310,24 +313,25 @@ class EfficientOCFMatcherMixin:
         if not isinstance(gt_attn_targets, dict):
             return None, None
 
-        gt_inst_mask_tnhw = gt_attn_targets.get("gt_inst_mask_tnhw", None)
+        gt_inst_cam_mask_tnnhw = gt_attn_targets.get("gt_inst_cam_mask_tnnhw", None)
         gt_inst_valid_tn = gt_attn_targets.get("gt_inst_valid_tn", None)
         attn_t_idx_t = gt_attn_targets.get("attn_t_idx_t", None)
         if (
-            (not torch.is_tensor(gt_inst_mask_tnhw))
-            or gt_inst_mask_tnhw.dim() != 4
+            (not torch.is_tensor(gt_inst_cam_mask_tnnhw))
+            or gt_inst_cam_mask_tnnhw.dim() != 5
             or (not torch.is_tensor(gt_inst_valid_tn))
             or gt_inst_valid_tn.dim() != 2
         ):
             return None, None
 
-        t_attn, q_count, _n_cam, h_attn, w_attn = [int(v) for v in query_attn_weights_tqnhw.shape]
-        t_gt, n_inst, h_gt, w_gt = [int(v) for v in gt_inst_mask_tnhw.shape]
+        t_attn, q_count, n_cam, h_attn, w_attn = [int(v) for v in query_attn_weights_tqnhw.shape]
+        t_gt, n_inst, n_cam_gt, h_gt, w_gt = [int(v) for v in gt_inst_cam_mask_tnnhw.shape]
         if (
             t_attn <= 0
             or q_count <= 0
             or t_gt <= 0
             or n_inst <= 0
+            or n_cam != n_cam_gt
             or h_attn != h_gt
             or w_attn != w_gt
             or int(gt_inst_valid_tn.shape[0]) != t_gt
@@ -348,10 +352,12 @@ class EfficientOCFMatcherMixin:
             attn_sel_tqnhw = query_attn_weights_tqnhw[:t]
 
         eps_v = float(max(1e-12, eps))
-        pred_tqp = attn_sel_tqnhw.to(torch.float32).sum(dim=2).reshape(t, q_count, -1).clamp_min(0.0)
+        # Flatten (cam, h, w) jointly instead of summing over cam first — keeps each
+        # camera's pixels in their own slot (see NOTES.md 2026-07-02 camera-collision fix).
+        pred_tqp = attn_sel_tqnhw.to(torch.float32).reshape(t, q_count, -1).clamp_min(0.0)
         pred_tqp = pred_tqp / pred_tqp.sum(dim=-1, keepdim=True).clamp_min(eps_v)
 
-        gt_tnp = gt_inst_mask_tnhw[:t].to(device=pred_tqp.device, dtype=torch.float32).reshape(t, n_inst, -1)
+        gt_tnp = gt_inst_cam_mask_tnnhw[:t].to(device=pred_tqp.device, dtype=torch.float32).reshape(t, n_inst, -1)
         valid_tn = gt_inst_valid_tn[:t].to(device=pred_tqp.device, dtype=torch.bool)
         valid_tn = valid_tn & (gt_tnp.sum(dim=-1) > 0.0)
 

@@ -13,7 +13,7 @@ import copy
 
 @PIPELINES.register_module()
 class LoadInstanceWithFlow(object):
-    def __init__(self, ocf_dataset_path, grid_size=[512, 512, 40], pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0], background=0, use_flow=True, use_separate_classes=False, use_lyft=False, validate_cache=False, write_cache=True, load_segmentation_instance3d=False, segmentation_instance3d_path=None, segmentation_instance3d_key='segmentation_instance_saved_list2', load_segmentation_cls_instance3d=False, segmentation_cls_dataset_path=None, segmentation_cls_key='segmentation_saved_list2', validate_segmentation_cls_instance3d_alignment=False, load_gt_occ_inst=False, gt_occ_inst_dataset_path=None, gt_occ_inst_key='segmentation_instance_saved_list2', exclude_occ_class_ids=()):
+    def __init__(self, ocf_dataset_path, grid_size=[512, 512, 40], pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0], background=0, use_flow=True, use_separate_classes=False, use_lyft=False, validate_cache=False, write_cache=True, load_segmentation_instance3d=False, segmentation_instance3d_path=None, segmentation_instance3d_key='segmentation_instance_saved_list2', load_segmentation_cls_instance3d=False, segmentation_cls_dataset_path=None, segmentation_cls_key='segmentation_saved_list2', validate_segmentation_cls_instance3d_alignment=False, load_gt_occ_inst=False, gt_occ_inst_dataset_path=None, gt_occ_inst_key='segmentation_instance_saved_list2', load_gt_bbox_aabb=False, gt_bbox_aabb_dataset_path=None, gt_bbox_aabb_key='segmentation_aabb_saved_list2', exclude_occ_class_ids=()):
         '''
         Loading sequential occupancy labels and instance flows for training and testing
         '''
@@ -42,6 +42,11 @@ class LoadInstanceWithFlow(object):
         self.load_gt_occ_inst = bool(load_gt_occ_inst)
         self.gt_occ_inst_dataset_path = gt_occ_inst_dataset_path
         self.gt_occ_inst_key = str(gt_occ_inst_key)
+        # bbox AABB GT (v3 캐시, [x,y,z,nusocc_cls,inst]) — focal3d의 bbox 분할 감독용.
+        # inst id는 gt_occ_inst와 동일 체계(ped 포함 번호). ped 행은 exclude 필터가 cls 컬럼으로 제거.
+        self.load_gt_bbox_aabb = bool(load_gt_bbox_aabb)
+        self.gt_bbox_aabb_dataset_path = gt_bbox_aabb_dataset_path
+        self.gt_bbox_aabb_key = str(gt_bbox_aabb_key)
         self.exclude_occ_class_ids = tuple(int(v) for v in exclude_occ_class_ids)
         if self.load_segmentation_cls_instance3d and (not self.load_segmentation_instance3d):
             raise ValueError(
@@ -88,6 +93,22 @@ class LoadInstanceWithFlow(object):
             candidates.append(self.gt_occ_inst_dataset_path)
         candidates.append(os.path.join(self.gt_occ_inst_dataset_path, prefix, "segmentation_instance3d"))
         candidates.append(os.path.join(self.gt_occ_inst_dataset_path, "segmentation_instance3d"))
+
+        for c in candidates:
+            if c is not None and os.path.isdir(c):
+                return c
+        return None
+
+    def resolve_gt_bbox_aabb_dir(self, prefix):
+        if self.gt_bbox_aabb_dataset_path is None:
+            return None
+
+        base = os.path.normpath(self.gt_bbox_aabb_dataset_path)
+        candidates = []
+        if os.path.basename(base) == "segmentation_aabb":
+            candidates.append(self.gt_bbox_aabb_dataset_path)
+        candidates.append(os.path.join(self.gt_bbox_aabb_dataset_path, prefix, "segmentation_aabb"))
+        candidates.append(os.path.join(self.gt_bbox_aabb_dataset_path, "segmentation_aabb"))
 
         for c in candidates:
             if c is not None and os.path.isdir(c):
@@ -237,6 +258,34 @@ class LoadInstanceWithFlow(object):
                 sample_key=sample_key,
                 frame_idx=frame_idx,
             )
+
+    def _validate_gt_bbox_aabb_sparse_list(self, sparse_list, sample_key, expected_seq_len):
+        # gt_occ_inst 검증과 달리 duplicate-좌표 검사는 하지 않는다:
+        # 인접 instance의 AABB가 겹치면 같은 voxel이 서로 다른 inst 행으로 중복 등장할 수 있음(정상).
+        if sparse_list is None:
+            raise ValueError(f"gt_bbox_aabb sparse list is missing for sample={sample_key}")
+        if len(sparse_list) != int(expected_seq_len):
+            raise ValueError(
+                f"gt_bbox_aabb sequence length mismatch for sample={sample_key}: "
+                f"{len(sparse_list)} vs {int(expected_seq_len)}"
+            )
+        for frame_idx, rows_raw in enumerate(sparse_list):
+            rows = self._normalize_sparse_rows(
+                rows_raw,
+                min_cols=5,
+                label="gt_bbox_aabb",
+            )
+            if rows.shape[0] <= 0:
+                continue
+            xyz = rows[:, :3]
+            dim_xyz = self.dimension[:3].reshape(1, 3)
+            oob_mask = (xyz < 0).any(axis=1) | (xyz >= dim_xyz).any(axis=1)
+            if bool(np.any(oob_mask)):
+                preview = xyz[oob_mask][:5].tolist()
+                raise ValueError(
+                    f"gt_bbox_aabb has out-of-bounds voxel coords for sample={sample_key}, "
+                    f"frame={frame_idx}: preview={preview}, grid_size={self.dimension[:3].tolist()}"
+                )
 
     def get_poly_region(self, instance_annotation, present_egopose, present_ego2lidar):
         """
@@ -545,6 +594,7 @@ class LoadInstanceWithFlow(object):
         """
         frame_center_maps = []
         all_instance_ids = set()
+        max_extent_by_id = {}
 
         for rows in sparse_seq_rows:
             arr = np.asarray(rows)
@@ -573,7 +623,15 @@ class LoadInstanceWithFlow(object):
                 pts = xyz[inst == iid]
                 if pts.shape[0] == 0:
                     continue
-                cur[int(iid)] = ((pts.min(axis=0) + pts.max(axis=0)) * 0.5).astype(np.float32, copy=False)
+                pmin = pts.min(axis=0)
+                pmax = pts.max(axis=0)
+                cur[int(iid)] = ((pmin + pmax) * 0.5).astype(np.float32, copy=False)
+                # Per-instance voxel-AABB extent (span), tracked as the MAX over all
+                # frames so the size target recovers the best-visibility extent
+                # (per-frame occlusion shrinks the span). Same id space as centers.
+                ext = (pmax - pmin).astype(np.float32, copy=False)
+                prev_ext = max_extent_by_id.get(int(iid))
+                max_extent_by_id[int(iid)] = ext if prev_ext is None else np.maximum(prev_ext, ext)
 
             frame_center_maps.append(cur)
             all_instance_ids.update(cur.keys())
@@ -584,6 +642,7 @@ class LoadInstanceWithFlow(object):
 
         centers_voxel = np.zeros((t_len, n_inst, 3), dtype=np.float32)
         valid_mask = np.zeros((t_len, n_inst), dtype=np.bool_)
+        sizes_voxel = np.zeros((n_inst, 3), dtype=np.float32)
 
         if n_inst > 0:
             id_to_col = {int(iid): idx for idx, iid in enumerate(instance_ids.tolist())}
@@ -592,16 +651,49 @@ class LoadInstanceWithFlow(object):
                     col = id_to_col[int(iid)]
                     centers_voxel[t, col] = c_xyz
                     valid_mask[t, col] = True
+            for iid, ext in max_extent_by_id.items():
+                col = id_to_col.get(int(iid))
+                if col is not None:
+                    sizes_voxel[col] = ext
 
         centers_world = centers_voxel * self.resolution[:3].reshape(1, 1, 3) + self.start_position[:3].reshape(1, 1, 3)
         centers_world = centers_world.astype(np.float32, copy=False)
         centers_world[~valid_mask] = 0.0
 
+        # Per-instance size = voxel-AABB span in meters, aligned to instance_ids.
+        # (extent is a span, so only scale by resolution; no start_position offset.)
+        sizes_world = (sizes_voxel * self.resolution[:3].reshape(1, 3)).astype(np.float32, copy=False)
+
         return (
             torch.from_numpy(centers_world),
             torch.from_numpy(valid_mask),
             torch.from_numpy(instance_ids),
+            torch.from_numpy(sizes_world),
         )
+
+    @staticmethod
+    def build_instance_dims_targets(instance_dict, instance_ids):
+        """
+        annotation 원본 box 치수(w,l)를 grid instance id 순서(instance_ids)에 정렬해 반환.
+        회전과 무관한 진짜 크기 — gt_instance_sizes(voxel-AABB, 회전 시 부풀려짐)와 달리
+        aux size head의 회귀 target용. id 미해결 슬롯은 0(=무효 표시, 소비측에서 >0 게이트).
+        Returns: [N, 2] float32 (w, l)
+        """
+        n = int(instance_ids.shape[0]) if instance_ids is not None else 0
+        dims = torch.zeros((n, 2), dtype=torch.float32)
+        if n == 0 or not isinstance(instance_dict, dict):
+            return dims
+        id_to_col = {int(v): i for i, v in enumerate(instance_ids.tolist())}
+        for anno in instance_dict.values():
+            col = id_to_col.get(int(anno.get('instance_id', -1)))
+            if col is None:
+                continue
+            size = anno.get('size', None)
+            if size is None or len(size) < 2:
+                continue
+            dims[col, 0] = float(size[0])
+            dims[col, 1] = float(size[1])
+        return dims
 
     # def __call__(self, results):
     #     assert 'attribute_label' not in results.keys()
@@ -967,6 +1059,14 @@ class LoadInstanceWithFlow(object):
 
 
     def __call__(self, results):
+        # [사고 방지] dataloader worker는 spawn으로 매 epoch 코드(디스크)를 새로 import하고
+        # 구(pickle) 인스턴스를 복원하므로, 학습 도중 이 파일에 새 속성이 추가되면 구 인스턴스에
+        # 그 속성이 없어 AttributeError로 run 전체가 죽는다 (2026-07-07 full/full_attn_cover 사망
+        # 원인, NOTES 참조). 새 속성은 반드시 여기서 기본값으로 self-heal 할 것.
+        if not hasattr(self, "load_gt_bbox_aabb"):
+            self.load_gt_bbox_aabb = False
+            self.gt_bbox_aabb_dataset_path = None
+            self.gt_bbox_aabb_key = "segmentation_aabb_saved_list2"
         assert 'attribute_label' not in results.keys()
         assert 'segmentation_bev' not in results.keys()
         assert 'instance_bev' not in results.keys()
@@ -974,6 +1074,7 @@ class LoadInstanceWithFlow(object):
         assert 'segmentation_instance3d' not in results.keys()
         assert 'segmentation_cls_instance3d' not in results.keys()
         assert 'gt_occ_inst' not in results.keys()
+        assert 'gt_bbox_aabb' not in results.keys()
         assert 'gt_instance_centers_world' not in results.keys()
         assert 'gt_instance_centers_valid' not in results.keys()
         assert 'gt_instance_ids' not in results.keys()
@@ -1061,6 +1162,17 @@ class LoadInstanceWithFlow(object):
                     f"for prefix={prefix!r}."
                 )
             gt_occ_inst_label_path = os.path.join(gt_occ_inst_label_dir, sample_key)
+
+        gt_bbox_aabb_label_path = None
+        if self.load_gt_bbox_aabb:
+            gt_bbox_aabb_label_dir = self.resolve_gt_bbox_aabb_dir(prefix)
+            if gt_bbox_aabb_label_dir is None:
+                raise FileNotFoundError(
+                    "Could not resolve gt_bbox_aabb directory from "
+                    f"gt_bbox_aabb_dataset_path={self.gt_bbox_aabb_dataset_path!r} "
+                    f"for prefix={prefix!r}."
+                )
+            gt_bbox_aabb_label_path = os.path.join(gt_bbox_aabb_label_dir, sample_key)
 
         # ---------------- small inline utils ----------------
         def to_tensor_safe(arr, dtype):
@@ -1162,6 +1274,30 @@ class LoadInstanceWithFlow(object):
                     rows_raw,
                     min_cols=5,
                     label="gt_occ_inst",
+                )
+                rows = self._filter_sparse_rows_by_class(rows, class_col=3)
+                out.append(rows.astype(np.int64, copy=False))
+            return out
+
+        def load_gt_bbox_aabb_sparse_list_or_raise(expected_seq_len):
+            if gt_bbox_aabb_label_path is None:
+                raise FileNotFoundError("gt_bbox_aabb label path is not resolved.")
+            npz_path = gt_bbox_aabb_label_path + ".npz"
+            if not os.path.exists(npz_path):
+                raise FileNotFoundError(f"gt_bbox_aabb npz is missing: {npz_path}")
+
+            gt_list = load_list_from_npz(npz_path, self.gt_bbox_aabb_key)
+            self._validate_gt_bbox_aabb_sparse_list(
+                sparse_list=gt_list,
+                sample_key=sample_key,
+                expected_seq_len=expected_seq_len,
+            )
+            out = []
+            for rows_raw in gt_list:
+                rows = self._normalize_sparse_rows(
+                    rows_raw,
+                    min_cols=5,
+                    label="gt_bbox_aabb",
                 )
                 rows = self._filter_sparse_rows_by_class(rows, class_col=3)
                 out.append(rows.astype(np.int64, copy=False))
@@ -1349,6 +1485,12 @@ class LoadInstanceWithFlow(object):
                 expected_seq_len=results['sequence_length']
             )
 
+        gt_bbox_aabb_sparse_list = None
+        if self.load_gt_bbox_aabb:
+            gt_bbox_aabb_sparse_list = load_gt_bbox_aabb_sparse_list_or_raise(
+                expected_seq_len=results['sequence_length']
+            )
+
         # ---------------- decide cache usage ----------------
         use_cache = (not need_regen) \
             and os.path.exists(seg_label_path + ".npz") \
@@ -1382,10 +1524,13 @@ class LoadInstanceWithFlow(object):
                 results['segmentation_instance3d'] = torch.cat(segmentation_instance3d_list, dim=0).long()
                 if segmentation_instance3d_sparse_list is None:
                     raise ValueError("segmentation_instance3d sparse list is missing while cache is used")
-                centers_world, centers_valid, instance_ids = self.build_instance_center_world_targets(segmentation_instance3d_sparse_list)
+                centers_world, centers_valid, instance_ids, instance_sizes = self.build_instance_center_world_targets(segmentation_instance3d_sparse_list)
                 results['gt_instance_centers_world'] = centers_world
                 results['gt_instance_centers_valid'] = centers_valid
                 results['gt_instance_ids'] = instance_ids
+                results['gt_instance_sizes'] = instance_sizes
+                results['gt_instance_dims'] = self.build_instance_dims_targets(
+                    results.get('instance_dict'), instance_ids)
                 if self.load_segmentation_cls_instance3d:
                     segmentation_cls_sparse_list = load_segmentation_cls_sparse_list_or_raise()
                     self._validate_segmentation_cls_instance3d_alignment(
@@ -1408,6 +1553,8 @@ class LoadInstanceWithFlow(object):
                     ).long()
             if self.load_gt_occ_inst:
                 results['gt_occ_inst'] = gt_occ_inst_sparse_list
+            if self.load_gt_bbox_aabb:
+                results['gt_bbox_aabb'] = gt_bbox_aabb_sparse_list
 
             if self.use_lyft:
                 results['height'] = torch.cat(pcd_height_list, dim=0)
@@ -1416,8 +1563,8 @@ class LoadInstanceWithFlow(object):
                 if key in [
                     'sample_token', 'centerness', 'offset', 'flow_bev', 'time_receptive_field', "indices",
                     'segmentation', 'segmentation_bev', 'instance_bev', 'attribute_label',
-                    'segmentation_instance3d', 'segmentation_cls_instance3d', 'gt_occ_inst',
-                    'gt_instance_centers_world', 'gt_instance_centers_valid', 'gt_instance_ids',
+                    'segmentation_instance3d', 'segmentation_cls_instance3d', 'gt_occ_inst', 'gt_bbox_aabb',
+                    'gt_instance_centers_world', 'gt_instance_centers_valid', 'gt_instance_ids', 'gt_instance_sizes', 'gt_instance_dims',
                     'sequence_length', 'instance_dict', 'instance_map', 'input_dict',
                     'egopose_list', 'ego2lidar_list', 'scene_token', 'instance', 'global_idx'
                 ]:
@@ -1537,10 +1684,13 @@ class LoadInstanceWithFlow(object):
         results['instance_bev'] = torch.cat(results['instance_bev'], dim=0)
         if self.load_segmentation_instance3d:
             results['segmentation_instance3d'] = torch.cat(results['segmentation_instance3d'], dim=0).long()
-            centers_world, centers_valid, instance_ids = self.build_instance_center_world_targets(segmentation_instance3d_sparse_list)
+            centers_world, centers_valid, instance_ids, instance_sizes = self.build_instance_center_world_targets(segmentation_instance3d_sparse_list)
             results['gt_instance_centers_world'] = centers_world
             results['gt_instance_centers_valid'] = centers_valid
             results['gt_instance_ids'] = instance_ids
+            results['gt_instance_sizes'] = instance_sizes
+            results['gt_instance_dims'] = self.build_instance_dims_targets(
+                results.get('instance_dict'), instance_ids)
             if self.load_segmentation_cls_instance3d:
                 segmentation_cls_sparse_list = load_segmentation_cls_sparse_list_or_raise()
                 self._validate_segmentation_cls_instance3d_alignment(
@@ -1563,6 +1713,8 @@ class LoadInstanceWithFlow(object):
                 ).long()
         if self.load_gt_occ_inst:
             results['gt_occ_inst'] = gt_occ_inst_sparse_list
+        if self.load_gt_bbox_aabb:
+            results['gt_bbox_aabb'] = gt_bbox_aabb_sparse_list
 
         results['flow_bev'] = self.get_flow_label(results, ignore_index=255)
 
@@ -1589,8 +1741,8 @@ class LoadInstanceWithFlow(object):
             if key in [
                 'sample_token', 'centerness', 'offset', 'flow_bev', 'time_receptive_field', "indices",
                 'segmentation', 'segmentation_bev', 'instance_bev', 'attribute_label',
-                'segmentation_instance3d', 'segmentation_cls_instance3d', 'gt_occ_inst',
-                'gt_instance_centers_world', 'gt_instance_centers_valid', 'gt_instance_ids',
+                'segmentation_instance3d', 'segmentation_cls_instance3d', 'gt_occ_inst', 'gt_bbox_aabb',
+                'gt_instance_centers_world', 'gt_instance_centers_valid', 'gt_instance_ids', 'gt_instance_sizes', 'gt_instance_dims',
                 'sequence_length', 'instance_dict', 'instance_map', 'input_dict',
                 'egopose_list', 'ego2lidar_list', 'scene_token', 'instance', 'global_idx'
             ]:

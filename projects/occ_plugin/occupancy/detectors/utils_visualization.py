@@ -1677,7 +1677,10 @@ class EfficientOCFVisualizationMixin:
             cand_scores = score_q.index_select(0, selected_candidate_idx)
             order = torch.argsort(cand_scores, descending=True)
             selected_candidate_idx = selected_candidate_idx.index_select(0, order)
-            nms_radius = max(0.0, float(getattr(self, "fg_score_distance_nms_radius_m", 0.0)))
+            # eval 실험용 override: EOCF_EVAL_NMS_RADIUS (0=NMS off). 미설정 시 config 값.
+            _nms_env = _os.environ.get("EOCF_EVAL_NMS_RADIUS", "")
+            nms_radius = (max(0.0, float(_nms_env)) if _nms_env != ""
+                          else max(0.0, float(getattr(self, "fg_score_distance_nms_radius_m", 0.0))))
             if nms_radius > 0.0 and int(selected_candidate_idx.numel()) > 0:
                 center_frame_idx = min(
                     max(0, int(getattr(self, "time_receptive_field", 1)) - 1),

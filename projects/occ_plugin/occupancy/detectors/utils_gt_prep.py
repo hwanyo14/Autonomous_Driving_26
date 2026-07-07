@@ -229,9 +229,11 @@ class EfficientOCFGTPrepMixin:
         out[ignore_mask] = ig
         return out
 
-    def _select_query_gt_for_losses(self, gt_occ, segmentation):
+    def _select_query_gt_for_debug_vis(self, gt_occ, segmentation):
         """
-        Select supervision source for query losses.
+        Select the scene-occupancy GT shown in query debug visualization.
+        (이름 주의: 과거엔 query loss GT 선택용이었으나, 현재 이 출력의 유일한
+        소비처는 maybe_save_query_debug_vis — gradient 경로에 쓰이지 않음.)
         """
         if self.use_segmentation_as_query_gt and (segmentation is not None):
             # segmentation은 bbox volume 기반이라 non-zero를 occupied(1)로 이진화해서 사용.
@@ -1088,6 +1090,26 @@ class EfficientOCFGTPrepMixin:
             "centers_valid_tn": centers_valid,
             "instance_ids_n": ids_n,
         }
+
+    def _prepare_gt_bbox_aabb_dense_txyz(
+        self,
+        gt_bbox_aabb=None,
+        fallback_segmentation_instance3d_txyz=None,
+    ):
+        """
+        bbox AABB GT(v3 캐시, [x,y,z,nusocc_cls,inst])를 dense instance-id 볼륨 [T,X,Y,Z]로 변환.
+        gt_occ_inst와 동일 sparse 포맷/id 공간이므로 같은 extract/class-filter/dense 경로를 재사용.
+        (겹치는 AABB voxel은 나중 행(id 큰 쪽)이 덮음 — pair mask 기준 미세 침식만 발생.)
+        """
+        sparse = self._extract_gt_occ_inst_sparse_list(gt_occ_inst=gt_bbox_aabb)
+        if sparse is None:
+            return None
+        sparse = self._filter_gt_occ_inst_sparse_list_by_query_classes(sparse)
+        dense_inst, _ = self._build_dense_from_gt_occ_inst_sparse(
+            sparse_list=sparse,
+            fallback_segmentation_instance3d_txyz=fallback_segmentation_instance3d_txyz,
+        )
+        return dense_inst
 
     def _prepare_segmentation_cls_instance3d(self, segmentation_cls_instance3d=None):
         """

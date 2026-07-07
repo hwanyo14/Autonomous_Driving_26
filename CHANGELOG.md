@@ -1,5 +1,171 @@
 # Changelog
 
+## 2026-07-06 KST — eval 실험 스위치 2종: NMS off + 렌더 가중치 독립화 (`eval_sweep_indep.sh`)
+
+- **`utils_visualization.py`**: `EOCF_EVAL_NMS_RADIUS` env — distance NMS 반경 override (0=off). 미설정 시 config 값(3.0m).
+- **`efficientocf.py` simple_test**: `EOCF_EVAL_WEIGHT_MODE=ones` env — 렌더 가중치를 score 대신 1.0 고정. blob 높이의 score 종속(occ thr가 fg thr를 흡수하던 구조, NOTES 스윕 결론)을 끊어 fg(선택)/occ(footprint 반경 σ√(2ln(1/t))) 완전 독립화. 기본값 score = 기존 동작 무변경.
+- **`eval_sweep_indep.sh` 신설**: A) NMS=0 (score 가중치, fg.75/occ.75) + B1~3) ones 가중치 occ {0.3,0.5,0.75} — 각 512샘플 순차, `SWEEP2_WAIT=1`이면 타 eval 대기(기본 병행).
+
+## 2026-07-06 KST — focal3d GT 혼합(0.1 inst3d + 0.9 AABB bbox) 구현 + train AABB v3 캐시 생성
+
+- **목적**: `loss_gmo_focal`(matched-pair focal, aka focal3d)의 GT를 pair별로 `0.1×gt_occ_inst3d + 0.9×AABB bbox`로 가중합 (`subset_attn_cover_aabb.py` 실험). dice/매칭/center는 inst3d 유지.
+- **핵심 발견 — id 공간**: gt_occ_inst3d·segmentation_instance3d(구 캐시)는 **ped 포함 + `classes=['vehicle','human']`(원본 EfficientOCF) 번호 체계**. ① v2 val 캐시(ped 제외 번호)는 id 어긋남(실측 cover 0.45) → 학습 loss에 사용 금지. ② 현재 config `class_names`의 'bicycle' substring이 `static_object.bicycle_rack`을 등록해 rack 낀 시퀀스에서 번호가 밀림 — `['vehicle','human']`으로 역공학 재현 확인(probe 3/3키 100%).
+- **`tools/gen_data/gen_bbox_gt_v2.py` 확장**: `--split train`(전 시퀀스 `len(dataset.indices)`=23,930 순회 — train subset은 매 run random이라 전체 필수), `--aabb_only`, `--include_ped_ids`(cache-parity: classes=['vehicle','human'] + ped rasterize cls=7).
+- **v3 캐시 생성**: `data/efficientocf_bboxcls_v3/GMO/segmentation_aabb/` train 23,930키, [x,y,z,nusocc_cls,inst], ~23G. 4-shard 병렬 ~40분. 전수 무결성(23,930 모두 구조 검사) PASS. 심층 검증: 랜덤 키 id-pair coverage=1.0·dominant-cls 일치 (경계 1~2voxel 예외는 inst3d 캐시의 box-margin 특성 — NOTES 참조).
+- **생성 중 잡은 함정 2건 (각각 전량 재생성으로 해결)**: ① 'bicycle' substring이 bicycle_rack을 id 번호에 등록 → `['vehicle','human']` cache-parity로 수정. ② 'construction' substring이 `human.pedestrian.construction_worker`(인부)를 cls5(차량)로 저장 → 로더 ped 필터(7)를 뚫고 학습에 들어갈 뻔 — CLS_MAP에서 pedestrian 매칭 최우선으로 수정. **v2 val 캐시엔 ②가 잔존**(bbox eval GT에 인부 box 소량 혼입, NOTES 참조).
+- **로더 (`loading_instance.py`)**: `load_gt_bbox_aabb`/`gt_bbox_aabb_dataset_path`/`gt_bbox_aabb_key` 추가 — gt_occ_inst 경로 미러(ped는 cls col 필터로 제거). AABB는 인접 box끼리 voxel 겹침이 정상이라 duplicate-좌표 검사 없는 전용 validator 사용. `formating.py`에 DC(cpu_only) 번들 추가.
+- **detector (`efficientocf.py`, `utils_gt_prep.py`)**: forward_train에 `gt_bbox_aabb` 수용 → `_prepare_gt_bbox_aabb_dense_txyz`(extract/query-class filter/dense 재사용)로 [T,X,Y,Z] dense → history_all_valid 필터·trajectory/vis slice를 inst3d GT와 동일 적용 → loss로 전달.
+- **loss (`utils_loss.py`)**: `_prepare_grouped_matched_pair_lowres_occ`의 GT lowres 빌드를 `_build_grouped_pair_lowres_gt`로 분리(회귀 diff=0 검증) — **pred voxelize 1회 재사용**, bbox GT lowres만 추가 빌드. pair별 `focal = inst3d_w×focal(inst3d) + bbox_w×focal(bbox)`. whole-box drop 프레임(bbox GT 비었는데 inst3d GT 있음)은 bbox 항에서 프레임 단위 제외(빈 GT 0-감독 방지). 디버그: `dbg_gmo_focal_inst3d/bbox`, `dbg_gmo_focal_bbox_pair_count`.
+- **config**: `efficientocf_config.py`에 `query_gmo_focal_inst3d_weight`(1.0)/`query_gmo_focal_bbox_weight`(0.0) 기본값. `subset_attn_cover_aabb.py`에 0.1/0.9 + 파이프라인 로드(train만; test split은 v3 키 없음·불필요) + Collect3D `gt_bbox_aabb`.
+- **검증**: 로더 e2e(실 train 키: 로드·ped제거·id겹침 1.000), lowres GT 리팩토링 회귀(diff=0), 문제 키 8개 재생성 대조. 시각화: `work_dirs/bbox_aabb_v3_vis/*.png` (AABB vs inst3d 오버레이 + box-밖 voxel 판정).
+
+## 2026-07-06 KST — Recall3d 성분(TP/FP/FN/bboxFP) 로깅 추가
+
+- **`efficientocf.py`**: `_iou_recall_3d`가 (iou, recall, comps) 3-tuple 반환 (comps=voxel 수 {tp,fp,fn,bbox_fp}; 호출부 3곳 언팩 수정). simple_test 결과에 `recall_3d_comps` 추가.
+- **`apis/test.py`**: 성분 voxel 합 누적(단일/분산) → `[FINAL]` 직후 `[recall3d comps] TP/FP/FN/bboxFP | 비관용FP | micro Recall3d` 줄을 stdout·live log에 기록 (분산은 all_reduce). collect에 `recall_3d_comps` 추가.
+- **`efficientocf_dataset.py` evaluate**: `Recall_3d_TP/FP/FN/bboxFP/micro` 키 추가 (macro 평균과 별개로 voxel-pooled micro recall).
+- **용도**: Recall3d를 갉아먹는 게 FN(못 채움)인지 비관용FP(box 밖 흘림)인지 정량 분리 — threshold/학습 개입 방향 결정용. 과거 run에는 성분이 저장 안 돼 소급 불가; 다음 eval부터 기록.
+
+## 2026-07-06 KST — 부분 eval 스위치 `EOCF_EVAL_MAX_SAMPLES` 추가 (파라미터 튜닝용 짧은 eval)
+
+- **`apis/test.py`**: 전 rank 합산 N샘플 처리 후 조기 종료(전 rank 동일 iter에서 break라 이후 all_reduce/collect 안전). `[FINAL]` 줄은 실제 처리 수(n_done)로 표기. `eval_total.sh`에 주석 예시 추가.
+- **수렴 실측 근거 (3개 완주 run)**: 최종값 ±5% 안착 384~768샘플 / ±2% 1,152~1,536 / ±1% 1,536~4,224. `fixed_val=True(seed 2)`라 순회 순서가 run 간 동일 → 같은 N 부분 eval끼리 비교 유효. 속도 ~2.6샘플/초(8GPU, vis on) → 512샘플 ≈ 11분.
+
+## 2026-07-06 KST — eval query_debug_vis 4행 교체: matched 점 → 'eval 실제 pred occ vs bbox AABB GT'
+
+- **요구**: 4행(Hungarian-matched, eval에선 항상 matched=0으로 빈 행)을 GT=bbox AABB(초록) + 예측=**metric 채점에 쓰는 threshold된 occupancy**(빨강) + 겹침(흰색)으로 교체, 프레임별 IoU 라벨.
+- **구현 (정합 보장 방식)**: simple_test가 metric 계산에 쓴 `pred_bev_t`/aligned `bbox_bev_t` 텐서를 `eval_cmp_pack`으로 시각화에 **그대로 전달** — 재계산 없음이라 threshold(EOCF_EVAL_OCC_THR)·FG 선택·align·기준프레임(EOCF_EVAL_MODE)이 정의상 metric과 동일. 이를 위해 `_maybe_save_eval_query_vis` 호출을 metric 계산 뒤로 이동.
+- **파일**: `efficientocf.py`(호출 이동+pack 배선, `bbox_bev_vis` 캡처), `query_head.py`(`_maybe_save_prob_grid_vis`/`maybe_save_query_debug_vis`에 `eval_cmp_pack` kwarg — pack 있으면 matched_ov를 초록/빨강/흰 합성으로 교체 + 라벨 `pred occ vs bbox_aabb IoU=`). pack 없으면(학습 debug vis) 기존 matched 행 그대로 — 학습 시각화 무영향.
+- **E2E 검증**: 1샘플 오프라인 forward(EOCF_EVAL_VIS=1)로 새 4행 PNG 생성 확인, 프레임별 IoU(0.135/0.174/0.174/0.174)가 사전 목업(metric 텐서 직접 캡처본)과 완전 일치. 목업: work_dirs/gt_align_vis/mock_row4_pred_occ_vs_aabb.png.
+- **주의**: 진행 중이던 14:59 eval은 교체 전 코드 — 다음 eval부터 새 4행 저장.
+
+## 2026-07-06 KST — eval 마감 로그 [FINAL] 추가 + E2E 검증 완료 + GT 4종 비교 시각화
+
+- **`apis/test.py`**: 루프 종료 후 최종 누적값을 running과 같은 형식 + `[FINAL]` 접미로 stdout·`eval_metrics_live.log`에 기록 (single/multi GPU 모두; dataset 크기가 metric_every 배수가 아니어서 마지막 구간이 안 찍히던 문제). multi는 all_reduce collective라 전 rank 공동 호출 위치에 배치. **다음 eval부터 적용** (14:59 run은 옛 코드라 4992에서 끊김 — 종료 후 evaluate() 테이블로 확인).
+- **E2E 확인 (14:59 run 첫 러닝 로그)**: 7지표 전부 정상 — `IoU2d(nusocc)=0.0886 IoU2d(bbox_aabb)=0.1520 IoU2d(bbox_rot)=0.1401 IoU3d(nusocc)=0.0301 IoU3d(bbox_aabb)=0.1137 IoU3d(bbox_rot)=0.1036 Recall3d=0.2632`. bbox_rot NaN 아님 = v2 detector-side 로드 실동작 확정.
+- **시각화**: `work_dirs/gt_align_vis/figD_gt_sources_4way.png` — GT 4종(raw gt_occ/inst3d/AABB/rot) 개별+관계 오버레이 8패널 (실측: inst3d ≈ raw∩bbox 99.93%, inst3d 교집합 밖 0voxel — "교집합" 멘탈모델 확정).
+
+## 2026-07-06 KST — bbox GT v2 생성 완료(val 5119) + eval 배선: bbox 메트릭 v2 교체 & bbox_rot 2D/3D 신설
+
+- **생성 완료**: `data/efficientocf_bboxcls_v2/GMO/segmentation_{aabb,rot}/` val 5119샘플 × 2. **val 검증(30키)**: v2 == loader 기준 캐시(diff 0, ped 제외분만 차이) — 반면 **기존 bboxcls는 val에서 box 누락이 13/30**으로 이전 추정(5/39)보다 광범위했음이 드러남(소멸-유지 frozen pose 미반영 추정). 생성 스크립트는 compressed int32 저장으로 전환 + 기존 산출물 재압축(129G→축소, logs/recompress_bboxv2.log).
+- **eval 배선 (`efficientocf.py`)**: ① `_eval_sample_key_from_metas`/`_eval_load_bbox_gt_v2` 헬퍼 신설 — test Collect의 `scene_token`(=present `<scene>_<lidar>` 결합키)으로 v2 npz를 detector에서 직접 lazy-load (**config/pipeline 무수정**; 경로 env `EOCF_BBOX_GT_V2_DIR`, 기본 `./data/efficientocf_bboxcls_v2/GMO`). ② bbox 메트릭 GT를 v2 aabb 우선으로 교체(부재 시 기존 bboxcls fallback — 그땐 rot 메트릭 NaN). ③ **IoU2d(bbox_rot)·IoU3d(bbox_rot)** 신설 — AABB와 동일 align 잠금·기준 프레임·수식(관용·마스크 없음). Recall_3d의 bbox 관용항도 자동으로 v2 사용.
+- **`apis/test.py`**: `hist_for_iou_bbox_rot`/`iou_3d_bbox_rot` 수집(단일/분산, all_reduce scalars 6→8, CM 3개), running 로그 7지표로 확장. **`efficientocf_dataset.py` evaluate**: `IOU_bbox_rot_*`, `IOU_3d_bbox_rot` 키 추가.
+- **검증**: py_compile 3파일 + 헬퍼 단위테스트(키 복원 2형태, dense [7,512,512,40] 로드, 캐시 hit, 부재 키 None). ⚠️ 실 eval E2E는 다음 eval 실행에서 확인 필요 — 로그에 `IoU2d(bbox_rot)=`가 NaN이 아니면 v2 로드 정상.
+- **효과**: 이제 7지표 전부(2D/3D × nusocc/bbox_aabb/bbox_rot + Recall) 생성소멸·사람 필터가 학습과 정합. bbox 계열 절대값은 GT 교체로 이전 로그와 비교 불가.
+
+## 2026-07-06 KST — 흔적코드 정리 + bbox GT v2 캐시 생성기(`gen_bbox_gt_v2.py`) [2단계 착수]
+
+- **흔적코드 정리 (오해 유발 legacy)**: ① `query_head.compute_gmo_dice_loss` 삭제 (110줄 — 호출처 없는 옛 dice, gt_occ를 받아 "학습이 gt_occ를 쓴다"는 오해의 원천; 실제 dice는 utils_loss의 matched-pair 버전). ② `_select_query_gt_for_losses` → `_select_query_gt_for_debug_vis` rename (utils_gt_prep + efficientocf 호출부) — 이름과 달리 출력이 디버그 시각화에만 쓰임을 명시. 나머지 legacy(`*_ori.py` 보존본, loading_instance 주석 블록, height_l1 상시 0 배관)는 삭제하지 않고 NOTES에 목록화.
+- **`tools/gen_data/gen_bbox_gt_v2.py` 신설**: val(eval) 5119샘플 전용 bbox GT 재생성 — `[x,y,z,cls,inst]` AABB + rotated(OBB) 두 벌을 `data/efficientocf_bboxcls_v2/GMO/segmentation_{aabb,rot}/`에 생성. 필터는 dataset 조립에서 자동 상속(사람: config class_names에 ped 없음 / 생성소멸·저가시성: record_instance가 skip). rasterize는 loader `get_poly_region`/`fill_occupancy` 규칙 재현(whole-box in-range, round 격자화), OBB는 box-local half-extent(+반voxel) 검사. category→nusocc id 매핑에 'vehicle.bicycle'만 bicycle 인정(bicycle_rack 배제). 빈 pipeline dataset으로 이미지 로딩 없이 동작, 존재 파일 skip(재실행/shard 안전).
+- **스모크 검증 (3샘플)**: v2 AABB가 기존 bboxcls(ped 제외)와 voxel 완전 일치(-0/+0) / rot ⊂ aabb 위반 0, 부피 0.45~0.71× / inst3d 커버 aabb 100%·rot 97.8~100% / t≥3 신규 id 없음 / cls = GMO만. 전체 생성은 백그라운드 실행 (logs/gen_bbox_gt_v2.log).
+- **미배선**: eval 메트릭은 아직 구 bboxcls 사용 — v2 생성 완료 후 로더/simple_test 배선 예정.
+
+## 2026-07-06 KST — IoU3d(nusocc)/Recall_3d GT 교체: gt_occ(raw) → gt_inst(inst3d) [1단계 적용]
+
+- **`efficientocf.py` simple_test**: 3D nusocc 메트릭의 GT를 `_eval_nusocc_3d_fg(gt_occ)` → `(gt_inst>0)`로 교체, `gt_occ_valid`(255 마스크)는 inst3d에 ignore 개념이 없어 None. gt_inst 부재 시에만 기존 gt_occ 경로 fallback. align/관용항/mode_slice 무수정(동일 그리드·방향 — inst3d ⊂ gt_occ 100% 실측).
+- **근거 (NOTES 2026-07-06 실측)**: raw gt_occ는 movable voxel의 평균 29%(최악 70%)가 inst3d·bbox 밖 잔여 + 생성소멸 미필터 → 학습(전 loss가 inst3d 기반, gt_occ는 디버그 시각화 전용임을 코드 추적으로 확인)이 배우지 않는 voxel을 구조적 FN으로 채점하고 있었음.
+- **영향**: 이제 5개 메트릭 중 nusocc 계열 3개(IoU2d/IoU3d/Recall_3d)가 전부 학습과 동일 GT·동일 필터(사람 제외·query_class·생성소멸). IoU3d·Recall_3d 절대값 상승 예상 — 이전 로그와 비교 금지. gt_occ는 eval에서 fallback 외 미사용.
+
+## 2026-07-06 KST — IoU3d(bbox_aabb) 메트릭 추가 + 기존 IoU3d에 (nusocc) 라벨 명시
+
+- **`efficientocf.py` simple_test**: `iou_3d_bbox` 신설 — 2D bbox 메트릭과 **동일 GT**(`segmentation_cls_instance3d` ch0=bboxcls 캐시, 로드 시 ped(7) 제거 + eval에서 7→0 이중 방어)를 3D 그대로 `_iou_recall_3d`로 채점 (nusocc valid(255) 마스크·bbox 관용항 없음 = IoU2d(bbox_aabb)와 규칙 일치). 3D align은 nusocc 3D와 같은 잠금(`bbox3d_t`) 재사용. `_pack`/return dict에 키 추가.
+- **`apis/test.py`**: single/multi GPU 수집·running 로그에 `iou_3d_bbox` 배선. 로그 라벨 `IoU3d=` → `IoU3d(nusocc)=` + `IoU3d(bbox_aabb)=` 추가 (분산 all_reduce scalars 4→6개).
+- **`efficientocf_dataset.py` evaluate**: `IOU_3d` → `IOU_3d_nusocc` rename + `IOU_3d_bbox_aabb` 추가 (save_best 등 키 소비처 없음 확인).
+- **필터 체크 결과 (실데이터 스캔)**: bboxcls 캐시 클래스 = {2,3,4,5,6,7,9,10} — GMO뿐, 딴 클래스 없음 ✓ / ped는 로드+eval 이중 제거 ✓ / **생성소멸은 캐시에 미적용** — 20샘플 대조에서 2건이 미래 프레임 신규 box 포함, 1건은 과거 box 누락 (loader 자체 캐시 `data/efficientocf`는 visible_instance_set로 필터됨과 대조). **IoU2d(bbox_aabb)도 원래부터 같은 누수** — bbox 계열 두 메트릭 공통 한계로 기록 (NOTES 참조).
+
+## 2026-07-06 KST — eval IoU2d(nusocc) GT 교체: bbox-AABB(segmentation_bev) → 진짜 nusocc inst3d z-collapse
+
+- **문제**: `simple_test`의 "IoU2d(nusocc)" GT가 `segmentation_bev`였는데, 이는 nusocc가 아니라 **bbox 8코너의 AABB를 rasterize한 캐시**(`loading_instance.py` `get_poly_region`→`fill_occupancy`가 min/max로 채움)의 z-sum — 즉 bbox 메트릭이었음 (실데이터 probe로 확인: `data/efficientocf/GMO/segmentation_bev` sparse [x,y,1]).
+- **수정 (`efficientocf.py` simple_test)**: GT를 `gt_inst`(=`_prepare_gt_occ_inst_primary_targets`의 `dense_inst_txyz`, nuScenes-Occupancy inst3d 캐시)로 교체 — `(gt_inst>0).any(z)` → [T,X,Y]. **학습 dice(`loss_gmo_dice`)가 쓰는 GT와 동일 소스·동일 필터**(로드 시 pedestrian cls7 제거 `exclude_occ_class_ids`, detector에서 query_class_ids 필터). gt_inst 부재 시에만 기존 segmentation_bev fallback. align/threshold/CM 로직은 무변경.
+- **영향**: IoU2d(nusocc) 절대값이 과거 로그와 비교 불가(GT가 바뀜 — nusocc는 표면 sparse라 bbox-AABB보다 작음 → 수치 하락이 정상). IoU2d(bbox_aabb)/IoU3d/Recall3d는 무변경.
+- **데이터 파악 (추가 예정 bbox3d·rotated-bbox 메트릭 사전조사)**: ① `segmentation_cls_instance3d` ch0 = bboxcls 캐시 [x,y,z,cls] — **AABB 채움**이라 bbox-3D(AABB) IoU는 지금 데이터로 즉시 가능. ② **회전(yaw)은 모든 캐시에서 소실** — `get_poly_region`이 회전 코너 8개를 계산하지만 rasterize 시 min/max(AABB)로 뭉갬. rotated bbox 2D/3D는 `instance_dict` annotation(translation/rotation/size)에서 OBB rasterize 필요(생성소멸 필터 `visible_instance_set`·pedestrian 제외 규칙 재사용 가능). ③ `gt_instance_dims`=(w,l) 원본 치수 있으나 yaw 미포함.
+
+## 2026-07-05 KST — size note("크기 쪽지") 구현: aux size head + σ/depth 성분 주입 (`subset_attn_cover_size.py`)
+
+- **배경 (NOTES 2026-07-02~04 실측 체인)**: 크기 정보가 모델 어디에도 없음(query feature R²=0.06, BEV dead code, instance-pool 0.015) + naive σ×depth 실패(시야각 단축·폭 바닥, spearman −0.05) → gaussian head에 크기를 **입력으로 직접 공급**하는 설계. 벌리는 힘(렌더-recall)은 사용자 결정으로 후속 스테이지.
+- **`loading_instance.py`**: `build_instance_dims_targets`(annotation 원본 box 치수 (w,l)을 grid instance id에 정렬, 회전 무관 진짜 크기) 신설 → cache/non-cache 양 분기에서 `gt_instance_dims` [N,2] emit + skip-list 2곳 등록. `formating.py`: DC(stack=False) 처리 추가.
+- **`query_head.py`**: ① `query_size_aux_head`(D→64→2, softplus로 (w,l) 예측), ② `query_size_note_proj`(5→D, **zero-init** — 시작 시 주입=no-op), ③ `apply_lifted_centers_to_outputs`에 `size_note_attn_sigma_tq2` kwarg — note 5성분 [logσu, logσv, log d, log w_pred, log l_pred]을 **detach 후** center_input에 additive 주입(gaussian head gradient가 attention/depth/aux로 역류 차단), outputs에 `query_size_aux_pred_tq2` 노출. 생성자 `query_size_note_enabled`(기본 False).
+- **`efficientocf.py`**: `_compute_query_attn_sigma_note`(질량 최대 캠의 attn 가중 표준편차 [T,Q,2], no-grad) 신설, apply_lifted 호출부 배선(학습·추론 공용 경로), `_last_query_size_aux_pred` 캐시, forward_train에 `gt_instance_dims` param + aux loss 호출 + aggregate 전달.
+- **`utils_loss.py`**: `_compute_query_size_aux_loss_from_match` — matched만, GT=gt_instance_dims(0=무효 제외), **크기-비례 가중** clamp(max(w,l)/2m, 1, cap=4) (버스 2.9% 희석 방지), L1. `_aggregate_training_losses`에 pack 전달 → `loss_query_size_aux` + dbg 4종(`l1_mean`/`l1_big`(>6m)/`pair_count`/`big_count`, z-prefill로 DDP 일관).
+- **`efficientocf_config.py`**: DEFAULTS 3키(`query_size_note_enabled`=False/`query_size_aux_loss_weight`=0.0/`query_size_aux_big_weight_cap`=4.0, **기본 off=기존 동작**) + apply/검증(aux weight>0인데 note off면 에러).
+- **config**: `subset_attn_cover_size.py`(사용자 생성 cover 복사본)에 3키 활성(aux weight 0.5) + Collect에 `gt_instance_sizes`/`gt_instance_dims` + 헤더 주석. cover 대비 단일변수. **head 파라미터 증가로 기존 ckpt 비호환 — from-scratch 전용.**
+- **검증**: py_compile 7파일 / 합성: dims 빌더(무효 id→0), aux loss(가중 수식 일치 3.9349, gradient OK), σ 헬퍼(넓은 blob 3.94 vs 좁은 1.00) / 양 config build(cover=off 유지) + note E2E(apply_lifted 경로, proj zero-init, aux_pred>0, mixture 정상). ⚠️ 실 데이터 forward smoke 미실행 — 첫 학습에서 `loss_query_size_aux`·dbg 키 정상 출력 확인 필요.
+- **판정 계획**: ① `dbg_query_size_aux_l1_big` 수렴(=feature가 대형 크기를 배우는가 — I/O로 보류된 probe를 학습이 대신), ② ep5 `vis_attn_by_size.py` 버스 BEV(before: work_dirs/subset_attn_cover/dbg_analysis/attn_vis_by_size.png), ③ ep15 eval Recall3d. 부족분 = 후속 렌더-recall 스테이지의 몫.
+
+## 2026-07-03 KST — dbg 프로브 스크립트 7종을 `tools/dbg_probe/`로 영구 보존
+
+- 세션 scratchpad(휘발)에 있던 체크포인트 오프라인 진단 스크립트들을 repo로 복사: `dbg_offset_spread.py`(spread/mixture 캡처), `plot_spread_results.py`, `cap_we_bev.py`(**두 run BEV 나란히 비교 — flag-pole 그림 생성기**), `probe_we_spread.py`(visible-gate 우회 판정), `probe_feat_size.py`(feature→크기 선형 프로브), `probe_bev_size.py`, `probe_attn_geometry.py`(attn 폭/coverage/σ×depth). 사용법·주의(하드코딩 경로 수정, vis 게이트, GPU 확인)는 `tools/dbg_probe/README.md`.
+- 이 스크립트들의 실측 결과(ghost/flag-pole loophole, feature 크기 부재, attn 고정폭 등)는 NOTES.md 2026-07-02~03 항목 참조.
+
+## 2026-07-02 KST — attn σ-matching(폭 감독) 추가: `loss_query_attn_sigma` + `subset_attn_cover.py`
+
+- **배경 (ep10 attn 기하 probe, NOTES 2026-07-02 참조)**: attn은 카메라·중심은 정확(질량 80~90% 올바른 캠)하지만 **폭이 크기 무관 고정**(σ_attn 8~14px vs σ_mask 1.7~6.3px, corr(σ×depth, GT크기) spearman=0.004). 원인 = inside-mass가 '마스크 안 총량'만 채점해 2차 모멘트(폭)가 감독 없는 자유변수 → feature 유사도 길이(~8px)의 기본 블롭에 정착. 크기 신호의 유일 생존 원천(attn 기하×depth)을 살리려면 폭에 최초의 감독 필요.
+- **`utils_loss.py`**: `_compute_query_attn_bbox_loss` 안에 σ-matching 블록 추가 — matched query마다 GT cam 마스크가 최대인 카메라에서 attn 분포의 가중 표준편차(σ_u,σ_v)를 계산해 마스크의 σ에 **log-ratio 회귀** `(logσ_attn−logσ_mask)²` (scale-free, floor 0.25px로 1px 마스크 σ=0 폭주 방지). **위치(1차 모멘트)는 loss 미포함 → center 경로 무접촉**. 게이트: matched valid + 마스크 ≥min_px + attn 질량 5%+가 해당 캠에 존재 + start_iter warmup. 신규 키 `loss_query_attn_sigma` + dbg(`ratio_u/v`(→1.0 목표), `raw`, `valid_count`) — DDP 일관성 위해 항상 prefill(z).
+- **`efficientocf_config.py`**: DEFAULTS 3키 — `query_attn_sigma_match_loss_weight`(**0.0=off 기본**, 기존 run 무영향)/`query_attn_sigma_match_start_iter`/`query_attn_sigma_match_min_mask_px`(4) + apply/검증.
+- **config**: `subset_attn_cover.py`(사용자 생성, subset_attn 복사본)에 weight **0.25**(초기 기여 ~0.3 = center_match의 1/5), start_iter **500**(≈1 epoch 후 개입) 활성. subset_attn 대비 단일변수 = σ-matching 3키.
+- **검증**: py_compile 3파일 / 합성 테스트(넓은 blob vs 좁은 마스크 → loss 0.59·ratio 2.7, gradient가 matched query attn에만, unmatched grad 0, weight=0→0, start_iter 전→0) / 양 config build+플래그 전파(subset_attn off | cover 0.25) OK. ⚠️ 실 forward smoke 미실행.
+- **판정**: `dbg_query_attn_sigma_ratio_u/v` → 1.0 수렴, `center_match`가 subset_attn 대비 ±5% 이내, 3~5 epoch 후 `probe_attn_geometry.py`(scratchpad) spearman 0.004→상승. ratio가 2 epoch 후에도 >2 정체면 weight ×2, center_match >10% 악화면 ÷2.
+
+## 2026-07-02 KST — camera-attn loss 카메라간 픽셀좌표 충돌 fix (`utils_loss.py`, `utils_matcher.py`, `subset_attn.py` 신규)
+
+- **배경 (대화 중 코드 리딩으로 발견, dbg 실측 아님)**: `_compute_query_attn_bbox_loss`(utils_loss.py)와 매칭 cost `_compute_query_attn_soft_iou_cost_qn`/`_compute_query_attn_inside_log_cost_qn`(utils_matcher.py) 전부, 예측 attn(`query_attn_weights_tqnhw` [T,Q,Ncam,H,W])을 `sum(dim=2)`로 카메라 축을 눌러 `[T,Q,H,W]`로, GT(`gt_inst_cam_mask_tnnhw`)는 `.any(dim=2)`로 OR해서 `[T,Ninst,H,W]`로 만든 뒤 비교하고 있었음. 두 값 다 카메라 정체성을 버리고 순수 배열 인덱스 `(h,w)`만으로 비교 — 서로 다른 카메라의 같은 `(h,w)`가 같은 슬롯으로 합쳐짐(원본 attn은 transformer cross-attention이 `S=Ncam*H*W` 전체에 대해 계산한 분포라 원래 카메라별로 고유 슬롯이 있었음, `transformer.py:558`).
+- **영향**: 한 객체가 카메라 여러 대에 걸쳐 보이거나(정상 케이스는 무해), 서로 다른 두 객체가 서로 다른 카메라의 우연히 같은 `(h,w)` 배열 인덱스에 투영되면 loss/매칭 cost가 이를 구분 못 하고 섞임. `query_attn_match_metric='inside_log'`(현재 활성 매칭 지표)와 `loss_query_attn_bbox`(`use_query_attn_bbox_loss=True`) 둘 다 영향권.
+- **수정**: 카메라 축을 미리 누르지 않고 `(Ncam,H,W)`를 하나의 축(`p = Ncam*H*W`)으로 flatten해서 비교. GT 타겟 빌더(`build_query_attn_bbox_targets`, utils_instance_img_debug.py)는 이미 카메라별로 안 뭉갠 `gt_inst_cam_mask_tnnhw`를 반환값에 포함하고 있었으나 아무도 안 쓰고 있었음 — 그걸 그대로 소비하도록 변경(빌더 자체는 무수정). Shape validation에 `ncam` 일치 체크 추가. `gt_inst_valid_tn`(인스턴스-프레임 유효성, `.any(dim=2)`)은 collision과 무관해 그대로 유지. 디버그 전용 `dbg_query_attn_bbox_empty_gt_mask`(efficientocf.py:3336, OR'd `gt_inst_mask_tnhw` 사용)는 그래디언트 무관 모니터링 값이라 무수정.
+- **검증**: py_compile 2파일 OK. 합성 텐서 단위테스트(scratchpad `test_attn_fix.py`) — 카메라만 다르고 `(h,w)`는 동일한 두 GT instance를 만들어 old 방식이면 충돌했을 상황 재현: `_compute_query_attn_inside_log_cost_qn`/`_compute_query_attn_soft_iou_cost_qn`/`_compute_query_attn_bbox_loss` 셋 다 자기 카메라·자기 인스턴스는 cost≈0, 다른 카메라의 동일 `(h,w)` 인스턴스는 cost 크게(≥5) 분리되는 것 확인. 전체 forward/학습 smoke는 미실행.
+- **config**: `subset_attn.py` 신규(내용은 `subset.py`와 100% 동일, 헤더에 실험 취지 주석만 추가) — 코드 fix가 config 무관(전역) 적용이라 새 하이퍼파라미터·값 변경 없음. 사용자 결정: GMO shape 계열(dice/tversky/weight/scale-spread) 안 얹고 순수 베이스라인 위 단일변수 ablation으로 검증.
+
+## 2026-07-02 KST — spread 정칙항 weight-loophole 봉쇄: 'visible' soft gate + 'violators' 정규화 (`subset_scale_offset_we.py`)
+
+- **배경 (dbg 실측, NOTES 2026-07-02 참조)**: subset_scale_offset ep1/ep10 forward 실측 결과 offset-only spread가 **크기 무관 ~3.5m 균일**(corr≈0), matched 42쌍 **전부 deficit=0 → 정칙항 무압력**. 원인 = σ-loophole의 weight 버전: 낮은 w '유령' 가우시안(~40/48개)이 정규화 질량의 60%+를 차지해 메트릭을 채우지만 점유(occ 임계 0.75)에는 안 나타남. 실제 가시 가우시안은 5~9개, 반경은 버스도 car-size(2.8m).
+- **`query_head.py`**: spread 가중에 **soft visibility gate** 추가 — `query_scale_spread_weight_mode='visible'`이면 `w_eff = sigmoid((peak − vis_thr)/0.1)`, peak = w(sigmoid/union: w=α opacity) 또는 1−exp(−w)(poisson). `1-exp(-w)` 단독은 w≤1에서 근사-선형이라 유령 억제 실패 → 임계 기준 gate 필수(합성 검증: 유령 질량 62%→**4.6%**). `__init__`에 `query_scale_spread_weight_mode`('raw' 기본)/`query_scale_spread_vis_threshold`(0.75) param+검증. tau=0.1은 하드코딩(주석).
+- **`utils_loss.py`**: `_compute_query_spread_reg_from_match`에 `norm_mode` param — 'matched'(기존 mean, 기본)/'violators'(deficit>0 쿼리 수로 정규화). visible 전환 후 위반자는 소수 대형뿐이라 matched-mean이면 1/K 희석으로 gradient 사멸(합성: 6쌍 중 1 위반 시 0.067 vs 0.40).
+- **`efficientocf.py`**: QueryHead에 `query_scale_spread_weight_mode`/`query_scale_spread_vis_threshold=self.occ_score_threshold` 전달, loss 호출에 `norm_mode` 전달.
+- **`efficientocf_config.py`**: DEFAULTS 2키 추가(`query_scale_spread_weight_mode`='raw', `query_scale_spread_norm_mode`='matched' — **기본값=기존 동작**, 진행 중인 run 재개 무영향) + apply/검증.
+- **config**: `subset_scale_offset_we.py`(사용자 생성 복사본)에 `weight_mode='visible'`/`norm_mode='violators'` 활성 + 근거 주석. weight 0.2/frac 0.5 유지(단일변수 = loophole 봉쇄만).
+- **검증**: py_compile 5파일 OK / 양 config build + 플래그 전파(qh.mode raw|visible, vis_thr 0.75) OK / 합성 수치: 버스형 raw spread 3.75m(충족·무압력)→visible 2.18m(deficit 1.17m 발생), gradient = 가시 가우시안 offset 바깥으로 + 유령 weight 올리기(opacity 레버), 균일 w(초기) 시 gate 균일→unweighted RMS 동일(초기 불안정 없음). ⚠️ 전체 forward smoke 미실행. ⚠️ CLAUDE.md가 언급하는 `EfficientOCF_V1.1_1gpu.py`는 repo에 부재 — efficientocf_config.py만 갱신.
+
+## 2026-07-01 KST — scale head / Lreg / budget 커플링 코드 전면 제거 (forcing-only 확정)
+
+- **배경**: forcing-only로 확정 → scale head의 유일한 소비처(천장 커플링)가 없어 dead code. 사용자 요청으로 완전 제거. (아래 2026-06-30~07-01의 scale head/Lreg/커플링 관련 항목은 이 제거로 **무효화**됨.)
+- **제거**:
+  - `query_head.py`: scale head 생성·`__init__` params/assignments·`query_inst_scale_q3` 예측·커플링 분기(→ 원래 고정 `off_max`/`sigmoid_to_sigma_from_range` 복원)·`_compute_gaussian_outputs` **6-tuple→5-tuple** 되돌림(두 unpack·양 outputs dict 포함).
+  - `efficientocf.py`: QueryHead scale wiring 4줄·`_last_query_inst_scale` 캐시(init+write)·forward_train Lreg 블록·aggregate `query_scale_loss` 전달.
+  - `utils_loss.py`: `_compute_query_scale_match_loss_from_match`·`_aggregate_training_losses` `query_scale_loss` param·`loss_query_scale` emit.
+  - `efficientocf_config.py`: scale DEFAULTS 5키(`use_query_scale_loss`/`query_scale_loss_weight`/`query_scale_couple_budget`/`query_scale_off_floor_m`/`query_scale_min_m`)+apply.
+  - `subset_scale.py`·`subset_scale_offset.py`: `use_query_scale_loss`/`query_scale_couple_budget` 줄.
+- **유지(forcing 경로)**: `gt_instance_sizes` 플러밍(voxel-AABB extent, loading/formating/Collect3D), `query_offset_spread_tq3`(query_head apply_lifted), `_gather_matched_gt_sizes`/`_normalize_gt_instance_ids/sizes`/`_compute_query_spread_reg_from_match`(utils_loss), `query_scale_spread_loss_weight(0.2)/target_frac(0.5)`, `loss_query_spread`.
+- **검증**: **repo 전체 제거 심볼 잔존 0** / py_compile 6파일 OK / Config.fromfile(subset_scale_offset) — spread 0.2 유지·scale 키 부재(KeyError 없음) / **QueryHead scale head 없이 빌드·`_compute_gaussian_outputs` 5-tuple 복귀·apply_lifted `query_offset_spread` 흐름·spread helper 동작**. ⚠️ 전체 build/forward smoke 미실행.
+
+## 2026-07-01 KST — spread forcing 메트릭을 offset-only로 교체 (σ-loophole 차단) + subset_scale_offset 신규
+
+- **배경**: 직전 forcing(subset_scale 실측, Epoch7)에서 `loss_query_spread`가 max 0.046/mean 0.0036으로 **사실상 미작동**. 원인 = 메트릭 `query_sigma=√(Σw(σ²+offset²))`가 **σ를 포함** → 모델이 offset을 분산 안 하고 **σ만 캡(3m)까지 키워** target 충족(=페널티 0). 로그상 spread가 epoch마다 0으로 수렴한 게 σ-loophole 증거.
+- **수정 = 메트릭에서 σ 제외**: `query_head.apply_lifted_centers_to_outputs`에 **offset-only 분산** `query_offset_spread_tq3 = √(Σ w·(mixture_center−query_center)²)` 노출(σ 무관, 가우시안 **중심 분포**만). spread 정칙항 target을 이것으로 → σ를 아무리 키워도 페널티 안 줄어 **offset을 실제로 움직여야만** 감소. gradient가 **offset head로만** 흐르는 것 E2E로 검증(offset grad 539 / sigma grad None).
+- **배선**: `efficientocf` 캐시 `self._last_query_sigma_world`→`self._last_query_offset_spread`(query_offset_spread_tq3). `utils_loss._compute_query_spread_reg_from_match` param `query_sigma_world_tq3`→`query_spread_tq3`(메트릭 무관), docstring/변수명 정리. 헬퍼 로직·정규화·one-sided·크기가중 없음(mean)·frac/weight 다 **동일**.
+- **config**: **가중치 변경 없음**(weight 0.2, frac 0.5 그대로). `subset_scale_offset.py`(subset_scale 복사본, 별도 work_dir용)를 active로 — 주석만 offset-metric 명시. 코드가 offset-only가 기본이라 subset_scale.py도 자동으로 offset metric(옛 σ metric 경로 제거).
+- **⚠️ 남은 watch-item(미변경)**: 희소한 버스가 mean-over-matched로 희석될 수 있음(gradient/K). 이번엔 단일변수(메트릭만) 원칙으로 안 건드림 — offset-metric으로 돌려보고 버스가 여전히 약하면 그때 크기가중/weight↑. center 아직 학습 중이라 초반 흔들림 가능(spread는 크기만 강제, 위치는 center_match).
+- **검증**: py_compile(4파일) OK / offset_spread 수식 σ-독립성(collapsed→0, spread→3.07) / 실제 `EfficientOCFLossMixin` 헬퍼 offset-spread 동작 / **QueryHead apply_lifted E2E**: query_offset_spread_tq3 outputs 흐름 + backward가 offset head만(σ head 0). ⚠️ 전체 build/forward smoke 미실행.
+
+## 2026-07-01 KST — forcing 추가: one-sided spread 정칙항 (`loss_query_spread`) — 큰 객체를 GT extent까지 펴기
+
+- **배경**: 직전 budget 커플링은 **천장(ceiling)만** per-query로 정함. 그런데 `offset_max=12`라 천장은 원래부터 버스를 안 막았음 → 커플링만으론 버스가 안 커짐(주효과는 차 조이기). 사용자 확인: 타 레포 실측상 **모든 객체가 차 크기로 collapse**. 원인은 ceiling이 아니라 **collapsed init + 먼 영역에서 약한 FN gradient**로 가우시안이 큰 GT를 못 채우고 차 크기 평형에 갇히는 것. 평형을 옮기려면 **밖으로 미는 항**이 필요.
+- **`_compute_query_spread_reg_from_match` (utils_loss.py) 신규**: matched query의 effective 2nd-moment 반경(`query_sigma_world`, 프레임 평균)을 `target_frac·0.5·GT_extent`까지 끌어올리는 **one-sided(relu) 정칙항**. 부족할 때만 밂 → 차/이미 큰 건 0, over-spread는 여전히 Tversky FP가 캡. xy는 `max(σx,σy)` vs `max(GTx,GTy)`(yaw/ego-transpose safe), z 별도. GT target은 detach, gradient는 offset/σ head로만(천장 off_max_q도 detached) → **scale head는 Lreg-only 유지**(충돌 0). query_sigma는 offset²를 포함 → 미는 힘이 σ(캡)보다 **offset을 키워 48개를 객체 전역에 분산** = collapsed init 직접 해소.
+- **공유 gather**: `_gather_matched_gt_sizes`로 id-매칭 gather를 Lreg/spread가 공유(중복 제거). 기존 `_compute_query_scale_match_loss_from_match`를 이 gather 사용으로 리팩터(동작 동일, 재검증).
+- **배선**: `efficientocf.py` `self._last_query_sigma_world` 캐시 + forward_train에서 `query_scale_spread_loss_weight>0`일 때 호출 → `_aggregate_training_losses(query_spread_loss=)` → `loss_query_spread` emit. (스칼라 placeholder 불필요 — offset/σ head는 occupancy loss로 매 iter grad 받음.)
+- **config**: `query_scale_spread_loss_weight`(기본 0.0=off)/`query_scale_spread_target_frac`(0.5) DEFAULTS+apply. 다른 config는 0.0이라 무영향.
+- **(최종) subset_scale = forcing-only**: 사용자 요청으로 **천장 커플링·scale head/Lreg를 OFF**(`use_query_scale_loss=False`, `query_scale_couple_budget=False`) → offset/sigma 캡은 **기존 전역 고정값(12 / 3·0.6) 그대로**, **spread 정칙항(0.2)만** 작동. 커플링/Lreg/scale-head 코드는 그대로 두고 flag로만 OFF(나중에 재활성 가능). spread의 GT-extent 타겟은 예측 scale이 아니라 voxel-AABB라 scale head 없이 동작. 검증: Config.fromfile로 게이트(F/F, spread 0.2) + 전역 캡(12/3·0.6) 유지 확인.
+- **천장+forcing 짝**: 예측 size→천장이 방을 열고, spread 정칙항이 그 방을 GT extent까지 채움. `frac=0.5`는 균등채움 2nd-moment(≈half/√3≈0.577)보다 보수적이라 달성가능·over-spread 안전.
+- **검증**: py_compile(4파일) OK / Config.fromfile(subset_scale) 키 확인 / **실제 `EfficientOCFLossMixin` helper 임포트·호출**(Lreg 스칼라, spread one-sided: 버스>차>0, weight=0→None·empty-match→placeholder 게이트) + 합성 gather 정렬·relu 거동 확인. ⚠️ 전체 build/forward smoke 미실행(데이터/GPU).
+
+## 2026-06-30 KST — per-query instance-scale head + Lreg + budget 커플링 (큰 객체 커버, subset_scale ON)
+
+- **목적**: 버스/트레일러 같은 큰 객체 under-coverage 해결. 지금까지 over-spread를 잡으려고 건 장치(Tversky α=0.7, sigma_max_z=0.6, offset_max 고정)가 **모든 query에 동일**해서, 차에 맞춰 조이면 큰 객체가 그 한도에 막혀 못 퍼짐. → query마다 객체 크기를 예측하고 그 크기로 가우시안 퍼짐 budget을 per-query로 정함.
+- **scale head (query_head.py)**: `gaussian_scale_head=GaussianHead(out_dim=3)` 추가(`query_scale_head_enabled`일 때만 생성). present-frame feature에서 `scale_q3 = scale_min + softplus(.)` [Q,3] (world x/y/z extent) 예측. `_compute_gaussian_outputs` 5-tuple→6-tuple(+`query_inst_scale_q3`); 두 호출부·outputs dict 전부 갱신. 33-tuple(`extract_feat_query`)은 **미변경** → 캐시 attr(`self._last_query_inst_scale`)로 loss에 전달해 eval/oracle 위치불변 unpack 안전.
+- **Lreg (utils_loss.py)**: `_compute_query_scale_match_loss_from_match` 신규 — 예측 scale과 **matched GT voxel-AABB span**의 L1. `_compute_query_center_match_loss_from_match`(실제 활성 경로)의 sibling로 추가(죽은 `utils_matcher.py:993` 안 건드림). GT size는 `gt_ids_n[matched_inst_idx]`로 **instance id 매칭 gather**(matcher 필터/순서 무관). `scale.sum()*0` placeholder 항상 포함 → zero-match 배치에서도 scale head가 grad 받아 **DDP static_graph 안전**. `_aggregate_training_losses`에 `query_scale_loss` param + `loss_query_scale` emit, forward_train에서 `use_query_scale_loss` gate로 호출.
+- **budget 커플링 (query_head.py, `query_scale_couple_budget`)**: `off_max_q = min(clamp(0.5·scale.detach(), off_floor), offset_max_global)`, `sigma_max_q = min(clamp(0.25·scale.detach(), sigma_min), sigma_max_global)`. **scale는 detach** → scale head는 Lreg로만 학습(occupancy loss가 안 끌어당김). xy는 `max(w,l)`로 **yaw-safe**(회전 객체 under-cover 방지), z는 half-height. 전역 offset/sigma_max 안쪽으로 **layer(min)** + off_floor(차 반-크기) 하한 → 기존 config 전부 그대로 로드, 작은 객체는 floor에 머물러 조여짐. 검증: 버스 xy budget 6m / 트레일러 9m / 차 2.25m / 보행자 floor 2.0m, sigma 음수 없음·cap 준수.
+- **size 타겟 소스 = voxel-AABB(max-over-frames)** (진짜 nuScenes box 대신): `build_instance_center_world_targets`가 center 계산하며 이미 `pts.min/max`를 뽑으므로 거기서 per-instance extent를 **프레임 최대값**으로 추가(occlusion 과소측정 완화). center와 **같은 id 공간**이라 정렬 무료. nuScenes `size`(loading_instance.py:344)는 cached voxel id↔annotation id 일치가 불확실 + plumbing hop 多라 보류. plumbing: build 4-tuple 반환 → `results['gt_instance_sizes']`(cache/non-cache 양 경로 + skip-list) → `formating.py` DC(stack=False) → `subset_scale.py` Collect3D(train+test).
+- **config**: `efficientocf_config.py` DEFAULTS+apply에 `use_query_scale_loss`(F)/`query_scale_loss_weight`(0.3)/`query_scale_couple_budget`(F)/`query_scale_off_floor_m`(2,2,0.4)/`query_scale_min_m`(0.4,0.4,0.2). QueryHead `__init__` 4 param + 생성부 wiring. **`subset_scale.py`는 전부 ON**(loss+couple, weight 0.3). 다른 config는 DEFAULTS OFF라 **무영향**(byte-identical). `EfficientOCF_V1.1_1gpu.py`는 tree에 없어 미러 불필요.
+- **검증**: 7개 수정파일 py_compile OK / mmcv Config.fromfile(subset_scale) 로드 + model_cfg 키 ON 확인 + Collect3D gt_instance_sizes(train+test) / 커플링·Lreg-gather 합성 단위테스트 통과(shape·size-ordering·cap·정렬). ⚠️ 진행 중 학습 미반영 — 다음 실행부터. 전체 모델 build/forward smoke는 미실행(데이터/GPU 필요).
+
 ## 2026-06-30 KST — oracle viz = normal viz로 통일 + footprint 복구 (두 레포)
 
 - **footprint 복구**: footprint 시각화(그리기)는 occ threshold 통일이 목적이었지 제거 대상이 아니었음(오해). `query_head.py`를 HEAD에서 복구 + rename(occ_score/fg_score) 재적용 → footprint 그림 그대로, 이진화는 `occ_score_threshold`로 통일. 검증: 1-GPU VIS smoke로 png 정상 렌더 확인. (앞서 footprint 메서드 제거 때 고아로 남은 `@staticmethod`가 `_get_query_vis_palette`를 깨뜨렸던 버그도 fix.)

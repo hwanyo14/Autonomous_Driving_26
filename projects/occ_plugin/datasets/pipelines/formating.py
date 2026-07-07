@@ -46,12 +46,18 @@ class OccDefaultFormatBundle3D(DefaultFormatBundle3D):
             results['segmentation_cls_instance3d'] = DC(to_tensor(results['segmentation_cls_instance3d']), stack=True)
         if 'gt_occ_inst' in results.keys():
             results['gt_occ_inst'] = DC(results['gt_occ_inst'], cpu_only=True, stack=False)
+        if 'gt_bbox_aabb' in results.keys():
+            results['gt_bbox_aabb'] = DC(results['gt_bbox_aabb'], cpu_only=True, stack=False)
         if 'gt_instance_centers_world' in results.keys():
             results['gt_instance_centers_world'] = DC(to_tensor(results['gt_instance_centers_world']), stack=True)
         if 'gt_instance_centers_valid' in results.keys():
             results['gt_instance_centers_valid'] = DC(to_tensor(results['gt_instance_centers_valid']), stack=False)
         if 'gt_instance_ids' in results.keys():
             results['gt_instance_ids'] = DC(to_tensor(results['gt_instance_ids']), stack=False)
+        if 'gt_instance_sizes' in results.keys():
+            results['gt_instance_sizes'] = DC(to_tensor(results['gt_instance_sizes']), stack=False)
+        if 'gt_instance_dims' in results.keys():
+            results['gt_instance_dims'] = DC(to_tensor(results['gt_instance_dims']), stack=False)
         if 'flow_bev' in results.keys():
             results['flow_bev'] = DC(to_tensor(results['flow_bev']), stack=True)
         if 'height' in results.keys():

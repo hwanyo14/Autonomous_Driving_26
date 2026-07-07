@@ -1,0 +1,2 @@
+cd /NHNHOME/WORKSPACE/0526040009_A/hwanhee/Autonomous_Driving_26_ksh_0630/projects/occ_plugin/ops/occ_pooling
+python setup.py build_ext --inplace

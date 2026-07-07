@@ -395,6 +395,9 @@ class QueryHead(nn.Module):
                  query_multi_gaussian_softplus_bias_init=-2.0,
                  query_multi_gaussian_weight_reg_loss_weight=1e-3,
                  query_multi_gaussian_weight_reg_target_sum=1.0,
+                 query_scale_spread_weight_mode="raw",
+                 query_scale_spread_vis_threshold=0.75,
+                 query_size_note_enabled=False,
                  gaussian_truncate_sigma=3.0,
                  point_cloud_range=None,
                  spatial_extent3d=None,
@@ -613,6 +616,33 @@ class QueryHead(nn.Module):
                 "query_multi_gaussian_weight_reg_loss_weight must be >= 0, "
                 f"got {self.query_multi_gaussian_weight_reg_loss_weight}"
             )
+        self.query_scale_spread_weight_mode = str(query_scale_spread_weight_mode).lower()
+        if self.query_scale_spread_weight_mode not in ("raw", "visible"):
+            raise ValueError(
+                "query_scale_spread_weight_mode must be 'raw' or 'visible', "
+                f"got {self.query_scale_spread_weight_mode}"
+            )
+        self.query_scale_spread_vis_threshold = float(query_scale_spread_vis_threshold)
+        if not (0.0 < self.query_scale_spread_vis_threshold < 1.0):
+            raise ValueError(
+                "query_scale_spread_vis_threshold must be in (0,1), "
+                f"got {self.query_scale_spread_vis_threshold}"
+            )
+        # size note ("크기 쪽지"): aux size head(w,l 회귀) + note 투영(additive 주입).
+        # note_proj는 zero-init — 학습 시작 시점엔 주입이 항등(no-op)이라 안전.
+        self.query_size_note_enabled = bool(query_size_note_enabled)
+        self.query_size_aux_head = None
+        self.query_size_note_proj = None
+        if self.query_size_note_enabled:
+            d_model = int(self.embed_dim)
+            self.query_size_aux_head = nn.Sequential(
+                nn.Linear(d_model, 64),
+                nn.ReLU(inplace=True),
+                nn.Linear(64, 2),
+            )
+            self.query_size_note_proj = nn.Linear(5, d_model)
+            nn.init.zeros_(self.query_size_note_proj.weight)
+            nn.init.zeros_(self.query_size_note_proj.bias)
         self.query_multi_gaussian_weight_reg_target_sum = float(query_multi_gaussian_weight_reg_target_sum)
         if self.query_multi_gaussian_weight_reg_target_sum <= 0.0:
             raise ValueError(
@@ -1842,6 +1872,7 @@ class QueryHead(nn.Module):
         outputs: dict,
         centers_world: torch.Tensor,
         detach_query_for_center: bool = None,
+        size_note_attn_sigma_tq2: torch.Tensor = None,
     ) -> dict:
         if not isinstance(outputs, dict):
             raise TypeError("outputs must be a dict returned by QueryHead.forward")
@@ -1866,6 +1897,29 @@ class QueryHead(nn.Module):
         pc_max = centers_world.new_tensor(self.point_cloud_range[3:])
         centers_world = torch.max(torch.min(centers_world, pc_max), pc_min)
         center_logits = self._world_to_range_logits(centers_world)
+
+        # ---- size note ("크기 쪽지"): gaussian head들이 객체 크기를 알고 뿌리게 ----
+        # 성분 5개 [logσu, logσv, log d, log w_pred, log l_pred]를 zero-init 투영으로
+        # center_input에 additive 주입. 전부 detach — gaussian head gradient가 attention/
+        # depth/aux head로 역류해 이들을 왜곡하는 지름길 차단(aux는 자기 L1로만 학습).
+        query_size_aux_pred_tq2 = None
+        if self.query_size_note_enabled:
+            query_size_aux_pred_tq2 = F.softplus(self.query_size_aux_head(query_feat_tqd))  # [T,Q,2] (w,l)
+            t_n, q_n = query_feat_tqd.shape[:2]
+            if torch.is_tensor(size_note_attn_sigma_tq2) and tuple(size_note_attn_sigma_tq2.shape[:2]) == (t_n, q_n):
+                sig_tq2 = size_note_attn_sigma_tq2.to(device=query_feat_tqd.device, dtype=query_feat_tqd.dtype)
+            else:
+                sig_tq2 = query_feat_tqd.new_zeros((t_n, q_n, 2))
+            d_tq1 = centers_world[..., :2].norm(dim=-1, keepdim=True)
+            note_tq5 = torch.cat(
+                (
+                    sig_tq2.clamp_min(1e-2).log(),
+                    d_tq1.clamp_min(0.5).log(),
+                    query_size_aux_pred_tq2.clamp(0.3, 25.0).log(),
+                ),
+                dim=-1,
+            ).detach()
+            center_input_tqd = center_input_tqd + self.query_size_note_proj(note_tq5)
 
         (
             query_sigma_world_tq3,
@@ -1897,6 +1951,32 @@ class QueryHead(nn.Module):
                 query_feat_tqd=query_feat_tqd,
             )
 
+        # Offset-only spread: 2nd-moment of the gaussian CENTERS around the query
+        # center, EXCLUDING sigma. The spread-forcing loss targets THIS so it must
+        # move the offsets (distribute the 48 gaussians) — growing sigma does not
+        # reduce it (closes the "sigma-only blob" loophole).
+        # weight_mode='visible': weight by a soft visibility gate — only gaussians
+        # whose SINGLE-gaussian peak occ contribution clears the occ threshold count
+        # toward the spread (closes the weight-loophole: low-w "ghost" gaussians can
+        # no longer fill the metric; the target is only met by placing gaussians that
+        # actually materialize in occupancy). peak = w for sigmoid/union (w=alpha
+        # opacity), 1-exp(-w) for poisson-style additive weights. 1-exp(-w) 단독으론
+        # w≤1에서 근사-선형이라 유령 억제가 안 됨 → 임계 기준 sigmoid gate(tau=0.1).
+        query_offset_spread_tq3 = None
+        if torch.is_tensor(mixture_centers_world_tqg3) and torch.is_tensor(mixture_weights_tqg):
+            eff_off_tqg3 = mixture_centers_world_tqg3 - centers_world.unsqueeze(2)
+            w_tqg = mixture_weights_tqg
+            if self.query_scale_spread_weight_mode == "visible":
+                peak_tqg = (
+                    w_tqg if self.query_multi_gaussian_weight_mode == "sigmoid"
+                    else 1.0 - torch.exp(-w_tqg)
+                )
+                w_tqg = torch.sigmoid((peak_tqg - self.query_scale_spread_vis_threshold) / 0.1)
+            w_sur_tqg = w_tqg / w_tqg.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            query_offset_spread_tq3 = torch.sqrt(
+                (w_sur_tqg.unsqueeze(-1) * eff_off_tqg3.pow(2)).sum(dim=2).clamp_min(1e-8)
+            )
+
         outputs = dict(outputs)
         outputs.update({
             "centers_world_tq3": centers_world,
@@ -1906,6 +1986,8 @@ class QueryHead(nn.Module):
             "mixture_sigmas_world_tqg3": mixture_sigmas_world_tqg3,
             "mixture_yaw_tqg": mixture_yaw_tqg,
             "mixture_weights_tqg": mixture_weights_tqg,
+            "query_offset_spread_tq3": query_offset_spread_tq3,
+            "query_size_aux_pred_tq2": query_size_aux_pred_tq2,
             "traj_motion_input_tqd2": traj_motion_input_tqd2,
             "traj_logits_fq2": traj_logits_fq2,
             "traj_offsets_fq2": traj_offsets_fq2,
@@ -2924,6 +3006,7 @@ class QueryHead(nn.Module):
         point_class_ids_all: torch.Tensor = None,
         point_weights_all: torch.Tensor = None,
         query_vis_bundle: dict = None,
+        eval_cmp_pack: dict = None,
     ) -> None:
         """
         Query-center-focused BEV visualization.
@@ -3129,6 +3212,17 @@ class QueryHead(nn.Module):
 
         use_score_bundle = isinstance(query_vis_bundle, dict)
         skip_traj_rows = bool(query_vis_bundle.get("_skip_traj_rows", False)) if use_score_bundle else False
+        # eval 비교 행 입력: simple_test가 metric 채점에 쓴 pred/GT BEV 그대로 —
+        # matched 행을 교체 렌더 (임계값·정렬·기준프레임이 metric과 정의상 동일).
+        eval_cmp_pred_np = None
+        eval_cmp_gt_np = None
+        eval_cmp_iou_t = []
+        if isinstance(eval_cmp_pack, dict):
+            _ecp = eval_cmp_pack.get("pred_bev_t", None)
+            _ecg = eval_cmp_pack.get("gt_bev_t", None)
+            if torch.is_tensor(_ecp) and torch.is_tensor(_ecg) and _ecp.dim() == 3 and _ecg.dim() == 3:
+                eval_cmp_pred_np = _ecp.detach().cpu().numpy().astype(np.bool_)
+                eval_cmp_gt_np = _ecg.detach().cpu().numpy().astype(np.bool_)
         bundle_top_k = 0
         bundle_score_thr = float(getattr(self, "fg_score_threshold", 0.5))
         bundle_w_iou = 0.5
@@ -3677,6 +3771,22 @@ class QueryHead(nn.Module):
                 _overlay_pred_bev(hi_ov, pred_bev, gt_bev, hi_color)
                 _overlay_pred_bev(hi_cls_ov, pred_bev, gt_bev, hi_color)
 
+            # eval 비교 행: matched 대신 'eval 실제 pred occ(빨강) vs bbox AABB GT(초록), 겹침 흰색'
+            if (
+                eval_cmp_pred_np is not None and eval_cmp_gt_np is not None
+                and t < int(eval_cmp_pred_np.shape[0]) and t < int(eval_cmp_gt_np.shape[0])
+                and tuple(eval_cmp_pred_np.shape[1:]) == (Y, X) == tuple(eval_cmp_gt_np.shape[1:])
+            ):
+                _ep = eval_cmp_pred_np[t]
+                _eg = eval_cmp_gt_np[t]
+                matched_ov = np.zeros((Y, X, 3), dtype=np.uint8)
+                matched_ov[_eg & ~_ep] = (0, 190, 60)
+                matched_ov[_ep & ~_eg] = (220, 45, 40)
+                matched_ov[_ep & _eg] = (255, 255, 255)
+                _ei = int((_ep & _eg).sum())
+                _eu = int((_ep | _eg).sum())
+                eval_cmp_iou_t.append((_ei / _eu) if _eu > 0 else float("nan"))
+
             if ego_visible:
                 for row_canvas in (gt_rgb, gt_cls_rgb, all_ov, hi_ov, hi_cls_ov, matched_ov, traj_ov):
                     self._draw_cross_marker(
@@ -3814,7 +3924,11 @@ class QueryHead(nn.Module):
             else:
                 draw.text((x0 + 2, y1 + 2), f"t={t} all={stats_valid[t]} hi={stats_hi[t]} lo={stats_lo[t]}", fill=(255, 255, 255))
             draw.text((x0 + 2, y2 + 2), f"hi(class)={stats_hi[t]}", fill=(255, 255, 255))
-            draw.text((x0 + 2, y3 + 2), f"matched={stats_matched[t]}", fill=(255, 255, 255))
+            draw.text(
+                (x0 + 2, y3 + 2),
+                (f"pred occ vs bbox_aabb  IoU={eval_cmp_iou_t[t]:.3f}"
+                 if t < len(eval_cmp_iou_t) else f"matched={stats_matched[t]}"),
+                fill=(255, 255, 255))
             if not skip_traj_rows:
                 draw.text((x0 + 2, y4 + 2), "refined traj", fill=(255, 255, 255))
             if (not skip_traj_rows) and has_base_traj_row:
@@ -4176,6 +4290,7 @@ class QueryHead(nn.Module):
         point_class_ids_all: torch.Tensor = None,
         point_weights_all: torch.Tensor = None,
         query_vis_bundle: dict = None,
+        eval_cmp_pack: dict = None,
     ) -> None:
         """
         Loss on/off와 무관하게 query debug visualization만 저장한다.
@@ -4323,6 +4438,7 @@ class QueryHead(nn.Module):
             point_class_ids_all=point_class_ids_all,
             point_weights_all=point_weights_all,
             query_vis_bundle=query_vis_bundle,
+            eval_cmp_pack=eval_cmp_pack,
         )
 
         if (
@@ -4374,116 +4490,6 @@ class QueryHead(nn.Module):
                 torch.save(sidecar, out_path)
             except Exception:
                 pass
-
-    def compute_gmo_dice_loss(
-        self,
-        pred_occ: torch.Tensor,
-        gt_occ,
-        gmo_ids=(2, 3, 4, 5, 6, 7, 9, 10),
-        ignore_index: int = 255,
-        pred_layout: str = "zyx",
-        loss_weight: float = 1.0,
-        smooth: float = 1.0,
-        eps: float = 1e-6,
-        include_bg: bool = False,
-        pred_is_logits: bool = False,
-    ):
-        """
-        GMO binary Dice loss.
-
-        Args:
-            pred_occ:
-                [T,1,Z,*,*] 또는 [T,Z,*,*]. (prob 또는 logits)
-            gt_occ:
-                list/tuple or tensor. 보통 list length>=T, each [1,X,Y,Z] 정수 라벨.
-            gmo_ids:
-                positive(1)로 매핑할 GT class id 집합.
-            pred_layout:
-                "zyx"이면 pred spatial dims를 [Z,Y,X]로 해석 후 [Z,X,Y]로 정렬.
-                "zxy"이면 이미 [Z,X,Y]로 가정.
-            include_bg:
-                True면 background dice도 함께 평균.
-            pred_is_logits:
-                True면 sigmoid 후 Dice 계산.
-        Returns:
-            dict(loss_gmo_dice=...)
-        """
-        pred = self._pred_occ_to_zxy(pred_occ, pred_layout=pred_layout)
-
-        T_pred = int(pred.shape[0])
-
-        # gt_occ -> [T, X, Y, Z]
-        if isinstance(gt_occ, (list, tuple)):
-            gt_occ_t = torch.stack(gt_occ, dim=0)
-        elif torch.is_tensor(gt_occ):
-            gt_occ_t = gt_occ
-        else:
-            raise TypeError(f"gt_occ must be list/tuple/tensor, got {type(gt_occ)}")
-
-        # Supported layouts:
-        # - [T,1,X,Y,Z]
-        # - [1,T,1,X,Y,Z]
-        # - [T,X,Y,Z]
-        if gt_occ_t.dim() == 6 and gt_occ_t.shape[0] == 1 and gt_occ_t.shape[2] == 1:
-            gt_occ_t = gt_occ_t[0, :, 0]  # [T,X,Y,Z]
-        elif gt_occ_t.dim() == 5 and gt_occ_t.shape[1] == 1:
-            gt_occ_t = gt_occ_t[:, 0]     # [T,X,Y,Z]
-        elif gt_occ_t.dim() == 4:
-            pass
-        else:
-            raise ValueError(f"Unsupported gt_occ shape for dice: {tuple(gt_occ_t.shape)}")
-
-        if gt_occ_t.shape[0] < T_pred:
-            raise ValueError(f"gt_occ time dim too short: {gt_occ_t.shape[0]} < {T_pred}")
-        if gt_occ_t.shape[0] != T_pred:
-            gt_occ_t = self._select_temporal_gt_for_prediction(gt_occ_t, T_pred)
-
-        # [T,X,Y,Z] -> [T,Z,X,Y]
-        gt_occ_t = gt_occ_t.permute(0, 3, 1, 2).contiguous()
-        gt_occ_gmo = self.gt_occ_to_gmo_binary(
-            gt_occ_t, gmo_ids=gmo_ids, ignore_index=ignore_index
-        )
-
-        valid = (gt_occ_gmo != ignore_index).float()
-        target_fg = (gt_occ_gmo == 1).float()
-
-        pred_f = pred.to(torch.float32)
-        if pred_is_logits:
-            pred_f = torch.sigmoid(pred_f)
-        pred_f = pred_f.clamp(min=float(eps), max=1.0 - float(eps))
-
-        # apply valid mask
-        p_fg = pred_f * valid
-        t_fg = target_fg * valid
-
-        p_fg_flat = p_fg.reshape(T_pred, -1)
-        t_fg_flat = t_fg.reshape(T_pred, -1)
-        valid_flat = valid.reshape(T_pred, -1)
-
-        inter_fg = (p_fg_flat * t_fg_flat).sum(dim=1)
-        den_fg = p_fg_flat.sum(dim=1) + t_fg_flat.sum(dim=1)
-        dice_fg = (2.0 * inter_fg + float(smooth)) / (den_fg + float(smooth) + float(eps))
-
-        if include_bg:
-            p_bg = (1.0 - pred_f) * valid
-            t_bg = (1.0 - target_fg) * valid
-            p_bg_flat = p_bg.reshape(T_pred, -1)
-            t_bg_flat = t_bg.reshape(T_pred, -1)
-
-            inter_bg = (p_bg_flat * t_bg_flat).sum(dim=1)
-            den_bg = p_bg_flat.sum(dim=1) + t_bg_flat.sum(dim=1)
-            dice_bg = (2.0 * inter_bg + float(smooth)) / (den_bg + float(smooth) + float(eps))
-            dice = 0.5 * (dice_fg + dice_bg)
-        else:
-            dice = dice_fg
-
-        valid_frames = (valid_flat.sum(dim=1) > 0)
-        if not valid_frames.any():
-            z = pred_f.sum() * 0.0
-            return {"loss_gmo_dice": z}
-
-        loss = (1.0 - dice[valid_frames]).mean() * float(loss_weight)
-        return {"loss_gmo_dice": loss}
 
     def compute_objectness_loss(
         self,
