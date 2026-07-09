@@ -5,6 +5,40 @@
 # [occ 실험] semantic cls를 binary {0=bg, 1=fg}로 통합한 config (car/truck/... 구분 제거).
 # 변경 방법/디버깅 가이드: 레포 루트의 BINARY_FG_CLS_CHANGES.md 참고.
 # 스위치는 model_cfg의 query_cls_binary_fg=True (+ num_classes=2, weights 2개). moving/static과 무관.
+#
+# [attn 실험] camera-attn loss 카메라간 픽셀좌표 충돌 버그 수정 검증용. subset.py와 config 값은
+# 100% 동일(단일변수 = 코드 수정만, 새 하이퍼파라미터 없음). 버그/수정 내용은 NOTES.md
+# 2026-07-02 "camera-collision" 항목, CHANGELOG.md 동일 날짜 항목 참고.
+# 수정 대상: utils_loss.py(_compute_query_attn_bbox_loss), utils_matcher.py
+#   (_compute_query_attn_soft_iou_cost_qn, _compute_query_attn_inside_log_cost_qn).
+# 요지: attn map을 카메라 축(Ncam) 합/OR로 눌러 H×W로 비교하던 것을, (Ncam,H,W)를 통째로
+#   flatten해서 비교하도록 변경. 이전엔 서로 다른 카메라의 같은 (h,w) 배열 인덱스가 같은
+#   슬롯으로 취급돼 attn mass/IoU가 섞일 수 있었음(scale/offset/GMO 계열과 무관, attn 전용).
+#
+# [_aabb_dice 실험 2026-07-07] focal-bbox(_aabb) 후속 — bbox 감독을 focal에서 dice(tversky)로 이동.
+#   단일변수(baseline subset_attn_cover 대비) = query_gmo_dice_inst3d_weight(0.1)/
+#   query_gmo_dice_bbox_weight(0.9). focal은 inst3d 1.0/bbox 0으로 baseline 복귀.
+# 근거(_aabb ep9 512샘플 실측, NOTES/CHANGELOG 2026-07-07): focal-bbox 0.9는 TP+14%·FN-4%로
+#   벌리는 덴 성공했지만 '비관용FP(box 밖) +30%'로 IoU·Recall3d 전부 악화 — focal은 FP에 관대해
+#   box 밖에서 멈추는 힘이 없음. tversky는 α=0.7 FP-heavy라 GT를 bbox로 주면
+#   "box 안 확장 허용 + box 밖 강벌"이 정확히 구현됨 (utils_loss.py dice 혼합 주석 참조).
+# dice는 기존 2D(z-collapse) 모드 유지 (query_gmo_dice_3d=False, 단일변수 원칙 — 사용자 지정).
+# bbox GT = data/efficientocf_bboxcls_v3 (train 23,930 전체; ped-포함 cache-parity id 체계.
+#   v2(val용)는 ped-제외 번호라 학습 loss에 쓰면 안 됨 — NOTES 2026-07-06 id 체계 참조).
+# 모니터: dbg_gmo_dice_inst3d vs dbg_gmo_dice_bbox (pair 평균), dbg_gmo_dice_bbox_pair_count.
+#   eval에선 비관용FP([recall3d comps])가 base·_aabb 대비 줄었는지가 1차 판정 기준.
+#
+# [_cover 실험 2026-07-02] 위 attn fix 위에 σ-matching(attn 폭 감독) 추가 — subset_attn 대비
+# 단일변수 = query_attn_sigma_match_* 3키.
+# 근거(ep10 dbg 실측, NOTES 2026-07-02): attn은 카메라·중심은 잘 잡지만(질량 80~90%가 올바른 캠)
+#   폭이 크기 무관 고정(σ_attn 8~14px vs σ_mask 1.7~6.3px, corr(σ×depth, GT크기)=0.004) —
+#   inside-mass가 '총량'만 채점해 폭이 감독 없는 자유변수였기 때문.
+# 동작: matched query의 attn 2차 모멘트(σ_u,σ_v)를 GT cam 마스크 σ에 log-ratio 회귀.
+#   위치(1차 모멘트)는 loss 미포함 → center 경로 무접촉 (attn이 왼쪽으로 치우쳐 있어도
+#   위치 gradient 0, 폭만 마스크를 따라감).
+# 판정: dbg_query_attn_sigma_ratio_u/v → 1.0 수렴 여부, center_match가 subset_attn 대비
+#   ±5% 이내인지, 3~5 epoch 후 probe(scratchpad probe_attn_geometry.py) spearman 상승 여부.
+# 조정: ratio가 2 epoch 후에도 >2 정체면 weight 0.25→0.5, center_match >10% 악화면 ÷2.
 
 # Basic params ******************************************
 _base_ = ['../datasets/custom_nus-3d.py', '../_base_/default_runtime.py']
@@ -36,6 +70,8 @@ nusc_root = './data/nuscenes/'
 occ_dt_path = "./data/occ_dt"
 segmentation_cls_dataset_path = "./data/efficientocf_bboxcls/"
 gt_occ_inst_dataset_path = "./data/nuScenes-Occupancy_inst3d/"
+# focal3d bbox 혼합용 AABB GT (train 전용 v3 캐시, gt_occ_inst와 동일 id 공간)
+gt_bbox_aabb_dataset_path = "./data/efficientocf_bboxcls_v3/"
 
 # Query/GMO foreground semantic classes use sparse raw nuScenes occupancy ids:
 # [2, 3, 4, 5, 6, 9, 10] + background(0); pedestrian(7) excluded
@@ -114,8 +150,8 @@ bda_aug_conf = dict(
     flip_dy_ratio=0.5,
 )
 
-# train_capacity = 23930  # default: use all sequences
-train_capacity = 4000  # 3880
+train_capacity = 23930  # default: use all sequences
+# train_capacity = 4000  # 3880
 # train_capacity = 7  # 3880
 
 test_capacity = 5119  # default: use all sequences
@@ -140,6 +176,8 @@ train_pipeline = [
         validate_segmentation_cls_instance3d_alignment=validate_segmentation_cls_instance3d_alignment,
         load_gt_occ_inst=True,
         gt_occ_inst_dataset_path=gt_occ_inst_dataset_path,
+        load_gt_bbox_aabb=True,
+        gt_bbox_aabb_dataset_path=gt_bbox_aabb_dataset_path,
         exclude_occ_class_ids=exclude_occ_class_ids,
     ),
     dict(
@@ -186,10 +224,10 @@ train_pipeline = [
             'segmentation_instance3d',
             'segmentation_cls_instance3d',
             'gt_occ_inst',
+            'gt_bbox_aabb',
             'gt_instance_centers_world',
             'gt_instance_centers_valid',
             'gt_instance_ids',
-            'gt_instance_sizes',
             'occ_dt',
         ],
         meta_keys=(
@@ -288,7 +326,6 @@ test_pipeline = [
             'gt_instance_centers_world',
             'gt_instance_centers_valid',
             'gt_instance_ids',
-            'gt_instance_sizes',
             'occ_dt',
         ],
         meta_keys=['pc_range', 'occ_size', 'scene_token', 'lidar_token'],
@@ -364,6 +401,11 @@ model_cfg = dict(
     use_segmentation_as_query_gt=True,
     use_gmo_bce_loss=True,
     query_gmo_loss_type='focal',
+    # [_aabb_dice 실험] focal은 baseline 복귀(inst3d 1.0), dice를 0.1 inst3d + 0.9 AABB로 혼합.
+    query_gmo_focal_inst3d_weight=1.0,
+    query_gmo_focal_bbox_weight=0.0,
+    query_gmo_dice_inst3d_weight=0.1,
+    query_gmo_dice_bbox_weight=0.9,
     # [dice 실험] focal-only는 over-spread에서 occ focal이 clamp 포화 + 전격자 mean 희석으로
     # FP gradient ≈0 → shape 못 잡음(NOTES 2026-06-25). Tversky(FP-heavy)를 켜서 FP를
     # foreground 크기로 정규화 → 퍼짐에 안 사라지는 gradient 부여. 격자 불변, β가 recall 방어.
@@ -394,9 +436,25 @@ model_cfg = dict(
     query_attn_bbox_other_weight=0.3,
     query_attn_bbox_other_mode='union',
     query_attn_bbox_unmatched_weight=0.0,
+    # σ-matching (attn 폭 감독) — 파일 상단 [_cover 실험] 주석 참고.
+    # 0.25 = 초기 기여 ~0.3 (raw ~0.5-0.8×2축) — center_match(~1.7)의 1/5 수준으로
+    #   폭은 당기되 위치 감독을 못 이기는 세기. inside-mass(총량)·other(0.3)는 그대로 병행.
+    query_attn_sigma_match_loss_weight=0.25,
+    # 1 epoch(8GPU subset ≈ 500 iter) 후 개입: center/attn이 자리 잡기 전에 폭을 당기면
+    #   co-training이 흔들릴 수 있어 warmup.
+    query_attn_sigma_match_start_iter=500,
+    query_attn_sigma_match_min_mask_px=4,
     query_require_history_all_valid=True,
     query_attn_cam_gaussian_truncate_sigma=1.777,
     query_num_queries=200,
+    # [_pyr 실험 2026-07-09] query cross-attention을 coarse->fine KV 해상도 피라미드 3-layer로 확장.
+    # 자매 레포 jhh_gi -> ksh_local 이식분(NOTES/CHANGELOG 2026-07-07)을 이 레포 코드(transformer.py,
+    # efficientocf_config.py, efficientocf.py)에 동일 이식. data_config['input_size']=(896,1600),
+    # img_neck(SECONDFPN)이 4-stage를 전부 stride16으로 합치므로 context feature 원본 해상도는
+    # (56,100)(896/16, 1600/16) — 마지막 layer를 이 값으로 맞춰야 σ-matching/attn 시각화가 깨지지 않음.
+    # layer1(14,25) 전역 대략 위치 -> layer2(28,50) 중간 정제 -> layer3(56,100) 원본 해상도 정밀화.
+    query_transformer_num_layers=3,
+    query_transformer_kv_resolutions=((14, 25), (28, 50), (56, 100)),
     query_cls_match_cost_weight=0.2,
     query_center_match_cost_weight=10.0,
     query_temporal_offset_match_cost_weight=0.0, #0으로 제거
@@ -474,24 +532,6 @@ model_cfg = dict(
     query_multi_gaussian_occ_combine_mode='union',
     query_multi_gaussian_softplus_bias_init=0.0,
     query_multi_gaussian_weight_reg_loss_weight=0.0,
-    # ===== [per-query instance scale] 큰 객체 커버 — forcing-only (OFFSET metric) ===========
-    # 천장(budget) 커플링·scale head/Lreg는 OFF → offset/sigma 캡은 위 전역 고정값(기존) 그대로.
-    # forcing(one-sided spread 정칙항)만 사용: matched query의 OFFSET-only 분산(=가우시안 중심
-    #   분포, σ 제외)을 0.5·GT_half_extent까지 끌어올림(부족할 때만). σ를 빼서 σ-blob 대신
-    #   offset을 실제로 움직이게 강제(σ만 키우면 페널티 안 줄어듦). 차/이미 큰 건 영향 0,
-    #   over-spread는 Tversky FP가 캡. GT extent = voxel-AABB(max-over-frames).
-    query_scale_spread_loss_weight=0.2,
-    query_scale_spread_target_frac=0.5,
-    # [_we 변경 2026-07-02] weight-loophole 봉쇄 (subset_scale_offset dbg 실측 근거):
-    #   raw 모드에선 낮은 w '유령' 가우시안들이 정규화 질량의 60%+를 차지해 spread 메트릭을
-    #   크기 무관 ~3.5m로 채워버림(corr(GT크기,spread)≈0, 전 쌍 deficit=0 → 정칙항 무압력).
-    # 'visible' = 단일 가우시안 피크 점유 기여(sigmoid/union이라 peak=w=α)가 occ 임계
-    #   (occ_score_threshold=0.75)를 넘는지의 soft gate(sigmoid, tau=0.1)로 가중 →
-    #   점유에 실제 보이는 가우시안만 spread에 집계, target 충족은 고-w를 멀리 보내야만 가능.
-    query_scale_spread_weight_mode='visible',
-    # 'violators' = matched 전체 mean(1/K 희석) 대신 deficit>0 쿼리 수로 정규화.
-    #   visible 전환 후 위반자는 소수 대형 객체뿐이라 matched-mean이면 gradient가 죽음.
-    query_scale_spread_norm_mode='violators',
     # eval도 학습과 동일하게 16개 mixture를 그대로 splat (평균 타원 X). occ_combine_mode=union 적용.
     query_eval_occ_use_mixture=True,
     # ===== [임계값 1/2] occ 점유 판정 =====================================

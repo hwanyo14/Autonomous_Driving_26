@@ -1,5 +1,32 @@
 # NOTES
 
+## 2026-07-09 KST — [실측] 07-06 eval GT 교체에 의한 full ep11 Recall3d 단절(0.347→0.304)의 원인 분해
+- **비교 대상 확정**: before=work_dirs/full/eval/20260706_095001(구 GT), after=20260706_162941(신 GT), 둘 다 epoch_11(체크포인트 저장 09:18, epoch_12는 18:15라 동일)·동일 knob(같은 샘플수 비교에서 IoU2d(bbox_aabb) 0.1521 vs 0.1515로 사실상 동일 = pred 동일 방증). fixed_val이라 같은 N끼리 비교 가능 — 갭은 @768 −0.042 / @1536 −0.044 / 완주 −0.043으로 전 구간 일정. **순수 GT 교체 효과 = −0.043.**
+- **bbox v2 교체는 범인이 아님 (기존 추정 정정)**: val 500키×7프레임 voxel 대조 결과 **구 bboxcls(ped 제외) ⊂ v2가 정확히 성립** — 구캐시에만 있는 voxel 문자 그대로 0개. 즉 val에서 "v2가 제거한 생성소멸 누수 box"는 실존하지 않음(NOTES 07-06의 '누수 5/39'는 loader 렌더 기준 표본 관찰이었고 v2 대비로는 0). v2는 오히려 box를 **복원**(+1.26% 미래 프레임 voxel, f3 0.6%→f6 1.8% 단조 증가, 102/500키에서 1k+ voxel) → 관용항 확대 = recall **상승** 방향 소폭. IoU2d(bbox_aabb)가 ±0.5%밖에 안 움직인 것도 이것으로 설명.
+- **주범 = 같은 날 함께 배선된 3D GT 교체(gt_occ→gt_inst, 1단계)**: val 150키 present 프레임 실측 — inst3d(ped 제외) = raw gt_occ movable의 **79.0%** (잔여 21.0% 제거; 키별 중앙 14.5% / 평균 19.6% / p90 42% / 최악 100%, heavy-tail). inst3d∖raw = 0 (완전 부분집합). **잔여의 94.7%가 v2 box 밖** → 모델이 거기 예측해둔 voxel이 TP(분자)→비관용FP(분모 잔류)로 전환, 예측 안 한 부분만 FN 소멸(분모 감소). Recall3d는 분모의 ~87%가 비관용FP인 구조(07-07 comps: 비관용FP 7.4억 vs FN 0.75억)라 이 전환에 최대 감도. 미시 산술상 −0.043이 닫히려면 모델이 잔여를 대부분 덮고 있었어야 하는데, 잔여 = annotation box가 없는 실물 movable(저가시성 skip·pc_range 경계 whole-box drop·box 밖 삐짐)이라 카메라 모델이 실제로 예측하는 영역임 + macro 평균이 heavy-tail(잔여 42~100% 샘플)에서 증폭 → 정합. 반면 IoU3d는 FN 감소가 상쇄해 +4%(0.0326→0.0340) 상승.
+- **valid(255) 마스크 제거 효과는 무시 가능**: 255=noise 라벨 voxel이 점유 voxel의 0.62%(그리드의 0.015%)뿐.
+- **결론**: recall 단절은 "bbox GT 교체" 때문이 아니라 "3D GT 모집단을 학습과 동일한 inst3d로 좁힌 것" 때문 — 모델이 점수 받던 box-밖 실물 예측이 벌점으로 재분류된 회계 변경이지 모델 열화 아님. 0.3043 계열이 새 기준선. 정밀 분해가 더 필요하면 EOCF_EVAL_GT_LEGACY 토글을 임시 배선해 512샘플 A/B로 성분 분리 가능(미실행). 수치 원본 기록은 본 항목(분석 스크립트는 세션 스크래치라 휘발).
+
+## 2026-07-08 KST — [전수 감사] GT 캐시 6종 정밀 감사 결과 (6개 병렬 감사, train 300키+val 150키 × seed 2회 교차검증)
+
+**건전 판정 (실측 확정, 더 의심할 필요 없음):**
+- **id 번호체계**: GT1(gt_occ_inst)⊆GT2(segmentation_instance3d), GT1⊆GT3(v3) 프레임 단위 100%(2,100프레임×2seed, 위반 0), 공유 id voxel coverage 1.00000 — 번호 shift/충돌 없음. GT1에만 있어 center 못 받는 instance 0건.
+- **center GT 품질**: GT2 AABB 중점 vs annotation box 중심(GT3) xy거리 중앙값/p95 = 0.000m, radial bias ±0.001m — systematic bias 없음(큰 물체 포함). 반면 GT1 voxel-mean은 ego쪽 -0.55m(bus/trailer -0.7~-1.7m) 쏠림 → 현 GT2 AABB 중점 설계가 정답임을 정량 확인.
+- **생성소멸**: 현 config에서 loss로 새는 경로 0건. GT2는 미래신규 id가 구조적으로 0(원천 방어), GT3 미래신규(키의 15~16%)는 keep-id 필터(efficientocf.py L2803-2806)+_hist_slice 이중 방어로 학습 도달 0. 단 두 방어 모두 `query_require_history_all_valid`/`query_matched_loss_history_only` 플래그 의존 — 끄는 실험 시 재검토 필수.
+- **v2 box 누락 해소**: GT1 present 물체(voxel≥10) non-ped 커버 100%(1,440/1,440, 1,519/1,519) — v1의 '누락 13/30' 결함은 v2에서 완전 해소. barrier 유입 0, rot⊆aabb 위반 0.
+- **cw(공사인부) leak 정체 확정**: GT1 leak 155건 전부 '이웃 대형물체 id에 흡수'(out_frac 중앙값 0.966, id 총voxel 중앙값 1,772) — 사람 고유 id가 ped 필터를 뚫고 학습에 들어가는 케이스 **0건**. 실해는 차량 GT 안 사람모양 voxel 소량(155박스 합 16k voxel) 혼입뿐.
+- **GT5(bboxcls cls, 학습 cls loss GT)는 cw를 cls=7로 정상 저장** — v2와 달리 오염 없음(0~0.4%).
+
+**실질 문제 (심각도순):**
+1. **[구조 한계] 교집합 필터로 center 감독 탈락 프레임당 평균 5.3~5.7개**(GT2 instance의 33~36%): ped 몫 ~3.8~4.3(nohuman 설계상 의도), **점유 0 박스 몫 ~1.5개/프레임**(가려짐/포인트 없음 — 카메라에 보일 수 있는 물체가 center 감독 없음). 미래 프레임일수록 증가(f0 4.0→f6 6.3).
+2. **[상충 감독] surviving id의 4.5~4.7%: GT1 history 3프레임 중 1개+가 빈 채 matched focal에 도달** → focal(inst3d 1.0)은 all-negative, dice_bbox(0.9)는 positive를 가르침(같은 프레임 GT3 커버 98~100%). 해소책: focal에서 GT1-빈 프레임 마스킹 or history_all_valid를 GT1 점유 기준으로 변경.
+3. **[GT1 cls 오염] cw가 GT1에도 cls=5로 저장돼 ped 필터 통과**(GT3는 cls=7로 드랍) → GT1/GT3 감독 불일치 소수(7~21 id/2,100프레임). + 겹침 box에서 (cls,inst) 교차오염 실측(truck id에 trailer cls 210행). 외부 캐시라 repo 내 수정 불가.
+4. **[v2 cw 오염 정량 확정] aabb voxel의 0.068~0.080%, rot 0.067~0.086%** — GMO 전체 IoU 왜곡 상한 ~0.1%p 상대(무시 가능), 단 construction 클래스 한정 1.4~2.3%(클래스별 지표 쓸 때 유의).
+5. **[신규 발견] refine_instance_poly 위치 동결**(x/y 이동≤1m/프레임이면 직전 위치 복사) + 미annotation 프레임 ghost box: 느린 물체의 GT box가 raw annotation과 최대 ~1m/프레임 어긋남(cw 사례 IoU 0.857→0.575 드리프트). train GT와 일관돼 랭킹 중립이나 절대 위치 정확도 저하. (v2/v3/GT2 공통 — 원본 파이프라인 상속)
+6. **[버그픽스 영향 정량] id=7 드랍 버그(2026-07-08 수정)**: train 키의 48.7~50.7%에서 물체 1개(car ~75-80%) center 감독 제외였음. 수정 후 center 대상 +5.5~5.8%, attn pair +5.6~8.2%, focal/dice pair +6.2~8.8%. 영향 범위 정확히 id=7에 국한 검증(diff 위반 0). id=7이 사람인 키(34/28건)는 교집합에서 어차피 빠져 무영향.
+
+기타: GT1 box-margin 삐져나옴 재측정 0.1%(기존 기록 ~1%보다 낮음, 필터 재현 후 측정 차이). GT2 z-extent는 GT3와 97~98% 완전 일치(placeholder는 cls뿐, 기하는 진짜 box). GT2≠GT3 차이(~9%)는 미래 진입 물체(GT2 부재)+가시성0 박스(GT3 드랍)로 전부 설명. 감사 스크립트/원시 출력은 세션 스크래치(임시)에 있으며 수치는 본 항목이 원본 기록.
+
 ## 2026-07-07 KST — ⚠ 사고 기록: 학습 중 pipeline 코드 수정으로 full·full_attn_cover 사망
 - **무엇**: 07-06 21시경 `loading_instance.py`에 `load_gt_bbox_aabb` 속성 추가(aabb 실험 배선) → 돌고 있던 **full**(07-07 03:12, epoch 13 직후)과 **full_attn_cover**(07-06 23:23, epoch 5 직후)가 다음 epoch 경계에서 `AttributeError: no attribute 'load_gt_bbox_aabb'`로 사망.
 - **메커니즘**: dataloader worker가 spawn 방식이라 매 epoch 워커가 **디스크의 새 코드를 import**하면서 **pickle된 구 인스턴스**(새 속성 없음)를 복원 → 새 `__call__`이 없는 속성을 참조. 즉 **학습 도는 동안 datasets/pipelines 파일에 속성·필드를 추가하면 그 이후 첫 epoch 경계에서 기존 run이 죽는다.**
@@ -28,7 +55,7 @@
 - **whole-box in-range 규칙**: box 코너가 pc_range 밖이면 v3는 그 프레임을 통짜 drop하지만 inst3d(occupancy)는 남음 — focal bbox 항은 utils_loss의 프레임 가드가 이런 프레임을 자동 제외.
 - **⚠ construction_worker 함정 (v3에서 수정, v2엔 잔존)**: `human.pedestrian.construction_worker`가 CLS_MAP의 ("construction",5) substring에 걸려 **공사장 인부가 cls5(차량)로 저장**되면 로더 ped 필터(7)를 통과함 — v3 생성기는 pedestrian 매칭을 최우선으로 두어 해결(gen_bbox_gt_v2.py). **v2 val 캐시와 구 bboxcls는 이 문제가 그대로 있음**(현 config class_names의 'construction'도 worker를 instance_dict에 등록) → bbox eval 메트릭 GT에 인부 box가 소량 섞여 있다는 뜻. eval 수치 연속성 때문에 v2는 재생성 안 함 — 필요 시 gen_bbox_gt_v2.py로 val도 재생성해 교체할 것.
 - **loss 배선 요약**: focal3d GT 혼합은 `query_gmo_focal_inst3d_weight/query_gmo_focal_bbox_weight`(efficientocf_config 기본 1.0/0.0). bbox_w>0 + pipeline 로드 누락 시 forward_train에서 명시적 raise. focal3d는 history-only(`query_matched_loss_history_only`)라 bbox GT도 과거3프레임만 실사용.
-- **⚠ 미수정 기존 버그 발견 (loading_instance.py:1380)**: segmentation_instance3d 로드에 `_filter_sparse_rows_by_class(rows, class_col=-1)` — 이 캐시의 마지막 컬럼은 **class가 아니라 instance id**라 exclude(7,)이 "**instance id==7인 인스턴스를 통째로 드랍**"으로 작동 중. 결과: 매 샘플 id 7 인스턴스가 center/매칭 대상에서 제외(사실상 무감독). ped 제거 의도였다면 이 캐시 sem 컬럼(col 3)은 binary(1)라 원래 no-op이어야 함. **이번 _aabb 실험에선 고치지 않음** — baseline(subset_attn_cover)과의 단일변수 유지 목적(양쪽 다 같은 버그를 공유하므로 비교는 유효). 별도 수정 시 subset 계열 재학습 비교 불가에 유의. 수정법: 그 줄의 필터 호출 제거 (ped 배제는 gt_occ_inst와의 id intersection이 이미 수행).
+- **✅ 2026-07-08 수정 완료 (loading_instance.py:1473, 구 1380)**: segmentation_instance3d 로드의 `_filter_sparse_rows_by_class(rows, class_col=-1)` 호출을 제거함 — 이 캐시의 마지막 컬럼은 **class가 아니라 instance id**라 exclude(7,)이 "**instance id==7인 인스턴스를 통째로 드랍**"으로 오동작하던 버그(실측: raw 캐시 1,050프레임 중 649~727프레임=62~69%에서 발동 조건 성립). ped 배제는 `gt_occ_inst`와의 id intersection(`_build_intersection_instance_ids_from_dense_pair`, class_col=3으로 정상 필터된 소스)이 이미 수행하므로 이 필터 제거는 안전. **부수효과**: `query_require_history_all_valid`(과거 3프레임 all-valid 교집합 필터)도 이제 완전한 instance 집합을 받게 됨. 수정 당시 `full_attn_cover`/`subset_attn_cover_aabb_dice`(ep11)/`subset_attn_cover_pyr` 3개 학습이 돌고 있었음 — 사용자 판단으로 즉시 적용(크래시 나면 latest.pth resume). **이 수정 이후 시작된 run과 그 이전 run(subset_attn_cover, subset_attn_cover_aabb{,_dice} 등 전부)은 GT가 다르므로 직접 비교 시 이 차이를 감안할 것.** 상세: CHANGELOG.md 2026-07-08.
 
 ## 2026-07-06 KST — [스윕 실측] epoch_11 threshold 스윕 결론 (512샘플, work_dirs/full/eval_sweep/)
 - 결과(IoU2d(aabb)/Recall3d): fg.75/occ.5 = 0.1561/0.2487 · fg.5/occ.5 = 0.1289/0.1605 · fg.5/occ.75 = **0.0922…0.1478/0.3058** · fg.75/occ.75 = fg.5/occ.75와 **7지표 전부 소수점까지 동일**.
@@ -360,3 +387,13 @@
 - `static_graph=True`는 iteration마다 graph 구조(사용 파라미터/분기)가 동일하다는 가정. 조건부로 모듈 일부가 빠지는 구조 변경을 하면 DDP 에러가 날 수 있으니 그 경우 이 옵션부터 의심할 것.
 - `dbg_query_match_cost_*` prefix 키 목록은 `utils_loss.py`의 prefill 루프와 실제 기록 지점이 수동으로 동기화돼 있음. 새 match-cost dbg 키를 추가하면 prefill 루프에도 반드시 같이 추가해야 multi-GPU에서 `log_vars` assert가 재발하지 않음.
 - baseline config는 `samples_per_gpu=1`이라 GPU 수 1~8 어느 쪽이든 per-rank batch shape은 동일. 검증은 아직 안 돌렸음 (smoke run 필요).
+
+## 2026-07-09 KST — query transformer coarse-to-fine KV 피라미드(`full_attn_cover_aabb_dice_pyr.py`) 이 레포 이식 시 주의
+
+- ksh_local의 2026-07-07 이식분(자매 레포 `jhh_gi` 원출처)을 이 레포 `transformer.py`/`efficientocf_config.py`/`efficientocf.py`에 diff 0로 동일 이식(코드 diff는 ksh_local과 완전히 일치함을 확인).
+- **마지막 layer의 `kv_resolutions` 해상도는 반드시 실제 context feature 해상도와 일치해야 함**. 이 레포도 ksh_local과 동일하게 `data_config['input_size']=(896,1600)`, img_neck(SECONDFPN)이 4개 ResNet stage(`out_indices=(0,1,2,3)`, `upsample_strides=[0.25,0.5,1,2]`)를 전부 stride16으로 맞춰 합치므로 context feature 해상도는 (56,100)로 고정 — 값을 그대로 재사용함. `input_size`나 backbone/neck stride를 바꾸는 다른 config에 이 피라미드를 얹을 땐 이 값도 같이 재계산해야 함. 안 맞으면 `_build_layer_kv_tokens`는 `adaptive_avg_pool2d`로 안 죽고 넘어가지만, `_format_ca1_attn_weights_tqnhw`의 `expected_s = ncam*h*w` 체크가 실패해 `return_attn_weights`/시각화/σ-matching 쪽이 조용히 `None`이 되거나 깨질 수 있음.
+- `_normalize_kv_resolutions`/`efficientocf_config.py`의 apply 단계 양쪽 다 `len(kv_resolutions) != num_layers`면 `ValueError`를 던지므로, `query_transformer_num_layers`와 `query_transformer_kv_resolutions`는 항상 같이 바꿀 것.
+- `kv_resolutions=None`(기본값)이면 기존 단일 해상도 동작과 100% 동일 — `subset_attn_cover_aabb_dice.py` 등 기존 baseline config는 전혀 영향 없음(`apply_model_cfg`로 회귀 확인 완료).
+- 이 레포의 대상 config는 σ-matching(`_cover`) + dice(tversky) AABB 혼합(`_aabb_dice`) 위에 피라미드(`_pyr`)까지 얹은 3중 조합이라 단일변수 원칙에서 벗어남(ksh_local의 `_attn_cover_pyr`보다 한 단계 더 누적). σ-matching·dice 혼합과 피라미드의 상호작용은 ksh_local에서도 미검증이었고 이 레포에서도 그대로 미검증 — 학습 로그(`dbg_query_attn_sigma_ratio_u/v`, `dbg_gmo_dice_bbox_pair_count`)로 기존 baseline 대비 이상 유무 확인 필요.
+- `load_from`/`resume_from`이 이 config에서도 `None`(from-scratch)인지 확인 필요 — 기존 1-layer 체크포인트로 이 구조를 fine-tune/resume하려 하면 `ca_layers.1.*`/`ca_layers.2.*` 등 state_dict 키가 없어 로드가 깨짐.
+- 검증: 독립 스모크(포워드/백워드, query grad 흐름, 레거시 `kv_resolutions=None` 경로, 길이 불일치 `ValueError`)와 `mmcv.Config.fromfile`+`apply_model_cfg` 통과를 이 env(`eof`)에서 직접 실행해 확인함 (CHANGELOG 2026-07-09 참고).

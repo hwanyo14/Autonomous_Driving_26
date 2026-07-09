@@ -1470,7 +1470,12 @@ class LoadInstanceWithFlow(object):
                         min_cols=4,
                         label="segmentation_instance3d",
                     )
-                    rows = self._filter_sparse_rows_by_class(rows, class_col=-1)
+                    # NOTE: no class-column filter here — this cache's last column is
+                    # instance_id, not class (unlike gt_occ_inst/gt_bbox_aabb). Applying
+                    # exclude_occ_class_ids here used to drop instance_id==7 wholesale
+                    # regardless of class (bug, NOTES.md 2026-07-06/2026-07-08). Pedestrian
+                    # removal is already enforced downstream via the gt_occ_inst id
+                    # intersection (which filters by the correct class column).
                     segmentation_instance3d_sparse_list.append(rows)
                     segmentation_instance3d = sparse_instance3d_to_dense(rows).long()
                     segmentation_instance3d_list.append(segmentation_instance3d.unsqueeze(0))

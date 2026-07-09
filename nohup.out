@@ -275,3 +275,40 @@ load config from local path: ./projects/configs/baselines/full.py
 -------------
 load config from local path: ./projects/configs/baselines/full_attn_cover.py
 [dist_train] console logging -> logs/full_attn_cover/20260707_133058.log  (실시간 보기: tail -f logs/full_attn_cover/20260707_133058.log)
+-------------
+load config from local path: ./projects/configs/baselines/full.py
+[dist_train] console logging -> logs/full/20260707_163741.log  (실시간 보기: tail -f logs/full/20260707_163741.log)
+-------------
+load config from local path: ./projects/configs/baselines/full.py
+[dist_train] console logging -> logs/full/20260707_163834.log  (실시간 보기: tail -f logs/full/20260707_163834.log)
+-------------
+load config from local path: ./projects/configs/baselines/full_attn_cover.py
+[dist_train] console logging -> logs/full_attn_cover/20260707_163838.log  (실시간 보기: tail -f logs/full_attn_cover/20260707_163838.log)
+-------------
+load config from local path: ./projects/configs/baselines/subset_attn_cover_aabb_dice.py
+[dist_train] console logging -> logs/subset_attn_cover_aabb_dice/20260707_165848.log  (실시간 보기: tail -f logs/subset_attn_cover_aabb_dice/20260707_165848.log)
+[dist_test] console logging -> logs/full/eval/20260708_123344.log  (실시간 보기: tail -f logs/full/eval/20260708_123344.log)
+[dist_test] console logging -> logs/full_attn_cover/eval/20260708_142209.log  (실시간 보기: tail -f logs/full_attn_cover/eval/20260708_142209.log)
+[dist_test] console logging -> logs/full_attn_cover/eval/20260708_142418.log  (실시간 보기: tail -f logs/full_attn_cover/eval/20260708_142418.log)
+[dist_test] console logging -> logs/subset_attn_cover_aabb_dice/eval/20260708_150414.log  (실시간 보기: tail -f logs/subset_attn_cover_aabb_dice/eval/20260708_150414.log)
+-------------
+load config from local path: ./projects/configs/baselines/full.py
+[dist_train] console logging -> logs/full/20260708_202336.log  (실시간 보기: tail -f logs/full/20260708_202336.log)
+[dist_test] console logging -> logs/full/eval/20260709_102512.log  (실시간 보기: tail -f logs/full/eval/20260709_102512.log)
+[dist_test] console logging -> logs/full_attn_cover/eval/20260709_102547.log  (실시간 보기: tail -f logs/full_attn_cover/eval/20260709_102547.log)
+-------------
+load config from local path: ./projects/configs/baselines/full.py
+[dist_train] console logging -> logs/full/20260709_114828.log  (실시간 보기: tail -f logs/full/20260709_114828.log)
+-------------
+load config from local path: ./projects/configs/baselines/full_attn_cover.py
+[dist_train] console logging -> logs/full_attn_cover/20260709_114836.log  (실시간 보기: tail -f logs/full_attn_cover/20260709_114836.log)
+[dist_test] console logging -> logs/subset_attn_cover_aabb_dice/eval/20260709_115047.log  (실시간 보기: tail -f logs/subset_attn_cover_aabb_dice/eval/20260709_115047.log)
+-------------
+load config from local path: ./projects/configs/baselines/full_attn_cover.py
+[dist_train] console logging -> logs/full_attn_cover/20260709_140855.log  (실시간 보기: tail -f logs/full_attn_cover/20260709_140855.log)
+-------------
+load config from local path: ./projects/configs/baselines/full.py
+[dist_train] console logging -> logs/full/20260709_140859.log  (실시간 보기: tail -f logs/full/20260709_140859.log)
+-------------
+load config from local path: ./projects/configs/baselines/full_attn_cover_aabb_dice_pyr.py
+[dist_train] console logging -> logs/full_attn_cover_aabb_dice_pyr/20260709_194933.log  (실시간 보기: tail -f logs/full_attn_cover_aabb_dice_pyr/20260709_194933.log)

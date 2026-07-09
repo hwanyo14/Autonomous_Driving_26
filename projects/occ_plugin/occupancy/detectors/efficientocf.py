@@ -130,6 +130,7 @@ class EfficientOCF(
             num_queries=self.query_num_queries,
             num_heads=4,
             num_layers=self.query_transformer_num_layers,
+            kv_resolutions=self.query_transformer_kv_resolutions,
             num_cams=6,
             embed_dim=self.query_embed_dim,
             max_time=self.time_receptive_field,
@@ -2675,16 +2676,20 @@ class EfficientOCF(
             if (isinstance(gt_occ_inst_bundle, dict) and torch.is_tensor(gt_occ_inst_bundle.get("seg_cls_inst_tcxzy", None)))
             else gt_segmentation_cls_instance3d_tcxyz
         )
-        # focal3d GT 혼합용 AABB bbox dense (gt_occ_inst와 동일 id 공간, v3 캐시).
+        # focal/dice GT 혼합용 AABB bbox dense (gt_occ_inst와 동일 id 공간, v3 캐시).
         gt_bbox_aabb_inst_txyz = None
-        if float(getattr(self, "query_gmo_focal_bbox_weight", 0.0)) > 0.0:
+        _need_bbox_gt = (
+            float(getattr(self, "query_gmo_focal_bbox_weight", 0.0)) > 0.0
+            or float(getattr(self, "query_gmo_dice_bbox_weight", 0.0)) > 0.0
+        )
+        if _need_bbox_gt:
             gt_bbox_aabb_inst_txyz = self._prepare_gt_bbox_aabb_dense_txyz(
                 gt_bbox_aabb=gt_bbox_aabb,
                 fallback_segmentation_instance3d_txyz=gt_segmentation_instance3d_txyz,
             )
             if gt_bbox_aabb_inst_txyz is None:
                 raise ValueError(
-                    "query_gmo_focal_bbox_weight>0 requires gt_bbox_aabb from the pipeline "
+                    "query_gmo_{focal,dice}_bbox_weight>0 requires gt_bbox_aabb from the pipeline "
                     "(LoadInstanceWithFlow load_gt_bbox_aabb=True + Collect3D key)."
                 )
 
@@ -3607,6 +3612,8 @@ class EfficientOCF(
                 ),
                 focal_inst3d_weight=float(getattr(self, "query_gmo_focal_inst3d_weight", 1.0)),
                 focal_bbox_weight=float(getattr(self, "query_gmo_focal_bbox_weight", 0.0)),
+                dice_inst3d_weight=float(getattr(self, "query_gmo_dice_inst3d_weight", 1.0)),
+                dice_bbox_weight=float(getattr(self, "query_gmo_dice_bbox_weight", 0.0)),
             )
 
         if torch.is_tensor(query_cls_scores_tqc) and query_cls_scores_tqc.numel() > 0:

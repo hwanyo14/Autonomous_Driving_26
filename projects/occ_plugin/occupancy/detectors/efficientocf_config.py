@@ -10,6 +10,10 @@ MODEL_CFG_DEFAULTS = {
     # bbox_w>0이면 pipeline에 load_gt_bbox_aabb=True + Collect3D 'gt_bbox_aabb' 필요. dice는 항상 inst3d.
     "query_gmo_focal_inst3d_weight": 1.0,
     "query_gmo_focal_bbox_weight": 0.0,
+    # dice(tversky) GT 혼합: pair dice = inst3d_w*tversky(inst3d) + bbox_w*tversky(AABB bbox).
+    # 의도: FP-heavy tversky(α)가 'box 밖' 확장을 강벌 — focal-bbox 실험의 비관용FP 문제 대응.
+    "query_gmo_dice_inst3d_weight": 1.0,
+    "query_gmo_dice_bbox_weight": 0.0,
     "query_gmo_dice_loss_weight": 0.5,
     "query_gmo_dice_3d": False,   # True면 dice/Tversky를 z collapse 없이 3D로 (z 과확장 억제)
     "query_gmo_tversky_alpha": 0.7,
@@ -176,6 +180,9 @@ MODEL_CFG_DEFAULTS = {
     "query_embed_dim": 256,
     "query_num_queries": 100,
     "query_transformer_num_layers": 1,
+    # Per-layer cross-attention KV 해상도 (coarse->fine 피라미드). None=기존 동작(전 layer가
+    # 원본 해상도 KV 공유). 지정 시 len()이 query_transformer_num_layers와 일치해야 함.
+    "query_transformer_kv_resolutions": None,
     "query_id_reinject_scale": 0.0,
     "query_ca_kv_identity_init": False,
     "query_ca_attn_tau": 1.0,
@@ -289,6 +296,8 @@ def apply_model_cfg(self, cfg):
     self.query_gmo_loss_weight = float(cfg["query_gmo_loss_weight"])
     self.query_gmo_focal_inst3d_weight = float(cfg["query_gmo_focal_inst3d_weight"])
     self.query_gmo_focal_bbox_weight = float(cfg["query_gmo_focal_bbox_weight"])
+    self.query_gmo_dice_inst3d_weight = float(cfg["query_gmo_dice_inst3d_weight"])
+    self.query_gmo_dice_bbox_weight = float(cfg["query_gmo_dice_bbox_weight"])
     self.query_gmo_dice_loss_weight = float(cfg["query_gmo_dice_loss_weight"])
     self.query_gmo_dice_3d = bool(cfg["query_gmo_dice_3d"])
     self.query_gmo_tversky_alpha = float(cfg["query_gmo_tversky_alpha"])
@@ -450,6 +459,18 @@ def apply_model_cfg(self, cfg):
     self.query_embed_dim = int(cfg["query_embed_dim"])
     self.query_num_queries = int(cfg["query_num_queries"])
     self.query_transformer_num_layers = int(cfg["query_transformer_num_layers"])
+    if cfg["query_transformer_kv_resolutions"] is None:
+        self.query_transformer_kv_resolutions = None
+    else:
+        self.query_transformer_kv_resolutions = tuple(
+            tuple(int(v) for v in hw) for hw in cfg["query_transformer_kv_resolutions"]
+        )
+        if len(self.query_transformer_kv_resolutions) != self.query_transformer_num_layers:
+            raise ValueError(
+                "query_transformer_kv_resolutions length must match "
+                f"query_transformer_num_layers: got {len(self.query_transformer_kv_resolutions)} "
+                f"vs {self.query_transformer_num_layers}"
+            )
     self.query_id_reinject_scale = float(cfg["query_id_reinject_scale"])
     self.query_ca_kv_identity_init = bool(cfg["query_ca_kv_identity_init"])
     self.query_ca_attn_tau = float(cfg["query_ca_attn_tau"])

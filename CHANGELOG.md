@@ -1,5 +1,44 @@
 # Changelog
 
+## 2026-07-08 KST — `NEW_GT_PIPELINE_SPEC.md` 저장 경로/파일명 확정
+
+- **저장 루트 통일**: `data/efficientocf_gt/GMO/` 하나로 6개 산출물을 전부 모음(기존처럼 캐시마다 다른 최상위 심볼릭 링크로 흩어지지 않게).
+- **A/B/C(raw, 미연결)**: `bbox_aabb_raw`/`bbox_rot_raw`/`occ_raw`로 개명 — "segmentation" 접두사 제거(내용과 무관한 레거시 관례였음, 이 3개는 로더에 안 걸리므로 이름 제약이 없음).
+- **D/E/F(연결)**: `segmentation_instance3d`/`segmentation_aabb`/`segmentation_rot` 이름을 그대로 유지 — 확인해보니 이건 미관상이 아니라 `loading_instance.py`의 `resolve_gt_occ_inst_dir`/`resolve_gt_bbox_aabb_dir`와 `efficientocf.py`의 eval rot lazy-loader가 이 문자열을 **하드코딩**해서 찾기 때문(§7.1.1에 근거 명시). 이름을 바꾸려면 저 3개 함수에 후보 문자열을 추가하는 작은 패치가 필요 — 이번엔 안 하는 쪽으로 결정, §12.8에 옵션으로 남김.
+
+## 2026-07-08 KST — `NEW_GT_PIPELINE_SPEC.md` v2: raw 3종 + 파생 3종(6파일) 구조로 재설계
+
+- **변경 이유**: v1(4파일, 게이트 결과를 메타데이터로 별도 저장)에서 논의 중 설계가 정제됨. focal loss가 필요로 하는 "voxel 단위 sparse 실점유" GT를 누락했던 문제를 발견 → 해결 과정에서 오히려 더 단순한 구조로 정리됨.
+- **최종 구조**: raw 레이어 3개(`bbox_aabb_raw`/`bbox_rot_raw`/`gt_occ_raw`, 필터·게이트 전혀 없음, **로더에 연결 안 하고 저장만** — 향후 재파생·감사용) → 파생 레이어 3개(`nusocc_inst`=raw bbox∩raw occ voxel교집합/`bbox_aabb`=존재게이트 통과 시 통짜 유지/`bbox_rot`=같은 게이트를 rot_raw에 재적용, OBB 재계산 없음).
+- **핵심 단순화**: "게이트 통과 여부"를 별도 계산·저장하지 않고 `nusocc_inst`에 해당 (frame,instance) row가 있는지 자체로 판별하도록 변경 — v1의 `occ_voxel_count_meta` 산출물 제거.
+- **로딩 매핑 확정**: `nusocc_inst`→`gt_occ_inst` 자리(경로만 교체), `bbox_aabb`→`gt_bbox_aabb`(dice 90%)+center/attn GT+cls GT 자리(뒤 둘은 모델 코드 배선 변경 필요), `bbox_rot`→eval lazy-loader 자리(env var 경로만 교체). raw 3종은 미연결.
+- **current-config 확인**: `loss_gmo_focal`=`query_gmo_focal_inst3d_weight=1.0`(nusocc 100%)/`bbox_weight=0.0`, `loss_gmo_dice`=`inst3d_weight=0.1`+`bbox_weight=0.9` — 새 구조가 이 레시피를 그대로 보존함을 재확인.
+
+## 2026-07-08 KST — `NEW_GT_PIPELINE_SPEC.md` 신설: 새 GT 캐시 자체 생성 파이프라인 명세서
+
+- **목적**: 기존 `gt_occ_inst`/`segmentation_instance3d`는 외부 프로젝트에서 생성된 캐시라 이 repo 안에 생성 스크립트가 없음(`reports/summary.json`으로만 레시피 역추적 가능). 이를 대체할 자체 생성 가능한 3종 GT(`bbox_aabb`/`nusocc_inst`/`bbox_rot`) 파이프라인을 다른 서버에서 구현하기 위한 완전 명세서 작성.
+- **검증 방법**: 6개 병렬 에이전트로 `record_instance()`, `gen_bbox_gt_v2.py` 전체, `nuScenes-Occupancy` 원본 npy 포맷(실측), config 상수 11개 baseline 전수 대조, npz 저장 관례, 좌표변환 공식을 전부 실제 코드/데이터에서 재검증 후 작성 — 추측 없이 라인번호·실측치까지 포함.
+- **파이프라인 구조**: 1단계 raw bbox(생성소멸·사람제거·construction_worker 우선매칭 전부 OFF) → 2단계 nuScenes-Occupancy 실점유와 게이트 방식 결합("존재하면 박스 전체 유지, 없으면 (instance,frame) 통째 drop" — voxel을 실점유로 깎지 않음, 필터는 나중 단계로 위임) → 3단계 정제 bbox + rot 파생(재-rasterize 없이 OBB 필터만 적용, 수학적으로 동치).
+- **부수 발견 (신규 버그, 기존 운영 코드)**: `loading_instance.py:659` `build_instance_center_world_targets()`의 voxel→world 역변환 공식에 `-resolution/2` 보정항이 누락됨 — 현재 모든 학습이 쓰는 center GT(`gt_instance_centers_world`)가 축마다 0.1m씩 체계적으로 밀려있음(`gen_bbox_gt_v2.py`의 OBB 재구성 공식과 대조해 확인). 이번엔 수정하지 않고 명세서에 경고만 남김(활성 학습 run 다수와 단일변수 원칙 고려) — NEW_GT_PIPELINE_SPEC.md §8.4 참조.
+- **PROJECT_STRUCTURE.md** 갱신(신규 파일 등록).
+
+## 2026-07-08 KST — `segmentation_instance3d` 로더 버그 수정: `exclude_occ_class_ids` 오적용 제거
+
+- **버그**: `loading_instance.py:1473`(구)가 `segmentation_instance3d` 캐시(행 포맷 `[x,y,z,...,inst]`, 마지막 컬럼=instance_id)에 `_filter_sparse_rows_by_class(rows, class_col=-1)`을 적용 — `exclude_occ_class_ids=(7,)`가 "class==7(사람) 제거"가 아니라 **"instance_id==7인 물체를 클래스 무관하게 매 샘플 통째로 드랍"**으로 오동작(NOTES.md 2026-07-06/2026-07-08). center GT·attn 카메라마스크 GT가 이 캐시에서 나오므로, id=7 물체는 매칭·center·traj·attn loss에서 조용히 빠지고 있었음.
+- **실측(수정 전, raw 캐시 150키×전프레임=1,050프레임 직접 로드)**: instance_id==7이 649~727/1,050프레임(62~69%)에 실존 — 드문 edge case가 아니라 시퀀스 절반 이상에서 상시 발생.
+- **수정**: 해당 필터 호출 제거(줄 삭제, 주석으로 이유 남김). 사람 제거는 `gt_occ_inst`(class_col=3, 정상)와의 id 교집합(`_build_intersection_instance_ids_from_dense_pair`, `efficientocf.py` forward_train)에서 이미 상시 보장되므로 안전 — `gt_occ_inst`엔 애초에 사람 voxel이 없어 교집합에서 자동 제외됨.
+- **부수효과**: `query_require_history_all_valid=True`(과거 3프레임 전체-valid 교집합 필터, `utils_gt_prep.py::_build_history_all_valid_instance_ids`)가 이제 완전한 instance 목록을 받게 됨 — 이전엔 id=7 물체가 필터 입력에 도달하기 전에 이미 빠져 있었음.
+- **적용 시점 주의**: 수정 시점에 `full_attn_cover`/`subset_attn_cover_aabb_dice`(epoch 11/15)/`subset_attn_cover_pyr` 3개 학습 job이 실행 중이었음 — `loading_instance.py`는 공유 dataloader 코드라 다음 epoch 워커 respawn 시 구인스턴스/신코드 불일치로 죽을 수 있음(2026-07-07 사고와 동일 메커니즘). 사용자 확인 하에 즉시 적용(체크포인트 resume으로 복구 가능 판단). 크래시 발생 시 `latest.pth`에서 resume하면 이 수정이 반영된 상태로 이어서 학습됨.
+- **검증**: `ast.parse`로 문법 확인만 완료, 학습 재검증(smoke run)은 아직 안 함.
+
+## 2026-07-07 KST — _aabb ep9 A/B 판정 + 후속 실험 `subset_attn_cover_aabb_dice.py` (dice GT 혼합)
+
+- **_aabb ep9 512샘플 A/B 결과 (base=subset_attn_cover ep9, 동일 조건 8GPU eval)**: Recall3d 0.1862→0.1589(−15%), IoU3d(nusocc) −11%, IoU2d(bbox_aabb) −1.2%. 성분: TP +14%·FN −4%(벌리기는 성공)였으나 **비관용FP(box 밖) +30%** — focal이 FP에 관대해 box 밖에서 멈추는 힘이 없음. eval 로그: work_dirs/subset_attn_cover{,_aabb}/eval/20260707_1601*.
+- **후속 구현 — dice(tversky) GT 혼합 (`utils_loss.py`)**: `_compute_matched_pair_gmo_losses`에 `dice_inst3d_weight/dice_bbox_weight` 추가 — pair별 `dice = inst3d_w×tversky(inst3d) + bbox_w×tversky(bbox)` (mixture·legacy 양 경로, focal과 동일한 빈-bbox 프레임 가드, bbox GT lowres는 focal용과 공유 1회 빌드). FP-heavy tversky(α=0.7)+bbox GT = "box 안 확장 허용, box 밖 강벌".
+- **config**: `efficientocf_config.py`에 `query_gmo_dice_inst3d_weight`(1.0)/`query_gmo_dice_bbox_weight`(0.0) 신설. 신규 `subset_attn_cover_aabb_dice.py` = focal 복귀(1.0/0.0) + dice 0.1/0.9, dice 2D(z-collapse) 유지(사용자 지정). detector(`efficientocf.py`)의 bbox dense 준비 조건을 focal∨dice bbox weight>0으로 확장.
+- **dbg**: `dbg_gmo_dice_inst3d/bbox`, `dbg_gmo_dice_bbox_pair_count` 추가 + 화이트리스트 `dbg_gmo_dice_` 허용(기존 dice pair_count/alpha/beta도 tensorboard로 나가게 됨).
+- 검증: py_compile + config 로드·가중치·pipeline 키 assert 통과. **datasets/pipelines 무수정** — 돌고 있는 학습 안전 (NOTES 2026-07-07 사고 원칙 준수). 새 run 시작 시 dbg_gmo_dice_bbox_pair_count>0으로 혼합 작동 즉시 확인 가능.
+
 ## 2026-07-06 KST — eval 실험 스위치 2종: NMS off + 렌더 가중치 독립화 (`eval_sweep_indep.sh`)
 
 - **`utils_visualization.py`**: `EOCF_EVAL_NMS_RADIUS` env — distance NMS 반경 override (0=off). 미설정 시 config 값(3.0m).
@@ -1201,3 +1240,19 @@ py_compile 통과. 시각화 전용이라 학습/평가 수치 영향 없음.
 - `projects/configs/baselines/test_traj_mcls_occ.py`: `evaluation = dict(...)` 블록 삭제, eval 전용 `val_config`/`data['val']` 삭제, 미사용 `import copy` 삭제. (`test_config`/`test_pipeline`은 tools/test.py용이라 유지)
 
 **영향**: train 중 eval 없음(전역). test.py를 통한 별도 평가는 영향 없음. 다른 실험 config들(test_traj.py, EfficientOCF_V1.1_1gpu.py 등)에 남아있는 `evaluation` dict는 이제 dead code지만 별도 실험 소유라 미수정.
+
+---
+
+## 2026-07-09 KST — Query Cross-Attention Coarse-to-Fine KV 해상도 피라미드 이 레포 이식 (`full_attn_cover_aabb_dice_pyr.py`)
+
+**배경**: 자매 레포 `Autonomous_Driving_26_ksh_local`에서 2026-07-07에 `Autonomous_Driving_26_jhh_gi`로부터 이식해둔 query cross-attention coarse→fine KV 해상도 피라미드(3-layer)를 사용자 요청으로 이 레포에도 동일 이식. 대상 config는 사용자가 미리 `subset_attn_cover_aabb_dice.py`를 복사해 `train_capacity`만 4000→23930(full)로 바꿔둔 `full_attn_cover_aabb_dice_pyr.py`.
+
+**변경사항**:
+- `projects/occ_plugin/occupancy/image2bev/transformer.py`: ksh_local 버전과 100% 동일하게 이식(diff 0). `TransformerModule.__init__`에 `kv_resolutions=None` 인자 + `_normalize_kv_resolutions`(길이==num_layers, 각 (h,w)>0 검증) 추가. `_build_layer_kv_tokens(x, t, ncam, c, h, w)` 신설: `None`이면 기존과 동일(전 레이어 원본 해상도 K/V 공유), 지정 시 레이어별 target(h,w)로 `avg_pool2d`(정수배)/`adaptive_avg_pool2d`(비정수배) 풀링. `forward()`에서 timestep 루프 밖에서 `layer_kv_tokens` 한 번만 계산, CA1의 `kv`를 `layer_kv_tokens[layer_idx][t]`로 교체.
+- `projects/occ_plugin/occupancy/detectors/efficientocf_config.py`: `MODEL_CFG_DEFAULTS`에 `query_transformer_kv_resolutions: None` 추가(하위호환 기본값). apply 단계에서 `None`이면 그대로, 아니면 tuple 정규화 + `len() != query_transformer_num_layers`면 `ValueError`.
+- `projects/occ_plugin/occupancy/detectors/efficientocf.py`: `TransformerModule` 생성 시 `kv_resolutions=self.query_transformer_kv_resolutions` 전달.
+- `projects/configs/baselines/full_attn_cover_aabb_dice_pyr.py`: `query_transformer_num_layers=3`, `query_transformer_kv_resolutions=((14, 25), (28, 50), (56, 100))` 추가. 마지막 레이어 해상도(56,100)는 이 레포의 `data_config['input_size']=(896,1600)` + img_neck(SECONDFPN, 4-stage 전부 stride16 통일) 기준 context feature 실제 원본 해상도와 일치(896/16=56, 1600/16=100) — ksh_local과 input_size/FPN 구성이 동일함을 확인 후 그대로 사용.
+
+**검증**: `mmcv.Config.fromfile` + `apply_model_cfg`로 `full_attn_cover_aabb_dice_pyr.py` 정상 통과(`num_layers=3`, `kv_resolutions=((14,25),(28,50),(56,100))`). 독립 스모크 스크립트로 `num_layers=3`+`kv_resolutions` forward/backward 성공(query grad 흐름 확인), 레거시 `kv_resolutions=None` 경로(다른 num_layers=3 인스턴스) shape 동일, 길이 불일치(`kv_resolutions` len=2 vs num_layers=3) 시 `ValueError` 발생 확인. 기존 `subset_attn_cover_aabb_dice.py`(`query_transformer_kv_resolutions` 미설정)도 `apply_model_cfg`에서 `None`/`num_layers=1`로 정상 처리(회귀 없음).
+
+**주의**: `full_attn_cover_aabb_dice_pyr.py`는 σ-matching(`query_attn_sigma_match_loss_weight=0.25`) + dice(tversky) AABB 혼합(`query_gmo_dice_bbox_weight=0.9`) 위에 3-layer 피라미드까지 얹은 것이라 세 축이 동시에 바뀜(단일변수 원칙 이탈, 파일명 체인 `attn→cover→aabb→dice→pyr`은 의도된 순차 누적). σ-matching과 피라미드의 상호작용(마지막 레이어 attn이 coarse 2-layer를 거친 뒤라 σ 분포가 좁아질 가능성)은 ksh_local에서도 미검증 상태 그대로 이어짐 — 세부 사항은 NOTES.md 2026-07-09 항목 참고.

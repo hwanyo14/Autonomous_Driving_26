@@ -9,6 +9,7 @@
 ├── PROJECT_STRUCTURE.md  # 이 문서
 ├── CHANGELOG.md  # 코드 수정/구현 기록
 ├── NOTES.md  # 구현 중 주의사항·경고·후속 작업 메모
+├── NEW_GT_PIPELINE_SPEC.md  # 새 GT 캐시 자체 생성 파이프라인 완전 명세서(v2) — raw 3종(bbox_aabb_raw/bbox_rot_raw/gt_occ_raw, 저장만 함) + 파생 3종(nusocc_inst/bbox_aabb/bbox_rot, 기존 로더에 연결) 구조. 다른 서버에서 구현 시작용, 기존 gt_occ_inst/segmentation_instance3d(외부 생성, 스크립트 없음)를 대체할 목적, 생성소멸·사람제거 필터는 의도적으로 미적용(추후 별도 단계)
 ├── GUIDE.pdf  # 실험/사용 가이드 문서
 ├── run.sh  # 학습용 진입 스크립트; config 확인 후 tools/dist_train.sh 호출
 ├── run_eval.sh  # 평가용 진입 스크립트; config/checkpoint 확인 후 tools/dist_test.sh 호출
@@ -48,7 +49,10 @@
 │   │   │   ├── subset_scale_offset_we.py  # offset-only + 'visible' soft gate + 'violators' 정규화 (weight-loophole 봉쇄판)
 │   │   │   ├── subset_attn.py  # subset과 값 동일; camera-attn loss 카메라간 픽셀좌표 충돌 fix 검증용 (NOTES/CHANGELOG 2026-07-02)
 │   │   │   ├── subset_attn_cover.py  # subset_attn + attn σ-matching(폭 감독, loss_query_attn_sigma) 활성 — 크기-무시 고정폭 블롭 교정 (NOTES/CHANGELOG 2026-07-02)
-│   │   │   └── subset_attn_cover_size.py  # cover + size note("크기 쪽지": aux size head + σ/depth 성분을 gaussian head 입력에 주입) — 큰 객체 shape 1단계 (NOTES/CHANGELOG 2026-07-05)
+│   │   │   ├── subset_attn_cover_size.py  # cover + size note("크기 쪽지": aux size head + σ/depth 성분을 gaussian head 입력에 주입) — 큰 객체 shape 1단계 (NOTES/CHANGELOG 2026-07-05)
+│   │   │   ├── subset_attn_cover_aabb.py  # cover + focal3d GT 혼합(0.1 inst3d + 0.9 AABB bbox v3) — ep9 판정: box 밖 비관용FP +30%로 악화 (CHANGELOG 2026-07-07)
+│   │   │   ├── subset_attn_cover_aabb_dice.py  # _aabb 후속: focal 복귀 + dice(tversky) GT 혼합(0.1 inst3d + 0.9 AABB) — "box 안 확장 허용, box 밖 강벌" (CHANGELOG 2026-07-07)
+│   │   │   └── full_attn_cover_aabb_dice_pyr.py  # aabb_dice + full(23930) train_capacity + query cross-attn coarse->fine KV 해상도 피라미드(3-layer, ksh_local 이식) (CHANGELOG 2026-07-09)
 │   │   └── datasets/
 │   │       └── custom_nus-3d.py  # MMDet3D 기반 nuScenes 3D dataset/pipeline 기본 템플릿
 │   └── occ_plugin/  # mmdetection3d plugin 진입점; datasets/models/hooks/ops 등록

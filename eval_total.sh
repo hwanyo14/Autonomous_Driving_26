@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # ----- 대상 config / checkpoint / GPU -----
-CONFIG=./projects/configs/baselines/full.py
-CHECKPOINT=./work_dirs/full/latest.pth
+CONFIG=./projects/configs/baselines/full_attn_cover_aabb_dice_pyr.py
+CHECKPOINT=./work_dirs/full_attn_cover_aabb_dice_pyr/latest.pth
 GPUS=8
-export PORT=50031
+export PORT=44031
 
 # ----- 평가 동작 -----
 export EOCF_EVAL_MODE=1            # 기준 프레임: 0=present(현재 1) / 1=future(미래 n_future). metric·viz 공통
