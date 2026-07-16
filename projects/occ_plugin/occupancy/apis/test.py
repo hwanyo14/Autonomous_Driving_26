@@ -41,19 +41,21 @@ def custom_encode_mask_results(mask_results):
     return [encoded_mask_results]
 
 def _running_eval_msg(n, iou_cm, bbox_cm, bbox_rot_cm, iou3d, iou3d_bbox,
-                      iou3d_bbox_rot, recall3d):
+                      iou3d_bbox_rot, recall3d, recall3d_rot=None):
     """One-line running eval summary (movable IoU2d nusocc/bbox_aabb/bbox_rot,
-    IoU3d nusocc/bbox_aabb/bbox_rot, Recall3d) from metrics accumulated so far."""
+    IoU3d nusocc/bbox_aabb/bbox_rot, Recall3d aabb/rot) from metrics accumulated so far."""
     from projects.occ_plugin.utils.formating import cm_to_ious
     def _mov(cm_list):
         return float(cm_to_ious(sum(cm_list))[1]) if cm_list else float('nan')
     def _mean(xs):
-        return float(np.mean(xs)) if len(xs) else float('nan')
+        return float(np.mean(xs)) if xs else float('nan')
     return ("[eval][{}] IoU2d(nusocc)={:.4f} IoU2d(bbox_aabb)={:.4f} "
             "IoU2d(bbox_rot)={:.4f} IoU3d(nusocc)={:.4f} IoU3d(bbox_aabb)={:.4f} "
-            "IoU3d(bbox_rot)={:.4f} Recall3d={:.4f}").format(
+            "IoU3d(bbox_rot)={:.4f} Recall3d(bbox_aabb)={:.4f} "
+            "Recall3d(bbox_rot)={:.4f}").format(
                 n, _mov(iou_cm), _mov(bbox_cm), _mov(bbox_rot_cm), _mean(iou3d),
-                _mean(iou3d_bbox), _mean(iou3d_bbox_rot), _mean(recall3d))
+                _mean(iou3d_bbox), _mean(iou3d_bbox_rot), _mean(recall3d),
+                _mean(recall3d_rot if recall3d_rot is not None else []))
 
 
 def _append_live_eval_log(msg):
@@ -69,7 +71,8 @@ def _append_live_eval_log(msg):
 
 
 def _distributed_running_eval_msg(n, dataset_size, iou_cm, bbox_cm, bbox_rot_cm,
-                                  iou3d, iou3d_bbox, iou3d_bbox_rot, recall3d):
+                                  iou3d, iou3d_bbox, iou3d_bbox_rot, recall3d,
+                                  recall3d_rot=None):
     from projects.occ_plugin.utils.formating import cm_to_ious
 
     device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
@@ -91,6 +94,8 @@ def _distributed_running_eval_msg(n, dataset_size, iou_cm, bbox_cm, bbox_rot_cm,
             float(len(iou3d_bbox)),
             float(np.sum(iou3d_bbox_rot)) if len(iou3d_bbox_rot) else 0.0,
             float(len(iou3d_bbox_rot)),
+            float(np.sum(recall3d_rot)) if (recall3d_rot and len(recall3d_rot)) else 0.0,
+            float(len(recall3d_rot)) if recall3d_rot else 0.0,
         ],
         dtype=torch.float64,
         device=device,
@@ -108,10 +113,12 @@ def _distributed_running_eval_msg(n, dataset_size, iou_cm, bbox_cm, bbox_rot_cm,
     recall3d_mean = float(scalars[2].item() / scalars[3].item()) if scalars[3].item() > 0 else float("nan")
     iou3d_bbox_mean = float(scalars[4].item() / scalars[5].item()) if scalars[5].item() > 0 else float("nan")
     iou3d_bbox_rot_mean = float(scalars[6].item() / scalars[7].item()) if scalars[7].item() > 0 else float("nan")
+    recall3d_rot_mean = float(scalars[8].item() / scalars[9].item()) if scalars[9].item() > 0 else float("nan")
     n = min(int(n), int(dataset_size))
     return ("[eval][{}] IoU2d(nusocc)={:.4f} IoU2d(bbox_aabb)={:.4f} "
             "IoU2d(bbox_rot)={:.4f} IoU3d(nusocc)={:.4f} IoU3d(bbox_aabb)={:.4f} "
-            "IoU3d(bbox_rot)={:.4f} Recall3d={:.4f} (all ranks)").format(
+            "IoU3d(bbox_rot)={:.4f} Recall3d(bbox_aabb)={:.4f} "
+            "Recall3d(bbox_rot)={:.4f} (all ranks)").format(
                 n,
                 float(cm_to_ious(cm_iou_np)[1]),
                 float(cm_to_ious(cm_bbox_np)[1]),
@@ -120,6 +127,7 @@ def _distributed_running_eval_msg(n, dataset_size, iou_cm, bbox_cm, bbox_rot_cm,
                 iou3d_bbox_mean,
                 iou3d_bbox_rot_mean,
                 recall3d_mean,
+                recall3d_rot_mean,
             )
 
 
@@ -133,6 +141,8 @@ def custom_single_gpu_test(model, data_loader, show=False, out_dir=None, show_sc
     iou_metric, iou_bbox_metric, iou_bbox_rot_metric = [], [], []
     iou_3d_metric, iou_3d_bbox_metric, iou_3d_bbox_rot_metric, recall_3d_metric = [], [], [], []
     r3d_comps_sum = np.zeros(4, dtype=np.float64)
+    recall_3d_rot_metric = []
+    r3d_rot_comps_sum = np.zeros(4, dtype=np.float64)
 
     for i, data in enumerate(data_loader):
         with torch.no_grad():
@@ -156,18 +166,24 @@ def custom_single_gpu_test(model, data_loader, show=False, out_dir=None, show_sc
                 c = result['recall_3d_comps']
                 r3d_comps_sum += np.array(
                     [c.get('tp', 0.0), c.get('fp', 0.0), c.get('fn', 0.0), c.get('bbox_fp', 0.0)])
+        if 'recall_3d_rot' in result.keys() and not np.isnan(result['recall_3d_rot']):
+            recall_3d_rot_metric.append(result['recall_3d_rot'])
+            if isinstance(result.get('recall_3d_rot_comps', None), dict):
+                c = result['recall_3d_rot_comps']
+                r3d_rot_comps_sum += np.array(
+                    [c.get('tp', 0.0), c.get('fp', 0.0), c.get('fn', 0.0), c.get('bbox_fp', 0.0)])
 
         prog_bar.update()
         if (i + 1) % 50 == 0:
             print("\n" + _running_eval_msg(i + 1, iou_metric, iou_bbox_metric,
                                            iou_bbox_rot_metric, iou_3d_metric,
                                            iou_3d_bbox_metric, iou_3d_bbox_rot_metric,
-                                           recall_3d_metric), flush=True)
+                                           recall_3d_metric, recall_3d_rot_metric), flush=True)
 
     final_msg = _running_eval_msg(len(dataset), iou_metric, iou_bbox_metric,
                                   iou_bbox_rot_metric, iou_3d_metric,
                                   iou_3d_bbox_metric, iou_3d_bbox_rot_metric,
-                                  recall_3d_metric) + "  [FINAL]"
+                                  recall_3d_metric, recall_3d_rot_metric) + "  [FINAL]"
     print("\n" + final_msg, flush=True)
     _append_live_eval_log(final_msg)
 
@@ -180,6 +196,8 @@ def custom_single_gpu_test(model, data_loader, show=False, out_dir=None, show_sc
         'iou_3d_bbox_rot': iou_3d_bbox_rot_metric,
         'recall_3d': recall_3d_metric,
         'recall_3d_comps': [r3d_comps_sum],
+        'recall_3d_rot': recall_3d_rot_metric,
+        'recall_3d_rot_comps': [r3d_rot_comps_sum],
     }
     return res
 
@@ -213,6 +231,8 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
     iou_3d_bbox_rot_metric = []
     recall_3d_metric = []
     r3d_comps_sum = np.zeros(4, dtype=np.float64)   # [tp, fp, fn, bbox_fp] voxel 합
+    recall_3d_rot_metric = []
+    r3d_rot_comps_sum = np.zeros(4, dtype=np.float64)   # rot OBB 관용 버전
 
     dataset = data_loader.dataset
     rank, world_size = get_dist_info()
@@ -268,6 +288,13 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
                         c = result['recall_3d_comps']
                         r3d_comps_sum += np.array(
                             [c.get('tp', 0.0), c.get('fp', 0.0), c.get('fn', 0.0), c.get('bbox_fp', 0.0)])
+            if 'recall_3d_rot' in result.keys():
+                if not np.isnan(result['recall_3d_rot']):
+                    recall_3d_rot_metric.append(result['recall_3d_rot'])
+                    if isinstance(result.get('recall_3d_rot_comps', None), dict):
+                        c = result['recall_3d_rot_comps']
+                        r3d_rot_comps_sum += np.array(
+                            [c.get('tp', 0.0), c.get('fp', 0.0), c.get('fn', 0.0), c.get('bbox_fp', 0.0)])
 
             batch_size = 1
                 
@@ -285,6 +312,7 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
                 iou_3d_bbox_metric,
                 iou_3d_bbox_rot_metric,
                 recall_3d_metric,
+                recall_3d_rot_metric,
             )
             if rank == 0:
                 print("\n" + msg, flush=True)
@@ -310,21 +338,28 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
             iou_3d_bbox_metric,
             iou_3d_bbox_rot_metric,
             recall_3d_metric,
+            recall_3d_rot_metric,
         ) + "  [FINAL]"
-        # Recall3d 성분 합산 (all_reduce — 전 rank 공동 호출)
+        # Recall3d 성분 합산 (all_reduce — 전 rank 공동 호출). aabb/rot 각각.
         device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
-        comps_t = torch.as_tensor(r3d_comps_sum, dtype=torch.float64, device=device)
-        dist.all_reduce(comps_t, op=dist.ReduceOp.SUM)
-        tp, fp, fn, bfp = [float(v) for v in comps_t.cpu().tolist()]
-        denom = tp + fn + fp - bfp
-        comps_msg = ("[recall3d comps] TP={:.3e} FP={:.3e} FN={:.3e} bboxFP={:.3e} "
-                     "| 비관용FP={:.3e} | micro Recall3d={:.4f}").format(
-                         tp, fp, fn, bfp, fp - bfp, (tp + bfp) / denom if denom > 0 else float("nan"))
+        def _comps_line(tag, comps_sum):
+            comps_t = torch.as_tensor(comps_sum, dtype=torch.float64, device=device)
+            dist.all_reduce(comps_t, op=dist.ReduceOp.SUM)
+            tp, fp, fn, bfp = [float(v) for v in comps_t.cpu().tolist()]
+            denom = tp + fn + fp - bfp
+            return ("[recall3d comps {}] TP={:.3e} FP={:.3e} FN={:.3e} bboxFP={:.3e} "
+                    "| 비관용FP={:.3e} | micro Recall3d={:.4f}").format(
+                        tag, tp, fp, fn, bfp, fp - bfp,
+                        (tp + bfp) / denom if denom > 0 else float("nan"))
+        comps_msg = _comps_line("bbox_aabb", r3d_comps_sum)
+        comps_rot_msg = _comps_line("bbox_rot", r3d_rot_comps_sum)
         if rank == 0:
             print("\n" + final_msg, flush=True)
             _append_live_eval_log(final_msg)
             print(comps_msg, flush=True)
             _append_live_eval_log(comps_msg)
+            print(comps_rot_msg, flush=True)
+            _append_live_eval_log(comps_rot_msg)
 
     # collect lists from multi-GPUs
     res = {}
@@ -364,6 +399,11 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
         recall_3d_metric = collect_results_cpu(recall_3d_metric, len(dataset), tmpdir)
         res['recall_3d'] = recall_3d_metric
         res['recall_3d_comps'] = collect_results_cpu([r3d_comps_sum], len(dataset), tmpdir)
+
+    if 'recall_3d_rot' in result.keys():
+        recall_3d_rot_metric = collect_results_cpu(recall_3d_rot_metric, len(dataset), tmpdir)
+        res['recall_3d_rot'] = recall_3d_rot_metric
+        res['recall_3d_rot_comps'] = collect_results_cpu([r3d_rot_comps_sum], len(dataset), tmpdir)
 
     if 'vpq' in result.keys():
         res['vpq_len'] = len(dataset)

@@ -3010,19 +3010,21 @@ class EfficientOCFLossMixin:
         gt_bbox_aabb_txyz: torch.Tensor = None,
         focal_inst3d_weight: float = 1.0,
         focal_bbox_weight: float = 0.0,
+        dice_inst3d_weight: float = 1.0,
+        dice_bbox_weight: float = 0.0,
         eps: float = 1e-6,
     ) -> dict:
-        # focal(occ) GT 혼합: pair별 focal = inst3d_w*focal(gt_occ_inst3d) + bbox_w*focal(AABB bbox).
-        # gt_bbox_aabb_txyz는 gt_occ_inst와 동일 id 공간의 [T,X,Y,Z] dense여야 하며(v3 캐시),
-        # dice(tversky)는 기존대로 inst3d GT만 사용한다.
+        # GT 혼합 (focal/dice 각각 독립 가중):
+        #   pair focal = focal_inst3d_w*focal(gt_occ_inst3d) + focal_bbox_w*focal(AABB bbox)
+        #   pair dice  = dice_inst3d_w*tversky(inst3d)       + dice_bbox_w*tversky(AABB bbox)
+        # gt_bbox_aabb_txyz는 gt_occ_inst와 동일 id 공간의 [T,X,Y,Z] dense여야 함(v3 캐시).
+        # dice+bbox 조합의 의도: tversky FP항(α)이 'box 밖' 확장을 강벌, box 안 확장은 허용.
         z = centers_world_tq3.sum() * 0.0
         loss_type = str(loss_type).lower()
         loss_key = "loss_gmo_focal" if loss_type in ("balanced_focal", "focal") else "loss_gmo_bce"
-        use_bbox_gt = (
-            torch.is_tensor(gt_bbox_aabb_txyz)
-            and gt_bbox_aabb_txyz.dim() == 4
-            and float(focal_bbox_weight) > 0.0
-        )
+        bbox_gt_ok = torch.is_tensor(gt_bbox_aabb_txyz) and gt_bbox_aabb_txyz.dim() == 4
+        use_bbox_gt = bbox_gt_ok and float(focal_bbox_weight) > 0.0
+        use_bbox_dice = bbox_gt_ok and bool(compute_dice) and float(dice_bbox_weight) > 0.0
         out = {
             "dbg_gmo_bce_pair_count": z,
             "dbg_gmo_bce_lowres_x": z,
@@ -3037,6 +3039,10 @@ class EfficientOCFLossMixin:
             out["dbg_gmo_focal_inst3d"] = z
             out["dbg_gmo_focal_bbox"] = z
             out["dbg_gmo_focal_bbox_pair_count"] = z
+        if use_bbox_dice:
+            out["dbg_gmo_dice_inst3d"] = z
+            out["dbg_gmo_dice_bbox"] = z
+            out["dbg_gmo_dice_bbox_pair_count"] = z
         out[loss_key] = z
         if loss_key == "loss_gmo_focal":
             out["dbg_gmo_bce_alias"] = z
@@ -3114,7 +3120,7 @@ class EfficientOCFLossMixin:
             if pred_tk1zyx is None:
                 return out
             gt_bbox_tk1zyx = None
-            if use_bbox_gt:
+            if use_bbox_gt or use_bbox_dice:
                 # pred voxelize는 위에서 1회 완료 — GT lowres만 bbox 소스로 재빌드.
                 gt_bbox_tk1zyx = self._build_grouped_pair_lowres_gt(
                     gt_occ_txyz=gt_bbox_aabb_txyz[:T].to(device=gt_occ_txyz.device, dtype=torch.long),
@@ -3125,6 +3131,8 @@ class EfficientOCFLossMixin:
                 )
             dbg_focal_inst3d_vals = []
             dbg_focal_bbox_vals = []
+            dbg_dice_inst3d_vals = []
+            dbg_dice_bbox_vals = []
             for k in range(int(mq.numel())):
                 p = pred_tk1zyx[:, k:k + 1].clamp(float(eps), 1.0 - float(eps))
                 t = gt_tk1zyx[:, k:k + 1].clamp(0.0, 1.0)
@@ -3165,7 +3173,8 @@ class EfficientOCFLossMixin:
                 if pair_loss is not None:
                     pair_losses.append(pair_loss)
                 if compute_dice:
-                    if getattr(self, "query_gmo_dice_3d", False):
+                    dice_3d = bool(getattr(self, "query_gmo_dice_3d", False))
+                    if dice_3d:
                         # 3D dice: z collapse 없이 [T,1,Z,Y,X] 그대로 -> z 과확장도 Tversky FP로 벌함
                         p_bev = p[:, :, 0]
                         t_bev = t[:, :, 0]
@@ -3182,11 +3191,40 @@ class EfficientOCFLossMixin:
                         beta=float(tversky_beta),
                         eps=float(eps),
                     )
+                    if use_bbox_dice and (gt_bbox_tk1zyx is not None):
+                        tb = gt_bbox_tk1zyx[:, k:k + 1].clamp(0.0, 1.0)
+                        # focal과 동일한 whole-box drop 프레임 가드 (빈 bbox GT 0-감독 방지)
+                        bbox_frame_ok_d = (tb.flatten(1).sum(dim=1) > 0) | (t.flatten(1).sum(dim=1) <= 0)
+                        if dice_3d:
+                            tb_bev = tb[:, :, 0]
+                            valid_bev_bbox = valid_bev & bbox_frame_ok_d[:, None, None, None, None]
+                        else:
+                            tb_bev = tb[:, :, 0].amax(dim=2)
+                            valid_bev_bbox = valid_bev & bbox_frame_ok_d[:, None, None, None]
+                        dice_loss_bbox = self._compute_foreground_tversky_pair_loss(
+                            pred_occ=p_bev,
+                            gt_occ=tb_bev,
+                            valid_mask=valid_bev_bbox,
+                            alpha=float(tversky_alpha),
+                            beta=float(tversky_beta),
+                            eps=float(eps),
+                        )
+                        if (dice_loss is not None) and (dice_loss_bbox is not None):
+                            dbg_dice_inst3d_vals.append(dice_loss.detach())
+                            dbg_dice_bbox_vals.append(dice_loss_bbox.detach())
+                            dice_loss = (
+                                float(dice_inst3d_weight) * dice_loss
+                                + float(dice_bbox_weight) * dice_loss_bbox
+                            )
+                        elif dice_loss_bbox is not None:
+                            dice_loss = dice_loss_bbox
                     if dice_loss is not None:
                         dice_pair_losses.append(dice_loss)
         else:
             dbg_focal_inst3d_vals = []
             dbg_focal_bbox_vals = []
+            dbg_dice_inst3d_vals = []
+            dbg_dice_bbox_vals = []
             for k in range(int(mq.numel())):
                 q_idx = int(mq[k].item())
                 inst_id = int(pair_gt_ids[k].item())
@@ -3213,8 +3251,10 @@ class EfficientOCFLossMixin:
                     focal_alpha=float(focal_alpha),
                     eps=float(eps),
                 )
-                if use_bbox_gt:
-                    t_cnt = int(min(T, gt_bbox_aabb_txyz.shape[0]))
+                gt_bbox_k = None
+                bbox_frame_ok = None
+                t_cnt = int(min(T, gt_bbox_aabb_txyz.shape[0])) if bbox_gt_ok else 0
+                if use_bbox_gt or use_bbox_dice:
                     gt_bbox_sel = gt_bbox_aabb_txyz[:t_cnt].to(device=p.device, dtype=torch.long)
                     gt_bbox_k = (gt_bbox_sel == inst_id).permute(0, 3, 2, 1).unsqueeze(1).to(torch.float32)
                     if tuple(gt_bbox_k.shape[-3:]) != tuple(p.shape[-3:]):
@@ -3224,6 +3264,7 @@ class EfficientOCFLossMixin:
                         (gt_bbox_k.flatten(1).sum(dim=1) > 0)
                         | (t[:t_cnt].flatten(1).sum(dim=1) <= 0)
                     )
+                if use_bbox_gt and (gt_bbox_k is not None):
                     valid_mask_bbox = valid_mask[:t_cnt] & bbox_frame_ok[:, None, None, None, None]
                     pair_loss_bbox = self._compute_balanced_binary_pair_loss(
                         pred_occ=p[:t_cnt],
@@ -3246,7 +3287,8 @@ class EfficientOCFLossMixin:
                 if pair_loss is not None:
                     pair_losses.append(pair_loss)
                 if compute_dice:
-                    if getattr(self, "query_gmo_dice_3d", False):
+                    dice_3d = bool(getattr(self, "query_gmo_dice_3d", False))
+                    if dice_3d:
                         p_bev = p
                         t_bev = t
                         valid_bev = valid_frame_t[:, None, None, None, None].expand_as(p_bev)
@@ -3262,6 +3304,30 @@ class EfficientOCFLossMixin:
                         beta=float(tversky_beta),
                         eps=float(eps),
                     )
+                    if use_bbox_dice and (gt_bbox_k is not None):
+                        if dice_3d:
+                            tb_bev = gt_bbox_k
+                            valid_bev_bbox = valid_bev[:t_cnt] & bbox_frame_ok[:, None, None, None, None]
+                        else:
+                            tb_bev = gt_bbox_k.amax(dim=2)
+                            valid_bev_bbox = valid_bev[:t_cnt] & bbox_frame_ok[:, None, None, None]
+                        dice_loss_bbox = self._compute_foreground_tversky_pair_loss(
+                            pred_occ=p_bev[:t_cnt],
+                            gt_occ=tb_bev,
+                            valid_mask=valid_bev_bbox,
+                            alpha=float(tversky_alpha),
+                            beta=float(tversky_beta),
+                            eps=float(eps),
+                        )
+                        if (dice_loss is not None) and (dice_loss_bbox is not None):
+                            dbg_dice_inst3d_vals.append(dice_loss.detach())
+                            dbg_dice_bbox_vals.append(dice_loss_bbox.detach())
+                            dice_loss = (
+                                float(dice_inst3d_weight) * dice_loss
+                                + float(dice_bbox_weight) * dice_loss_bbox
+                            )
+                        elif dice_loss_bbox is not None:
+                            dice_loss = dice_loss_bbox
                     if dice_loss is not None:
                         dice_pair_losses.append(dice_loss)
 
@@ -3281,6 +3347,11 @@ class EfficientOCFLossMixin:
                 out["dbg_gmo_focal_inst3d"] = torch.stack(dbg_focal_inst3d_vals, dim=0).mean()
                 out["dbg_gmo_focal_bbox"] = torch.stack(dbg_focal_bbox_vals, dim=0).mean()
             out["dbg_gmo_focal_bbox_pair_count"] = centers_world_tq3.new_tensor(float(len(dbg_focal_bbox_vals)))
+        if use_bbox_dice:
+            if len(dbg_dice_inst3d_vals) > 0:
+                out["dbg_gmo_dice_inst3d"] = torch.stack(dbg_dice_inst3d_vals, dim=0).mean()
+                out["dbg_gmo_dice_bbox"] = torch.stack(dbg_dice_bbox_vals, dim=0).mean()
+            out["dbg_gmo_dice_bbox_pair_count"] = centers_world_tq3.new_tensor(float(len(dbg_dice_bbox_vals)))
         out["dbg_gmo_bce_pair_count"] = centers_world_tq3.new_tensor(float(len(pair_losses)))
         out["dbg_gmo_bce_lowres_x"] = centers_world_tq3.new_tensor(float(low_x))
         out["dbg_gmo_bce_lowres_y"] = centers_world_tq3.new_tensor(float(low_y))
@@ -4130,6 +4201,7 @@ class EfficientOCFLossMixin:
             and (not k.startswith("dbg_query_matched_center_"))
             and (not k.startswith("dbg_query_depth_"))  # depth-head perf (acc/err/entropy)
             and (not k.startswith("dbg_gmo_focal_"))  # focal GT 혼합 모니터 (inst3d/bbox/pair_count)
+            and (not k.startswith("dbg_gmo_dice_"))   # dice GT 혼합 모니터 (+기존 pair_count/alpha/beta)
         ]:
             del losses[k]
         self._namespace_dbg_logs(losses)

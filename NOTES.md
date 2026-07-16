@@ -1,5 +1,164 @@
 # NOTES
 
+## 2026-07-13 KST — mixture3d 시각화의 GT class 라벨은 binary-fg 모드에서 전부 "bicycle"로 잘못 찍힘 (표시 전용, 수정 안 함)
+
+`utils_visualization.py:1207`의 `_QUERY_CLS_NAMES_8` 이름표를 compact class id로 인덱싱하는데,
+`query_cls_binary_fg=True` config에서는 모든 전경 인스턴스의 compact id가 1이라 표의 index 1인
+"bicycle"이 항상 찍힘 (car든 truck이든). multi-class 모드에서는 표가 맞음. **loss/매칭은 id로
+계산해서 정상 — 순수 표시 버그.** 사용자 결정으로 수정하지 않고 둠(2026-07-13). mixture3d에서
+"bicycle" 라벨 보여도 class 배선 오류로 오인하지 말 것. 고치려면 `_cls_name()`(:1354)에
+binary 분기 한 줄 추가하면 됨.
+
+## 2026-07-13 KST — (해결됨) D(inst3d) 경로도 빈-씬 샘플에서 같은 shape-추론 문제 있었음
+
+아래 있던 우려("하드 크래시 없어서 안 건드림")가 실제로 터짐 — 크래시가 아니라 rank마다 loss dict
+키 개수가 달라지는 DDP AssertionError로 나타남. `_prepare_gt_occ_inst_primary_targets`와
+`_build_instance_center_world_targets_from_sparse`에도 `spatial_shape=(voxelizer.W,H,D)`를 넘기도록
+수정 완료. 상세 내용은 CHANGELOG.md "`_rot` 학습 2차 크래시 수정" 항목 참고. **결론: `torch.is_tensor`
+가드로 관대하게 처리된다고 해서 안전한 게 아니었음 — None 전파가 상위에서 loss 블록 전체를 스킵시켜
+다른 형태의(더 찾기 어려운) 버그로 나타날 수 있다는 교훈.**
+
+## 2026-07-13 KST — binary-fg 전용 추가 단순화(class 판정 생략, 존재만 확인)는 보류
+
+`_prepare_gt_instance_classes_for_matching` 벡터화 이후, `query_cls_binary_fg=True` config는 raw
+class를 정확히 안 따지고 "instance에 유효 voxel이 있냐"만 봐도 되지 않냐는 아이디어가 나옴 — 맞는
+지적이고 실측으로도 추가 ~2배 빨라짐(K=5~70에서 132~137ms → 69~74ms, 결과도 동일). 근데:
+- `query_cls_binary_fg`가 없는 config(`full_attn_cover.py` 등 multi-class)는 raw class를 그대로
+  써야 해서, 적용하려면 binary/multi-class 분기를 함수 안에 새로 넣어야 함.
+- 절대 이득이 작음(스텝당 ~60ms, `_rot`(4000샘플×15epoch) 기준 전체 학습 통틀어 ~7.5분).
+- 분기 추가 복잡도·검증 부담 대비 이득이 작다고 판단해 **적용 안 하기로 함**. 이미 적용된
+  범용(binary/multi-class 공통) 벡터화 버전을 그대로 유지.
+
+## 2026-07-13 KST — (최종 결론) GT metadata 캐시 대신 `_prepare_gt_instance_classes_for_matching` 벡터화로 종결
+
+바로 아래 항목("GT metadata 캐시... 이식 안 함")에서 캐싱을 보류한 뒤, 실측을 더 해보니 캐싱 자체가
+필요 없다는 결론까지 남. `query_present_only=True`라 class 판정 직전에 이미 7프레임→1프레임으로
+줄어서 실비용이 작았고(T=1, K=70 기준 2488ms), 캐싱으로 아끼는 절대 시간이 15 epoch 전체 기준
+8.6분 수준이라 캐싱 인프라(mixin/config/심링크/raw-compact 분리, model config 바뀌면 오염 위험)를
+새로 만들 실익이 없다고 판단. 대신 loop를 `torch.unique(pairs, dim=0)` 1회 호출로 벡터화(2.0~18.9배)
+— 디스크/config 없이, 위험 없이 적용. 상세 내용은 CHANGELOG.md 동일 날짜 항목 참고. **결론: 이
+레포에서 GT metadata 캐시는 만들지 않기로 최종 확정.**
+
+## 2026-07-13 KST — GT metadata 캐시(다른 레포 `EOCF_pyramid_multi`)는 이 레포에 이식 안 함 — 이유
+
+- `EOCF_pyramid_multi`의 `utils_gt_meta_cache.py`(2026-07-08 그쪽 changelog)는 이 레포에 없음 — 의도적으로
+  안 옮김. `_filter_dense_instance_ids` torch.isin 벡터화(같은 날짜 CHANGELOG 참고)만 이식함.
+- **캐싱 대상 3개 함수 중 실제로 이 레포에 유효한 건 1개뿐**:
+  - `_build_intersection_instance_ids_from_dense_pair` — 이 레포에서 **죽은 코드**. secondary
+    input(`gt_segmentation_instance3d_txyz`)이 구 `segmentation_instance3d` 캐시 삭제 이후 항상
+    `None`이라 매번 즉시 `None` 반환(`np.intersect1d`까지 안 감). 캐싱해도 이득 없음.
+  - `_build_history_all_valid_instance_ids` — python loop 없는 순수 텐서 bool 연산이라 원래 저렴.
+  - `_prepare_gt_instance_classes_for_matching` — 유일하게 진짜 비싼 함수(K개 인스턴스 python loop,
+    실측 K=5~70에서 1.1~2.9초/call, CPU 기준 occ_size=512x512x40,T=7 실측치).
+- **이 함수를 캐싱하려면 다른 레포 버전 그대로 쓰면 안 됨**: `utils_gt_prep.py:1228`
+  `_prepare_gt_instance_classes_for_matching`이 raw class id → compact class id 매핑
+  (`self.query_raw_to_compact_class_map`, `query_class_ids`/`query_cls_binary_fg` 등 model_cfg에서
+  파생)을 함수 **안에서** 적용한 뒤 리턴함. 다른 레포의 캐시 검증 로직(`_gt_meta_cache_get_inst_cls`)은
+  "instance id 리스트가 캐시된 것과 같은가"만 체크하고 class 매핑 스킴이 바뀐 건 감지 못 함 → 같은
+  (scene,lidar) 토큰에 model config만 바꿔 재사용하면 **옛 매핑 기준 compact class를 조용히 반환**할
+  위험이 있음(에러 없이 잘못된 라벨로 학습됨).
+- **나중에 이식하려면**: 캐싱 경계를 raw class(매핑 전, majority-vote 직후)까지만으로 옮기고, raw→compact
+  매핑은 캐시 밖에서 매번 새로 계산(단순 인덱싱이라 사실상 공짜, 캐싱 불필요)하도록 재설계할 것.
+  이렇게 해야 GT 소스 변경뿐 아니라 model config(class 매핑) 변경에도 안전해짐.
+
+## 2026-07-13 KST — [new_data 레포] `_rot` 배선 시 확인한 주의사항 / 미해결 항목
+
+- **eval 스크립트는 아직 `_rot` 체크포인트를 안 가리킴**: `eval_total.sh`(CONFIG=`full.py`,
+  이미 깨짐)/`eval_total_2.sh`(CONFIG=`full_attn_cover_pyr_aabb_dice3d.py`) 둘 다
+  `subset_attn_cover_pyr_aabb_dice3d_rot.py`를 안 가리킴. `train_total.sh`가 지금 이 config를
+  가리키고 있으니(`--resume ./work_dirs/subset_attn_cover_pyr_aabb_dice3d_rot/latest.pth`), 실제
+  학습이 시작되어 체크포인트가 나오면 eval용 스크립트를 새로 만들거나 기존 스크립트의 CONFIG/CHECKPOINT를
+  이 경로로 바꿔야 함(이번 작업 범위 밖 — 아직 안 함).
+- **`gen_new_gt_pipeline.py` 필터 모순 (미해결, 재생성 시 주의)**: 이 스크립트 자체 docstring은
+  "필터 전부 OFF(생성소멸 카운터 제거)"라고 명시하는데, `CHANGELOG.md`는 `efficientocf_gt_f3`를
+  "생성소멸 필터판(관측창 0~2 교집합)"이라고 설명 — 서로 모순. 지금 디스크에 있는
+  `efficientocf_gt_f3`(구조/키/id-space/train-val 분리/완전성은 전부 실측 검증 완료, 문제 없음)가
+  실제로 어느 쪽으로 생성됐는지는 정적 분석만으론 확정 불가. **이 스크립트로 rot 데이터를 포함해
+  재생성/추가생성할 계획이면, 재생성 전에 이 필터 상태부터 먼저 확정할 것** — 안 그러면 기존
+  파일들과 필터 기준이 다른 데이터가 섞일 위험.
+- **`segmentation_rot` 학습 배선 완료 상태**: `loading_instance.py`에 `gt_bbox_aabb_subdir` 파라미터
+  추가로 rot GT를 `gt_bbox_aabb` 자리에 재사용하도록 배선함(CHANGELOG 2026-07-13 참고). 학습 중인
+  `full_attn_cover.py`(mid-training 크래시 이력 있는 파일, NOTES 07-07 참조) 안전을 위해 self-heal
+  패턴을 반드시 같이 추가했음 — 이 파일에 새 속성을 추가할 때는 항상 `__call__` 상단 self-heal
+  블록에도 기본값을 추가할 것(안 하면 다음 epoch에 학습 중인 다른 job이 죽을 수 있음).
+
+## 2026-07-13 KST — [new_data 레포] 구 config명을 아직 참조하는 스크립트/도구 목록 (이번 재배선 범위 밖)
+
+- **무엇**: config 5개 전부 새 GT(f3) 재배선 + `loading_instance.py` 구 캐시 코드 삭제(CHANGELOG
+  2026-07-13)를 하면서, 레포 전체에서 이미 삭제된 8개 구 config명(`full.py`/`subset.py`/
+  `subset_scale*.py`/`subset_attn_cover{,_size,_aabb}.py`)을 참조하는 곳을 grep해봤더니 예상보다
+  넓게 남아있었음: `eval_total.sh`(CONFIG=`full.py`, 대응 후속 config 없어 미수정), `train_total_{2,4,5}.sh`,
+  `eval_{oracle,sweep_thr,sweep_indep}.sh`, `eval_total_v1.sh`, `tools/dbg_probe/*.py`,
+  `tools/gen_data/gen_bbox_gt_v2.py`.
+- **조치 안 함**: 이번 작업은 사용자가 명시적으로 확인한 범위(config 5개 + `loading_instance.py` +
+  깨진 게 이미 확인된 `eval_total_2.sh`)만 처리. 위 목록은 실제로 깨졌는지(경로 존재 여부) 개별
+  확인 안 된 상태 — 다음에 이 스크립트들을 실행하려 하면 먼저 CONFIG= 줄이 가리키는 파일이 실제로
+  있는지 확인할 것.
+
+## 2026-07-10 KST — NEW_GT_PIPELINE_SPEC.md 전면 실측 검증 결과 (에이전트 31개 + BEV 시각 대조)
+
+- **스펙 정정 ① (v2/val)**: "ped 우선매칭 누락"이 아니라 **pedestrian 미포함 생성**이 실체 — 1,000파일 스캔에서 cls=7이 0건. v2는 `--include_ped_ids` 없이 default로 생성됐고, construction_worker만 'construction' substring으로 유입돼 cls=5를 받음(비겹침 CW 박스 12건 전부 100% cls=5).
+- **스펙 정정 ② (gt_occ_inst)**: §0 표의 "inst3d CW cls=5 오염"은 **반대** — inst3d는 CW를 올바르게 cls=7로 저장(18곳 중 17곳, 유일한 cls=5는 진짜 vehicle.construction 겹침). cls=5 오염의 주체는 v2였음.
+- **v3(train) 건전성 확정**: 23,930키 = inst3d−v2 정확히 일치, CW→7/adult→7/건설차량→5 전부 정상, 파일 손상 0. rot 없음(스펙 §8.5대로).
+- **id 정렬**: train 3캐시(v3·inst3d·seg3d)는 인스턴스 id **100% 일치**, 빠진 인스턴스는 번호를 밀지 않고 구멍으로 남음(gap-not-shift). **val의 v2만 52.4% 일치** — 사람 제거 후 번호 재부여 탓. 로더/모델엔 id 재매핑 코드가 전혀 없어(캐시 숫자 그대로 소비, 유일 안전장치는 id 교집합 필터) val에서 v2를 inst3d와 id로 엮으면 즉시 오염됨.
+- **npz collapse 함정 (신규 발견)**: 7프레임 row 수가 전부 같으면 `np.array(frames, dtype=object)`가 (7,N,5) 3-D object 배열로 붕괴 — v2 ~11%, v3 ~3% 실측. 새 파이프라인 저장부는 `arr=np.empty(T,object); arr[:]=frames` 방식으로 방어할 것(스펙 §7.3 코드 그대로 구현 금지). dtype도 캐시별 상이(v2/v3=int32, inst3d/seg3d=int64).
+- **center GT +0.1m 편향은 2곳**: `loading_instance.py:659`(§9.4) 외에 `utils_gt_prep.py:1005~1006`(gt_occ_inst 폴백 center 빌더)에도 동일 편향. 고칠 땐 반드시 동시 수정(한쪽만 고치면 두 소스가 0.1m 어긋남).
+- **§8.3 위치 정정**: `build_instance_center_world_targets`는 detector가 아니라 `loading_instance.py`(:583 정의, :1532/:1692 호출) — center GT 배선 변경은 로더 파이프라인 수정임.
+- **§12.4 실측 입력**: 기존 inst3d는 중복 좌표 0(생성기가 이미 병합, summary.json의 class_mismatch_n=4.3M이 그 흔적). 새 D=A∩C는 겹침 AABB에서 중복이 생기므로 병합 규칙을 구현 전에 확정해야 strict 로더(`_validate_sparse_rows_basic`) 통과.
+- **환경**: v3 캐시는 온전하나 `data/efficientocf_bboxcls_v3` 심볼릭 링크만 누락(7/10 링크 재생성 때 빠짐). aabb 계열 config 실행 전 `ln -s /home/hwanhee/datasets/efficientocf_bboxcls_v3 data/` 필요 — resolver는 조용한 폴백 없이 FileNotFoundError를 냄. 이 머신의 활성 8-GPU 학습은 **다른 레포**(EOCF_pyramid_multi) 소속.
+- 검증 상세(판정 20건 전체표 + BEV 그림 7종): 아티팩트 "GT 파이프라인 스펙 검증 리포트" 및 대화 로그 참조. inst3d⊆occupancy 100.000%, inst3d 비보행자⊆v2 100%, rot⊆aabb 위반 0, config 상수 12/12 동일.
+
+### [예약 문구] center GT +0.1m 편향 수정 — §8.3 배선 변경 시 함께 적용할 것 (2026-07-11 확정, 아직 미적용)
+- 원인: voxel→world 역변환에서 `-res/2` 누락. 정변환(`get_poly_region`, `round((pts-pc_range_min)/res)`) 기준 voxel v의 참 중심은 `pc_range_min + v*res`인데 아래 두 곳은 `pc_range_min + v*res + res/2`를 계산 → 3축 각각 +0.1 m 공통 편향. **데이터 캐시는 무관(복셀 좌표 정상), 로더 산출값만 밀리는 로더 버그.**
+- 수정 ① `projects/occ_plugin/datasets/pipelines/loading_instance.py:659` (`build_instance_center_world_targets`) — 아래로 교체:
+  `centers_world = centers_voxel * self.resolution[:3].reshape(1, 1, 3) + self.start_position[:3].reshape(1, 1, 3) - self.resolution[:3].reshape(1, 1, 3) / 2.0`
+- 수정 ② `projects/occ_plugin/occupancy/detectors/utils_gt_prep.py:~1004` (gt_occ_inst 폴백 center 빌더) — `start = pc[:3] + (0.5 * voxel)` → `start = pc[:3]`
+- ①②는 반드시 동시 적용(한쪽만 고치면 두 center 소스가 서로 0.1 m 어긋남). 활성 run 단일변수 원칙 때문에 배선 작업 전까지 적용 금지.
+
+### [결정사항] 새 GT 파이프라인 스펙 변경 (2026-07-11, 사용자 확정)
+- **① CW/클래스 정합**: `cls_map = (("pedestrian",7),) + CLS_MAP` (ped 우선매칭 ON) — construction_worker→cls=7. nusocc(lidarseg)·inst3d·v3와 클래스 의미 일치, D(=A∩C)에서 bbox와 occ의 CW 클래스가 7로 정합. 스펙 §3.2 기본값(ped-last, CW→5)을 뒤집는 결정.
+- **② 겹침 AABB 중복 좌표 병합**: **먼저 등장한 인스턴스(작은 id) 우선(first-wins)**. id가 최초 등장 순서로 부여되므로 미래-신규(생성) 인스턴스는 항상 더 큰 id → 추후 생성소멸 필터 방향과 일치, 신규 물체가 기존 물체 복셀을 잠식하지 않음. 구현: id 오름차순으로 채우되 이미 점유된 좌표는 skip(결정적, 추가 상태 불필요). 적용 지점은 D(nusocc_inst)의 dedup(strict 로더 통과용)뿐 — E/F(bbox 최종)는 지금처럼 중복 허용 유지.
+- **배선 체크리스트(추가 확인 2건)**: (a) `forward_train`에 같이 들어가는 `segmentation`/`segmentation_bev`(구 필터 기준 바이너리 캐시, id 없음)는 이번 파이프라인 범위 밖 — raw GT(인스턴스 더 많음)와 내용 불일치 생기므로 해당 loss의 GT 소스 확인 후 유지/E-파생 재생성 중 택일. (b) id를 쓰는 GT 텐서는 현 배선상 전부 캐시 소스(runtime record_instance id는 모델에 안 들어감)임을 forward_train 인자 목록으로 확인함 — §8.3/8.4 배선 완료 후에는 id 소스가 D/E로 단일화됨.
+
+## 2026-07-10 KST — `Autonomous_Driving_26_ksh_local`에서 이식한 기능은 이 레포에 자동 동기화되지 않음
+
+- **무엇**: query cross-attention coarse-to-fine KV 해상도 피라미드(`kv_resolutions`)는 원래
+  `Autonomous_Driving_26_ksh_local` 레포(자매 레포 jhh_gi에서 이식)에만 있던 기능이었음. 이 레포
+  (`ksh_0630`)는 별도 워킹 카피라 코드가 자동으로 동기화되지 않고, `query_transformer_num_layers`만
+  있고 `kv_resolutions` 관련 코드가 전혀 없는 상태였음 — config에 `query_transformer_kv_resolutions`를
+  적어도 `_merge_cfg`가 unknown key를 조용히 무시해 **에러 없이 그냥 죽은 설정**이 되는 함정이 있었음.
+- **조치**: `transformer.py`/`efficientocf_config.py`/`efficientocf.py` 3개 파일에 ksh_local과 동일한
+  코드를 수동 이식(diff 대조로 이 기능 외엔 두 레포 `transformer.py`가 100% 동일함을 확인 후 진행).
+  상세: CHANGELOG.md 2026-07-10.
+- **일반화된 경고**: 앞으로 "다른 레포(ksh_local, jhh_gi 등)에 있던 X를 여기도 적용해줘" 요청이 오면,
+  이 레포에 해당 코드가 실제로 있는지(config 키가 `efficientocf_config.py`의 `apply_model_cfg`에서
+  실제로 읽히는지) **먼저 grep으로 확인**할 것 — 있는 것처럼 보여도(하위 num_layers 등 관련 키만 존재)
+  실제 기능 코드가 없을 수 있음 (`query_gmo_dice_3d`처럼 이미 포팅된 케이스와 `kv_resolutions`처럼
+  전혀 없던 케이스가 혼재).
+- **미검증**: `subset_attn_cover_pyr_aabb_dice3d.py`(σ-matching + dice3D + 피라미드 3중 결합)는
+  단독 스모크(forward/backward)만 확인했고 실제 학습(메모리/속도/σ-matching 상호작용)은 미실행.
+  ksh_local NOTES 2026-07-07 항목의 "σ-matching과 피라미드 상호작용 미검증" 경고가 동일 적용됨.
+
+## 2026-07-08 KST — [전수 감사] GT 캐시 6종 정밀 감사 결과 (6개 병렬 감사, train 300키+val 150키 × seed 2회 교차검증)
+
+**건전 판정 (실측 확정, 더 의심할 필요 없음):**
+- **id 번호체계**: GT1(gt_occ_inst)⊆GT2(segmentation_instance3d), GT1⊆GT3(v3) 프레임 단위 100%(2,100프레임×2seed, 위반 0), 공유 id voxel coverage 1.00000 — 번호 shift/충돌 없음. GT1에만 있어 center 못 받는 instance 0건.
+- **center GT 품질**: GT2 AABB 중점 vs annotation box 중심(GT3) xy거리 중앙값/p95 = 0.000m, radial bias ±0.001m — systematic bias 없음(큰 물체 포함). 반면 GT1 voxel-mean은 ego쪽 -0.55m(bus/trailer -0.7~-1.7m) 쏠림 → 현 GT2 AABB 중점 설계가 정답임을 정량 확인.
+- **생성소멸**: 현 config에서 loss로 새는 경로 0건. GT2는 미래신규 id가 구조적으로 0(원천 방어), GT3 미래신규(키의 15~16%)는 keep-id 필터(efficientocf.py L2803-2806)+_hist_slice 이중 방어로 학습 도달 0. 단 두 방어 모두 `query_require_history_all_valid`/`query_matched_loss_history_only` 플래그 의존 — 끄는 실험 시 재검토 필수.
+- **v2 box 누락 해소**: GT1 present 물체(voxel≥10) non-ped 커버 100%(1,440/1,440, 1,519/1,519) — v1의 '누락 13/30' 결함은 v2에서 완전 해소. barrier 유입 0, rot⊆aabb 위반 0.
+- **cw(공사인부) leak 정체 확정**: GT1 leak 155건 전부 '이웃 대형물체 id에 흡수'(out_frac 중앙값 0.966, id 총voxel 중앙값 1,772) — 사람 고유 id가 ped 필터를 뚫고 학습에 들어가는 케이스 **0건**. 실해는 차량 GT 안 사람모양 voxel 소량(155박스 합 16k voxel) 혼입뿐.
+- **GT5(bboxcls cls, 학습 cls loss GT)는 cw를 cls=7로 정상 저장** — v2와 달리 오염 없음(0~0.4%).
+
+**실질 문제 (심각도순):**
+1. **[구조 한계] 교집합 필터로 center 감독 탈락 프레임당 평균 5.3~5.7개**(GT2 instance의 33~36%): ped 몫 ~3.8~4.3(nohuman 설계상 의도), **점유 0 박스 몫 ~1.5개/프레임**(가려짐/포인트 없음 — 카메라에 보일 수 있는 물체가 center 감독 없음). 미래 프레임일수록 증가(f0 4.0→f6 6.3).
+2. **[상충 감독] surviving id의 4.5~4.7%: GT1 history 3프레임 중 1개+가 빈 채 matched focal에 도달** → focal(inst3d 1.0)은 all-negative, dice_bbox(0.9)는 positive를 가르침(같은 프레임 GT3 커버 98~100%). 해소책: focal에서 GT1-빈 프레임 마스킹 or history_all_valid를 GT1 점유 기준으로 변경.
+3. **[GT1 cls 오염] cw가 GT1에도 cls=5로 저장돼 ped 필터 통과**(GT3는 cls=7로 드랍) → GT1/GT3 감독 불일치 소수(7~21 id/2,100프레임). + 겹침 box에서 (cls,inst) 교차오염 실측(truck id에 trailer cls 210행). 외부 캐시라 repo 내 수정 불가.
+4. **[v2 cw 오염 정량 확정] aabb voxel의 0.068~0.080%, rot 0.067~0.086%** — GMO 전체 IoU 왜곡 상한 ~0.1%p 상대(무시 가능), 단 construction 클래스 한정 1.4~2.3%(클래스별 지표 쓸 때 유의).
+5. **[신규 발견] refine_instance_poly 위치 동결**(x/y 이동≤1m/프레임이면 직전 위치 복사) + 미annotation 프레임 ghost box: 느린 물체의 GT box가 raw annotation과 최대 ~1m/프레임 어긋남(cw 사례 IoU 0.857→0.575 드리프트). train GT와 일관돼 랭킹 중립이나 절대 위치 정확도 저하. (v2/v3/GT2 공통 — 원본 파이프라인 상속)
+6. **[버그픽스 영향 정량] id=7 드랍 버그(2026-07-08 수정)**: train 키의 48.7~50.7%에서 물체 1개(car ~75-80%) center 감독 제외였음. 수정 후 center 대상 +5.5~5.8%, attn pair +5.6~8.2%, focal/dice pair +6.2~8.8%. 영향 범위 정확히 id=7에 국한 검증(diff 위반 0). id=7이 사람인 키(34/28건)는 교집합에서 어차피 빠져 무영향.
+
+기타: GT1 box-margin 삐져나옴 재측정 0.1%(기존 기록 ~1%보다 낮음, 필터 재현 후 측정 차이). GT2 z-extent는 GT3와 97~98% 완전 일치(placeholder는 cls뿐, 기하는 진짜 box). GT2≠GT3 차이(~9%)는 미래 진입 물체(GT2 부재)+가시성0 박스(GT3 드랍)로 전부 설명. 감사 스크립트/원시 출력은 세션 스크래치(임시)에 있으며 수치는 본 항목이 원본 기록.
+
 ## 2026-07-07 KST — ⚠ 사고 기록: 학습 중 pipeline 코드 수정으로 full·full_attn_cover 사망
 - **무엇**: 07-06 21시경 `loading_instance.py`에 `load_gt_bbox_aabb` 속성 추가(aabb 실험 배선) → 돌고 있던 **full**(07-07 03:12, epoch 13 직후)과 **full_attn_cover**(07-06 23:23, epoch 5 직후)가 다음 epoch 경계에서 `AttributeError: no attribute 'load_gt_bbox_aabb'`로 사망.
 - **메커니즘**: dataloader worker가 spawn 방식이라 매 epoch 워커가 **디스크의 새 코드를 import**하면서 **pickle된 구 인스턴스**(새 속성 없음)를 복원 → 새 `__call__`이 없는 속성을 참조. 즉 **학습 도는 동안 datasets/pipelines 파일에 속성·필드를 추가하면 그 이후 첫 epoch 경계에서 기존 run이 죽는다.**
@@ -28,7 +187,7 @@
 - **whole-box in-range 규칙**: box 코너가 pc_range 밖이면 v3는 그 프레임을 통짜 drop하지만 inst3d(occupancy)는 남음 — focal bbox 항은 utils_loss의 프레임 가드가 이런 프레임을 자동 제외.
 - **⚠ construction_worker 함정 (v3에서 수정, v2엔 잔존)**: `human.pedestrian.construction_worker`가 CLS_MAP의 ("construction",5) substring에 걸려 **공사장 인부가 cls5(차량)로 저장**되면 로더 ped 필터(7)를 통과함 — v3 생성기는 pedestrian 매칭을 최우선으로 두어 해결(gen_bbox_gt_v2.py). **v2 val 캐시와 구 bboxcls는 이 문제가 그대로 있음**(현 config class_names의 'construction'도 worker를 instance_dict에 등록) → bbox eval 메트릭 GT에 인부 box가 소량 섞여 있다는 뜻. eval 수치 연속성 때문에 v2는 재생성 안 함 — 필요 시 gen_bbox_gt_v2.py로 val도 재생성해 교체할 것.
 - **loss 배선 요약**: focal3d GT 혼합은 `query_gmo_focal_inst3d_weight/query_gmo_focal_bbox_weight`(efficientocf_config 기본 1.0/0.0). bbox_w>0 + pipeline 로드 누락 시 forward_train에서 명시적 raise. focal3d는 history-only(`query_matched_loss_history_only`)라 bbox GT도 과거3프레임만 실사용.
-- **⚠ 미수정 기존 버그 발견 (loading_instance.py:1380)**: segmentation_instance3d 로드에 `_filter_sparse_rows_by_class(rows, class_col=-1)` — 이 캐시의 마지막 컬럼은 **class가 아니라 instance id**라 exclude(7,)이 "**instance id==7인 인스턴스를 통째로 드랍**"으로 작동 중. 결과: 매 샘플 id 7 인스턴스가 center/매칭 대상에서 제외(사실상 무감독). ped 제거 의도였다면 이 캐시 sem 컬럼(col 3)은 binary(1)라 원래 no-op이어야 함. **이번 _aabb 실험에선 고치지 않음** — baseline(subset_attn_cover)과의 단일변수 유지 목적(양쪽 다 같은 버그를 공유하므로 비교는 유효). 별도 수정 시 subset 계열 재학습 비교 불가에 유의. 수정법: 그 줄의 필터 호출 제거 (ped 배제는 gt_occ_inst와의 id intersection이 이미 수행).
+- **✅ 2026-07-08 수정 완료 (loading_instance.py:1473, 구 1380)**: segmentation_instance3d 로드의 `_filter_sparse_rows_by_class(rows, class_col=-1)` 호출을 제거함 — 이 캐시의 마지막 컬럼은 **class가 아니라 instance id**라 exclude(7,)이 "**instance id==7인 인스턴스를 통째로 드랍**"으로 오동작하던 버그(실측: raw 캐시 1,050프레임 중 649~727프레임=62~69%에서 발동 조건 성립). ped 배제는 `gt_occ_inst`와의 id intersection(`_build_intersection_instance_ids_from_dense_pair`, class_col=3으로 정상 필터된 소스)이 이미 수행하므로 이 필터 제거는 안전. **부수효과**: `query_require_history_all_valid`(과거 3프레임 all-valid 교집합 필터)도 이제 완전한 instance 집합을 받게 됨. 수정 당시 `full_attn_cover`/`subset_attn_cover_aabb_dice`(ep11)/`subset_attn_cover_pyr` 3개 학습이 돌고 있었음 — 사용자 판단으로 즉시 적용(크래시 나면 latest.pth resume). **이 수정 이후 시작된 run과 그 이전 run(subset_attn_cover, subset_attn_cover_aabb{,_dice} 등 전부)은 GT가 다르므로 직접 비교 시 이 차이를 감안할 것.** 상세: CHANGELOG.md 2026-07-08.
 
 ## 2026-07-06 KST — [스윕 실측] epoch_11 threshold 스윕 결론 (512샘플, work_dirs/full/eval_sweep/)
 - 결과(IoU2d(aabb)/Recall3d): fg.75/occ.5 = 0.1561/0.2487 · fg.5/occ.5 = 0.1289/0.1605 · fg.5/occ.75 = **0.0922…0.1478/0.3058** · fg.75/occ.75 = fg.5/occ.75와 **7지표 전부 소수점까지 동일**.

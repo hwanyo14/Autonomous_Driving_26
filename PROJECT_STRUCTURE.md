@@ -8,6 +8,7 @@
 ├── README.md  # 저장소 목적을 짧게 적은 루트 소개
 ├── PROJECT_STRUCTURE.md  # 이 문서
 ├── CHANGELOG.md  # 코드 수정/구현 기록
+├── DATA_PREPROCESSING.md  # GT 캐시(efficientocf_gt/_f3) 전처리 절차 — 실행 파일·명령·순서·검증 기록 (재현용, 2026-07-13 확정)
 ├── NOTES.md  # 구현 중 주의사항·경고·후속 작업 메모
 ├── GUIDE.pdf  # 실험/사용 가이드 문서
 ├── run.sh  # 학습용 진입 스크립트; config 확인 후 tools/dist_train.sh 호출
@@ -16,6 +17,7 @@
 ├── eval_total.sh  # 단일 eval 원클릭 래퍼; CONFIG/checkpoint/GPU 값만 수정 후 dist_test.sh 호출
 ├── eval_oracle.sh  # Oracle(GT 치팅) eval 래퍼; EOCF_EVAL_ORACLE_MATCH=1로 query↔GT center Hungarian 선택 → 스코어링 병목 진단
 ├── eval_sweep_thr.sh  # (FG_THR,OCC_THR) 조합 순차 스윕 래퍼; 부분 eval(EOCF_EVAL_MAX_SAMPLES=512)로 짧게 비교, 타 eval 종료 대기 후 시작
+├── data_vis/  # GT 파이프라인 검증 BEV 시각화 PNG (fig1~7=기존 캐시 검증, fign1~3=새 파이프라인 샘플; NOTES 2026-07-10 검증 섹션 참조)
 ├── data/  # 외부 데이터와 전처리 캐시를 가리키는 심볼릭 링크 모음
 │   ├── efficientocf -> /home/user/jhh/Projects/EfficientOCF/data/efficientocf  # OCF instance/flow 전처리 캐시
 │   ├── efficientocf_bboxcls -> /home/user/jhh/Projects/EOCF_qg_distil_dev/data/efficientocf_bboxcls  # bbox/class 기반 segmentation 캐시
@@ -40,15 +42,12 @@
 │   │   │       ├── seg_cosine_150e.py  # segmentation용 cosine 150epoch 템플릿
 │   │   │       ├── seg_cosine_200e.py  # segmentation용 cosine 200epoch 템플릿
 │   │   │       └── seg_cosine_50e.py  # segmentation용 cosine 50epoch 템플릿
-│   │   ├── baselines/
-│   │   │   ├── full.py  # 전체 train셋 학습 config
-│   │   │   ├── subset.py  # 4000-sample subset 학습 config (빠른 실험용 베이스)
-│   │   │   ├── subset_scale.py  # subset + spread forcing 1차(σ-포함 메트릭, σ-loophole로 무효 판명)
-│   │   │   ├── subset_scale_offset.py  # subset + offset-only spread forcing (weight-loophole로 무압력 판명, NOTES 2026-07-02)
-│   │   │   ├── subset_scale_offset_we.py  # offset-only + 'visible' soft gate + 'violators' 정규화 (weight-loophole 봉쇄판)
-│   │   │   ├── subset_attn.py  # subset과 값 동일; camera-attn loss 카메라간 픽셀좌표 충돌 fix 검증용 (NOTES/CHANGELOG 2026-07-02)
-│   │   │   ├── subset_attn_cover.py  # subset_attn + attn σ-matching(폭 감독, loss_query_attn_sigma) 활성 — 크기-무시 고정폭 블롭 교정 (NOTES/CHANGELOG 2026-07-02)
-│   │   │   └── subset_attn_cover_size.py  # cover + size note("크기 쪽지": aux size head + σ/depth 성분을 gaussian head 입력에 주입) — 큰 객체 shape 1단계 (NOTES/CHANGELOG 2026-07-05)
+│   │   ├── baselines/  # 2026-07-13 기준 전부 새 GT(efficientocf_gt_f3) 배선 — 구버전 config 8개(full/subset/subset_scale*/subset_attn_cover{,_size,_aabb}) 삭제됨 (CHANGELOG 2026-07-13)
+│   │   │   ├── subset_attn.py  # subset(4000) + camera-attn 충돌 fix. GT는 gt_bbox_aabb(E) 기반 (NOTES/CHANGELOG 2026-07-02, 2026-07-13)
+│   │   │   ├── subset_attn_cover_aabb_dice.py  # subset_attn + σ-matching + dice(tversky) GT 혼합(0.1 inst3d+0.9 AABB, 2D z-collapse) (CHANGELOG 2026-07-07, 2026-07-13)
+│   │   │   ├── subset_attn_cover_pyr_aabb_dice3d.py  # 위 + dice 3D(query_gmo_dice_3d=True) + query cross-attn coarse-to-fine KV 피라미드(3-layer) (CHANGELOG 2026-07-10, 2026-07-13)
+│   │   │   ├── full_attn_cover_pyr_aabb_dice3d.py  # subset_attn_cover_pyr_aabb_dice3d와 동일 조합, train_capacity=23930(전체) (CHANGELOG 2026-07-13)
+│   │   │   └── newgt_f3_aabb_dice.py  # subset_attn_cover_aabb_dice의 새 GT 배선 프로토타입(최초 검증본, model_cfg 동일) (CHANGELOG 2026-07-12)
 │   │   └── datasets/
 │   │       └── custom_nus-3d.py  # MMDet3D 기반 nuScenes 3D dataset/pipeline 기본 템플릿
 │   └── occ_plugin/  # mmdetection3d plugin 진입점; datasets/models/hooks/ops 등록
@@ -127,7 +126,7 @@
 │       │   │   ├── __init__.py  # view transformer 등록
 │       │   │   ├── ViewTransformerLSSBEVDepth.py  # LSS+BEVDepth 기반 depth/view transform 핵심 구현
 │       │   │   ├── ViewTransformerLSSVoxel.py  # voxel occupancy용 LSS transformer와 depth loss 구현
-│       │   │   └── transformer.py  # camera/time cross-attention으로 query를 모으는 transformer 모듈
+│       │   │   └── transformer.py  # camera/time cross-attention으로 query를 모으는 transformer 모듈; kv_resolutions 지정 시 레이어별 coarse-to-fine KV 해상도 피라미드 지원(2026-07-10 이식)
 │       │   ├── necks/
 │       │   │   ├── __init__.py  # 3D FPN 계열 neck 등록
 │       │   │   ├── fpn3d.py  # 다중 해상도 3D feature를 합치는 일반 FPN
@@ -163,6 +162,9 @@
     ├── gen_data/
     │   ├── gen_bbox_gt_v2.py  # bbox GT 재생성기 (AABB+rotated OBB, [x,y,z,cls,inst], 생성소멸·사람 필터 상속). --split train/--aabb_only/--include_ped_ids(cache-parity id)로 v3 train 캐시도 생성
     │   ├── gen_depth_gt.py  # nuScenes lidar를 카메라로 투영해 depth GT bin 파일 생성
+    │   ├── derive_filtered_gt.py  # raw D/E/F에서 f3 필터판 파생 (past3all/keep-human 등, row 필터만·id 재부여 없음). 0630 레포에서 무수정 복사(md5 동일)
+    │   ├── gen_new_gt_pipeline.py  # 새 GT 캐시(A/B/D/E/F) 통합 생성기 (NEW_GT_PIPELINE_SPEC.md). ⚠ compute_D에 이물질 흡수 버그 있음 — 수정판은 regen_def_clsmatch.py
+    │   ├── regen_def_clsmatch.py  # D/E/F 재생성기 (compute_D class-match 수정판, --no-f3-filter로 raw 모드). _gt의 A/B 재사용, D/E/F만 저장 (CHANGELOG 2026-07-13)
     │   └── verify_and_merge_occ_cls_inst.py  # sparse class/instance occupancy 캐시 정합성 검증과 병합 도구
     └── misc/
         ├── browse_dataset.py  # dataset pipeline을 시각적으로 브라우징하는 도구

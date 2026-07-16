@@ -502,14 +502,18 @@ class EfficientOCFGTPrepMixin:
         background_index: int = 0,
         ignore_index: int = 255,
     ):
+        # torch.isin 1회로 K개 instance id 비교를 벡터화 (K에 비례해 느려지던 python loop 제거,
+        # 출력은 이전 loop 구현과 bit-identical — CHANGELOG 참고). needle을 dense_gt와 같은
+        # device로 옮겨서 keep_instance_ids가 다른 device에 있어도 안전.
         if (not torch.is_tensor(dense_gt)) or (not torch.is_tensor(keep_instance_ids)):
             return dense_gt
         if dense_gt.dim() == 4:
             inst = dense_gt.to(torch.long)
-            keep = inst == int(background_index)
-            keep |= inst == int(ignore_index)
-            for instance_id in keep_instance_ids.detach().cpu().tolist():
-                keep |= inst == int(instance_id)
+            needle = torch.cat([
+                keep_instance_ids.to(device=inst.device, dtype=torch.long),
+                torch.as_tensor([background_index, ignore_index], device=inst.device, dtype=torch.long),
+            ])
+            keep = torch.isin(inst, needle)
             if bool(keep.all().item()):
                 return dense_gt
             out = inst.clone()
@@ -519,10 +523,11 @@ class EfficientOCFGTPrepMixin:
             out = dense_gt.to(torch.long).clone()
             cls = out[:, 0]
             inst = out[:, 1]
-            keep = inst == int(background_index)
-            keep |= inst == int(ignore_index)
-            for instance_id in keep_instance_ids.detach().cpu().tolist():
-                keep |= inst == int(instance_id)
+            needle = torch.cat([
+                keep_instance_ids.to(device=inst.device, dtype=torch.long),
+                torch.as_tensor([background_index, ignore_index], device=inst.device, dtype=torch.long),
+            ])
+            keep = torch.isin(inst, needle)
             drop = ~keep
             if bool(drop.any().item()):
                 cls[drop] = int(background_index)
@@ -866,6 +871,7 @@ class EfficientOCFGTPrepMixin:
         self,
         sparse_list,
         fallback_segmentation_instance3d_txyz=None,
+        spatial_shape=None,
     ):
         """
         Build dense instance-id and class volumes from sparse gt_occ_inst rows.
@@ -881,6 +887,11 @@ class EfficientOCFGTPrepMixin:
         if torch.is_tensor(fallback_segmentation_instance3d_txyz) and fallback_segmentation_instance3d_txyz.dim() == 4:
             spatial = tuple(int(v) for v in fallback_segmentation_instance3d_txyz.shape[1:])
             t_len = min(t_len, int(fallback_segmentation_instance3d_txyz.shape[0]))
+        # spatial_shape(호출자가 아는 고정 grid 크기, 예: voxelizer.W/H/D)가 있으면 우선 사용 —
+        # 이 샘플 윈도우에 GMO 인스턴스가 하나도 없어 sparse row가 전부 비었을 때도(정상적으로
+        # 발생 가능) shape 추론 실패로 None을 리턴하지 않고 all-background dense를 만들 수 있음.
+        if spatial is None and spatial_shape is not None:
+            spatial = tuple(int(v) for v in spatial_shape)
         if spatial is None:
             spatial = self._infer_dense_shape_from_sparse(sparse_list)
         if spatial is None:
@@ -922,6 +933,7 @@ class EfficientOCFGTPrepMixin:
         self,
         sparse_list,
         fallback_segmentation_instance3d_txyz=None,
+        spatial_shape=None,
     ):
         """
         Convert sparse gt_occ_inst rows into per-instance temporal center targets.
@@ -938,6 +950,8 @@ class EfficientOCFGTPrepMixin:
         if torch.is_tensor(fallback_segmentation_instance3d_txyz) and fallback_segmentation_instance3d_txyz.dim() == 4:
             spatial = tuple(int(v) for v in fallback_segmentation_instance3d_txyz.shape[1:])
             t_len = min(t_len, int(fallback_segmentation_instance3d_txyz.shape[0]))
+        if spatial is None and spatial_shape is not None:
+            spatial = tuple(int(v) for v in spatial_shape)
         if spatial is None:
             spatial = self._infer_dense_shape_from_sparse(sparse_list)
         if spatial is None:
@@ -1002,7 +1016,8 @@ class EfficientOCFGTPrepMixin:
             ],
             dtype=np.float32,
         )
-        start = pc[:3] + (0.5 * voxel)
+        # NOTES 2026-07-11 [예약 문구] 수정 ②: voxel 참 중심 = pc_min + v*res (+0.5*voxel 편향 제거).
+        start = pc[:3]
         centers_world = centers_voxel * voxel.reshape(1, 1, 3) + start.reshape(1, 1, 3)
         centers_world[~valid_mask] = 0.0
         return (
@@ -1069,13 +1084,24 @@ class EfficientOCFGTPrepMixin:
         if sparse is None:
             return None
         sparse = self._filter_gt_occ_inst_sparse_list_by_query_classes(sparse)
+        # spatial_shape을 voxelizer 고정 grid로 명시 — 이 샘플 윈도우에 GMO 인스턴스가 하나도 없어
+        # sparse row가 전부 비면(정상 케이스) shape 추론 실패로 None이 나와 이 함수 전체가 None을
+        # 리턴하고, 그 결과 forward_train의 matched-pair GMO loss/attn 관련 loss 블록 전체가
+        # 통째로 스킵되어 rank마다 손실 dict 키 개수가 달라지는 DDP AssertionError로 이어짐
+        # (2026-07-13 크래시, CHANGELOG 참고).
+        spatial_shape = None
+        voxelizer = getattr(self, "voxelizer", None)
+        if voxelizer is not None:
+            spatial_shape = (int(voxelizer.W), int(voxelizer.H), int(voxelizer.D))
         dense_inst, dense_cls = self._build_dense_from_gt_occ_inst_sparse(
             sparse_list=sparse,
             fallback_segmentation_instance3d_txyz=fallback_segmentation_instance3d_txyz,
+            spatial_shape=spatial_shape,
         )
         centers_world, centers_valid, ids_n = self._build_instance_center_world_targets_from_sparse(
             sparse_list=sparse,
             fallback_segmentation_instance3d_txyz=fallback_segmentation_instance3d_txyz,
+            spatial_shape=spatial_shape,
         )
         seg_cls_inst = self._build_segmentation_cls_instance3d_from_gt_occ_inst_dense(
             dense_cls_txyz=dense_cls,
@@ -1105,9 +1131,17 @@ class EfficientOCFGTPrepMixin:
         if sparse is None:
             return None
         sparse = self._filter_gt_occ_inst_sparse_list_by_query_classes(sparse)
+        # spatial_shape을 voxelizer 고정 grid로 명시 — 이 샘플에 GMO 인스턴스가 하나도 없어
+        # sparse row가 전부 빌 때도(정상 케이스) shape 추론 실패로 None이 나오지 않게 함
+        # (None을 리턴하면 호출부(forward_train)가 query_gmo_*_bbox_weight>0일 때 하드 에러를 냄).
+        spatial_shape = None
+        voxelizer = getattr(self, "voxelizer", None)
+        if voxelizer is not None:
+            spatial_shape = (int(voxelizer.W), int(voxelizer.H), int(voxelizer.D))
         dense_inst, _ = self._build_dense_from_gt_occ_inst_sparse(
             sparse_list=sparse,
             fallback_segmentation_instance3d_txyz=fallback_segmentation_instance3d_txyz,
+            spatial_shape=spatial_shape,
         )
         return dense_inst
 
@@ -1293,29 +1327,54 @@ class EfficientOCFGTPrepMixin:
             dtype=torch.bool,
         )
 
-        for inst_col in range(int(inst_ids_n.numel())):
-            inst_id = int(inst_ids_n[inst_col].item())
-            mask = (inst_txyz == inst_id)
-            if not bool(mask.any().item()):
-                continue
-            cls_vals = cls_txyz[mask]
-            keep_cls = (cls_vals != int(background_index)) & (cls_vals != int(ignore_index))
-            cls_vals = cls_vals[keep_cls]
-            if cls_vals.numel() <= 0:
-                continue
-            uniq_cls, cls_counts = torch.unique(cls_vals, sorted=True, return_counts=True)
-            if uniq_cls.numel() == 1:
-                gt_inst_cls_n[inst_col] = uniq_cls[0]
+        # torch.unique(dim=0) 1회로 (instance,class) 쌍을 grid 전체에서 한꺼번에 집계 —
+        # 인스턴스 수(K)만큼 grid를 반복 스캔하던 이전 loop 제거, 출력은 bit-identical
+        # (CHANGELOG 참고). 뒤쪽 loop는 grid가 아니라 unique-pair 개수(보통 K개 안팎)만큼만
+        # 돌아서 비용이 사실상 없음.
+        inst_flat = inst_txyz.reshape(-1)
+        cls_flat = cls_txyz.reshape(-1)
+        keep_voxel = (
+            (cls_flat != int(background_index))
+            & (cls_flat != int(ignore_index))
+            & (inst_flat != 0)
+        )
+        inst_flat = inst_flat[keep_voxel]
+        cls_flat = cls_flat[keep_voxel]
+        if inst_flat.numel() > 0:
+            pairs = torch.stack([inst_flat, cls_flat], dim=1)
+            uniq_pairs, pair_counts = torch.unique(pairs, dim=0, return_counts=True)
+            order = torch.argsort(uniq_pairs[:, 0], stable=True)
+            u_inst = uniq_pairs[order, 0]
+            u_cls = uniq_pairs[order, 1]
+            u_cnt = pair_counts[order]
+            id_to_group = {}
+            i = 0
+            n_groups = int(u_inst.numel())
+            while i < n_groups:
+                j = i
+                while j < n_groups and bool(u_inst[j] == u_inst[i]):
+                    j += 1
+                id_to_group[int(u_inst[i].item())] = (i, j)
+                i = j
+            for inst_col in range(int(inst_ids_n.numel())):
+                span = id_to_group.get(int(inst_ids_n[inst_col].item()))
+                if span is None:
+                    continue
+                s, e = span
+                grp_cls = u_cls[s:e]
+                grp_cnt = u_cnt[s:e]
+                if grp_cls.numel() == 1:
+                    gt_inst_cls_n[inst_col] = grp_cls[0]
+                    gt_inst_cls_valid_n[inst_col] = True
+                    continue
+                top_count = grp_cnt.max()
+                top_mask = grp_cnt == top_count
+                if int(top_mask.sum().item()) != 1:
+                    # Exact tie: skip cls supervision for this instance rather than
+                    # injecting an arbitrary label into Hungarian cls cost / cls loss.
+                    continue
+                gt_inst_cls_n[inst_col] = grp_cls[top_mask][0]
                 gt_inst_cls_valid_n[inst_col] = True
-                continue
-            top_count = cls_counts.max()
-            top_mask = cls_counts == top_count
-            if int(top_mask.sum().item()) != 1:
-                # Exact tie: skip cls supervision for this instance rather than
-                # injecting an arbitrary label into Hungarian cls cost / cls loss.
-                continue
-            gt_inst_cls_n[inst_col] = uniq_cls[top_mask][0]
-            gt_inst_cls_valid_n[inst_col] = True
 
         # Convert raw semantic ids to compact classifier ids [0..C-1].
         raw_to_compact = getattr(self, "query_raw_to_compact_class_map", None)

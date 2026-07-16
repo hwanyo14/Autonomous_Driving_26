@@ -14,6 +14,11 @@
 # 요지: attn map을 카메라 축(Ncam) 합/OR로 눌러 H×W로 비교하던 것을, (Ncam,H,W)를 통째로
 #   flatten해서 비교하도록 변경. 이전엔 서로 다른 카메라의 같은 (h,w) 배열 인덱스가 같은
 #   슬롯으로 취급돼 attn mass/IoU가 섞일 수 있었음(scale/offset/GMO 계열과 무관, attn 전용).
+#
+# [_newgt 재배선 2026-07-13] GT 소스를 구 캐시(nuScenes-Occupancy_inst3d/efficientocf_bboxcls)에서
+#   새 GT 파이프라인(efficientocf_gt_f3)으로 전환. center/attn GT는 이제 gt_bbox_aabb(E)에서 생성
+#   (loading_instance.py §8.3 분기, load_segmentation_instance3d=False). 구 캐시 로딩 코드 자체도
+#   loading_instance.py에서 완전 삭제됨 — 이 레포는 새 GT 전용. model_cfg는 무수정(단일변수).
 
 # Basic params ******************************************
 _base_ = ['../datasets/custom_nus-3d.py', '../_base_/default_runtime.py']
@@ -43,8 +48,9 @@ ocf_dataset_path = "./data/efficientocf/"
 occ_path = "./data/nuScenes-Occupancy"
 nusc_root = './data/nuscenes/'
 occ_dt_path = "./data/occ_dt"
-segmentation_cls_dataset_path = "./data/efficientocf_bboxcls/"
-gt_occ_inst_dataset_path = "./data/nuScenes-Occupancy_inst3d/"
+gt_occ_inst_dataset_path = "./data/efficientocf_gt_f3/"
+# center/attn GT 소스(E) — load_segmentation_instance3d=False라 아래서 이 경로로 생성.
+gt_bbox_aabb_dataset_path = "./data/efficientocf_gt_f3/"
 
 # Query/GMO foreground semantic classes use sparse raw nuScenes occupancy ids:
 # [2, 3, 4, 5, 6, 9, 10] + background(0); pedestrian(7) excluded
@@ -60,7 +66,6 @@ class_names = [
 query_class_ids = [0, 2, 3, 4, 5, 6, 9, 10]
 query_class_names = ['background'] + class_names
 exclude_occ_class_ids = (7,)  # pedestrian: 로드 단계에서 제거 (nohuman)
-validate_segmentation_cls_instance3d_alignment = True
 strict_query_class_id_validation = True
 use_separate_classes = False
 use_fine_occ = False
@@ -143,12 +148,10 @@ train_pipeline = [
         use_separate_classes=use_separate_classes,
         validate_cache=validate_instance_cache,
         write_cache=write_instance_cache,
-        load_segmentation_instance3d=True,
-        load_segmentation_cls_instance3d=True,
-        segmentation_cls_dataset_path=segmentation_cls_dataset_path,
-        validate_segmentation_cls_instance3d_alignment=validate_segmentation_cls_instance3d_alignment,
         load_gt_occ_inst=True,
         gt_occ_inst_dataset_path=gt_occ_inst_dataset_path,
+        load_gt_bbox_aabb=True,
+        gt_bbox_aabb_dataset_path=gt_bbox_aabb_dataset_path,
         exclude_occ_class_ids=exclude_occ_class_ids,
     ),
     dict(
@@ -192,9 +195,8 @@ train_pipeline = [
             'segmentation',
             'segmentation_bev',
             'instance_bev',
-            'segmentation_instance3d',
-            'segmentation_cls_instance3d',
             'gt_occ_inst',
+            'gt_bbox_aabb',
             'gt_instance_centers_world',
             'gt_instance_centers_valid',
             'gt_instance_ids',
@@ -243,12 +245,10 @@ test_pipeline = [
         use_separate_classes=use_separate_classes,
         validate_cache=validate_instance_cache,
         write_cache=write_instance_cache,
-        load_segmentation_instance3d=True,
-        load_segmentation_cls_instance3d=True,
-        segmentation_cls_dataset_path=segmentation_cls_dataset_path,
-        validate_segmentation_cls_instance3d_alignment=validate_segmentation_cls_instance3d_alignment,
         load_gt_occ_inst=True,
         gt_occ_inst_dataset_path=gt_occ_inst_dataset_path,
+        load_gt_bbox_aabb=True,
+        gt_bbox_aabb_dataset_path=gt_bbox_aabb_dataset_path,
         exclude_occ_class_ids=exclude_occ_class_ids,
     ),
     dict(
@@ -290,8 +290,6 @@ test_pipeline = [
             'segmentation',
             'segmentation_bev',
             'instance_bev',
-            'segmentation_instance3d',
-            'segmentation_cls_instance3d',
             'gt_occ_inst',
             'gt_instance_centers_world',
             'gt_instance_centers_valid',

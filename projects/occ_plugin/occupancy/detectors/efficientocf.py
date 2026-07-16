@@ -130,6 +130,7 @@ class EfficientOCF(
             num_queries=self.query_num_queries,
             num_heads=4,
             num_layers=self.query_transformer_num_layers,
+            kv_resolutions=self.query_transformer_kv_resolutions,
             num_cams=6,
             embed_dim=self.query_embed_dim,
             max_time=self.time_receptive_field,
@@ -1796,7 +1797,9 @@ class EfficientOCF(
                         iou_3d=float("nan"), iou_3d_bbox=float("nan"),
                         iou_3d_bbox_rot=float("nan"),
                         recall_3d=float("nan"),
-                        recall_3d_comps=dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0))
+                        recall_3d_comps=dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0),
+                        recall_3d_rot=float("nan"),
+                        recall_3d_rot_comps=dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0))
         empty = _pack(np.zeros((2, 2), dtype=np.int64))
 
         # eval 시각화(EOCF_EVAL_VIS=1)일 때만 attn/cam-gaussian용 디버그 산출물도 함께 반환.
@@ -2011,7 +2014,9 @@ class EfficientOCF(
         iou_3d, recall_3d = float("nan"), float("nan")
         iou_3d_bbox = float("nan")
         iou_3d_bbox_rot = float("nan")
+        recall_3d_rot = float("nan")
         r3d_comps = dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0)
+        r3d_rot_comps = dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0)
         cm_bbox = np.zeros((2, 2), dtype=np.int64)
         cm_bbox_rot = np.zeros((2, 2), dtype=np.int64)
         # bbox GT v2(annotation 재생성: 생성소멸·사람 필터 + rotated OBB) 우선 사용.
@@ -2110,6 +2115,10 @@ class EfficientOCF(
                             if torch.is_tensor(rot3d_t) and int(rot3d_t.shape[0]) >= t_eval:
                                 iou_3d_bbox_rot, _, _ = self._iou_recall_3d(
                                     pred_zyx_t, rot3d_t[:t_eval])
+                                # Recall3d(bbox_rot): base=inst3d(gt3d_t) 그대로, 관용 영역만
+                                # AABB→rot OBB로 교체. rot⊂aabb라 관용이 좁아져 방향까지 맞아야 함.
+                                _, recall_3d_rot, r3d_rot_comps = self._iou_recall_3d(
+                                    pred_zyx_t, gt3d_t, bbox3d=rot3d_t[:t_eval], valid3d=valid_arg)
 
         # ---- eval-time query visualization (opt-in via EOCF_EVAL_VIS) ----
         # metric 계산 뒤로 이동: 4행 비교(eval 실제 pred_bev_t vs aligned AABB GT)를
@@ -2132,7 +2141,8 @@ class EfficientOCF(
                     height_l1=torch.tensor(0.0),
                     iou_3d=iou_3d, iou_3d_bbox=iou_3d_bbox,
                     iou_3d_bbox_rot=iou_3d_bbox_rot, recall_3d=recall_3d,
-                    recall_3d_comps=r3d_comps)
+                    recall_3d_comps=r3d_comps,
+                    recall_3d_rot=recall_3d_rot, recall_3d_rot_comps=r3d_rot_comps)
 
     @staticmethod
     def _binary_occ_cm(pred_bin, gt_bin):
@@ -2348,7 +2358,9 @@ class EfficientOCF(
         return None
 
     def _eval_load_bbox_gt_v2(self, img_metas):
-        """재생성 bbox GT v2 lazy-load (tools/gen_data/gen_bbox_gt_v2.py 산출물).
+        """eval 전용 bbox GT lazy-load. 기본 소스는 새 GT 파이프라인 산출물
+        (tools/gen_data/gen_new_gt_pipeline.py, ./data/efficientocf_gt_f3/GMO) — 폴더 구조/키
+        네이밍이 구 v2 캐시와 동일해 로직 변경 없이 경로만 교체됨(2026-07-13 재배선).
 
         returns {"aabb": [T,X,Y,Z] long, "rot": [T,X,Y,Z] long} (값=cls id) 또는
         파일 부재 시 None. 경로는 EOCF_BBOX_GT_V2_DIR로 override 가능.
@@ -2361,7 +2373,7 @@ class EfficientOCF(
         cache = getattr(self, "_eval_bbox_v2_cache", None)
         if isinstance(cache, tuple) and cache[0] == key:
             return cache[1]
-        root = os.environ.get("EOCF_BBOX_GT_V2_DIR", "./data/efficientocf_bboxcls_v2/GMO")
+        root = os.environ.get("EOCF_BBOX_GT_V2_DIR", "./data/efficientocf_gt_f3/GMO")
         x_dim = int(self.voxelizer.W)
         y_dim = int(self.voxelizer.H)
         z_dim = int(self.voxelizer.D)
@@ -2675,16 +2687,20 @@ class EfficientOCF(
             if (isinstance(gt_occ_inst_bundle, dict) and torch.is_tensor(gt_occ_inst_bundle.get("seg_cls_inst_tcxzy", None)))
             else gt_segmentation_cls_instance3d_tcxyz
         )
-        # focal3d GT 혼합용 AABB bbox dense (gt_occ_inst와 동일 id 공간, v3 캐시).
+        # focal/dice GT 혼합용 AABB bbox dense (gt_occ_inst와 동일 id 공간, v3 캐시).
         gt_bbox_aabb_inst_txyz = None
-        if float(getattr(self, "query_gmo_focal_bbox_weight", 0.0)) > 0.0:
+        _need_bbox_gt = (
+            float(getattr(self, "query_gmo_focal_bbox_weight", 0.0)) > 0.0
+            or float(getattr(self, "query_gmo_dice_bbox_weight", 0.0)) > 0.0
+        )
+        if _need_bbox_gt:
             gt_bbox_aabb_inst_txyz = self._prepare_gt_bbox_aabb_dense_txyz(
                 gt_bbox_aabb=gt_bbox_aabb,
                 fallback_segmentation_instance3d_txyz=gt_segmentation_instance3d_txyz,
             )
             if gt_bbox_aabb_inst_txyz is None:
                 raise ValueError(
-                    "query_gmo_focal_bbox_weight>0 requires gt_bbox_aabb from the pipeline "
+                    "query_gmo_{focal,dice}_bbox_weight>0 requires gt_bbox_aabb from the pipeline "
                     "(LoadInstanceWithFlow load_gt_bbox_aabb=True + Collect3D key)."
                 )
 
@@ -3607,6 +3623,8 @@ class EfficientOCF(
                 ),
                 focal_inst3d_weight=float(getattr(self, "query_gmo_focal_inst3d_weight", 1.0)),
                 focal_bbox_weight=float(getattr(self, "query_gmo_focal_bbox_weight", 0.0)),
+                dice_inst3d_weight=float(getattr(self, "query_gmo_dice_inst3d_weight", 1.0)),
+                dice_bbox_weight=float(getattr(self, "query_gmo_dice_bbox_weight", 0.0)),
             )
 
         if torch.is_tensor(query_cls_scores_tqc) and query_cls_scores_tqc.numel() > 0:

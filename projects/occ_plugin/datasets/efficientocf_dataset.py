@@ -504,17 +504,29 @@ class EfficientOCFDataset(NuScenesDataset):
             eval_results['IOU_3d_bbox_aabb'] = sum(results['iou_3d_bbox']) / len(results['iou_3d_bbox'])
         if results.get('iou_3d_bbox_rot'):
             eval_results['IOU_3d_bbox_rot'] = sum(results['iou_3d_bbox_rot']) / len(results['iou_3d_bbox_rot'])
+        # Recall3d(bbox_aabb): base=inst3d, 관용=AABB box. Recall3d(bbox_rot): 관용=rot OBB (더 엄격).
         if results.get('recall_3d'):
-            eval_results['Recall_3d'] = sum(results['recall_3d']) / len(results['recall_3d'])
+            eval_results['Recall3d(bbox_aabb)'] = sum(results['recall_3d']) / len(results['recall_3d'])
         if results.get('recall_3d_comps') is not None and len(results['recall_3d_comps']) > 0:
             comps = np.sum(np.stack([np.asarray(c) for c in results['recall_3d_comps']]), axis=0)
             tp, fp, fn, bfp = [float(v) for v in comps]
             denom = tp + fn + fp - bfp
-            eval_results['Recall_3d_TP'] = tp
-            eval_results['Recall_3d_FP'] = fp
-            eval_results['Recall_3d_FN'] = fn
-            eval_results['Recall_3d_bboxFP'] = bfp
-            eval_results['Recall_3d_micro'] = (tp + bfp) / denom if denom > 0 else float('nan')
+            eval_results['Recall3d(bbox_aabb)_TP'] = tp
+            eval_results['Recall3d(bbox_aabb)_FP'] = fp
+            eval_results['Recall3d(bbox_aabb)_FN'] = fn
+            eval_results['Recall3d(bbox_aabb)_bboxFP'] = bfp
+            eval_results['Recall3d(bbox_aabb)_micro'] = (tp + bfp) / denom if denom > 0 else float('nan')
+        if results.get('recall_3d_rot'):
+            eval_results['Recall3d(bbox_rot)'] = sum(results['recall_3d_rot']) / len(results['recall_3d_rot'])
+        if results.get('recall_3d_rot_comps') is not None and len(results['recall_3d_rot_comps']) > 0:
+            comps = np.sum(np.stack([np.asarray(c) for c in results['recall_3d_rot_comps']]), axis=0)
+            tp, fp, fn, bfp = [float(v) for v in comps]
+            denom = tp + fn + fp - bfp
+            eval_results['Recall3d(bbox_rot)_TP'] = tp
+            eval_results['Recall3d(bbox_rot)_FP'] = fp
+            eval_results['Recall3d(bbox_rot)_FN'] = fn
+            eval_results['Recall3d(bbox_rot)_bboxFP'] = bfp
+            eval_results['Recall3d(bbox_rot)_micro'] = (tp + bfp) / denom if denom > 0 else float('nan')
 
         def _to_py(val):
             if torch.is_tensor(val):
