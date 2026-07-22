@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-07-20 20:40 KST — IoU3d(asset) threshold sweep → top-2 full eval 자동화
+
+- `eval_sweep_asset_top2.sh` 추가: pyramid epoch14 checkpoint에서 FG `{0.75,0.85,0.9}` × OCC `{0.75,0.8,0.85,0.9}` 총 12조합을 fixed-val 600샘플로 순차 평가한다.
+- 각 조합의 최종 `IoU3d(asset)`을 `sweep_results.tsv`에 저장·내림차순 정렬하고 상위 2개 조합만 `EOCF_EVAL_MAX_SAMPLES=0`으로 전체 5,119샘플 재평가한다.
+- sweep 구간은 시각화를 끄고, top-2 full 구간은 기본적으로 기존 ABC eval과 동일하게 시각화를 켠다(`FULL_VIS=0`으로 비활성화 가능). 실행 중인 다른 `tools/test.py`가 있으면 기본적으로 종료를 기다린다(`WAIT_FOR_EVALS=0`으로 즉시 시작 가능).
+- 조합별 live metric 로그와 `sweep_ranked.tsv`, `top2_full_results.tsv`를 실행별 `work_dirs/.../asset_sweep/<timestamp>/` 아래에 분리 저장한다.
+
+## 2026-07-20 19:25 KST — hybrid asset IoU2d/IoU3d/Recall3d 추가
+
+- `nuscenes_gmo_full_hybrid_solid_data_v1/val`의 `segmentation_instance_saved_list2`(fine occupancy ∪ asset occupancy)를 평가 전용 asset GT로 lazy-load하도록 추가했다. 기존 fine inst3d GT와 동일하게 pedestrian(class 7) 필터, future slice, 3D align을 적용한다.
+- `IoU2d(asset)`/`IoU3d(asset)`은 hybrid 합집합 GT와 기존 prediction의 confusion matrix를 전체 eval voxel 기준 micro 집계한다.
+- `Recall3d(asset)`은 기존 fine inst3d를 base GT로 유지하고 hybrid 합집합 내부 FP를 허용하는 기존 Cam4DOcc 공식을 그대로 사용하며, AABB/Rot과 동일하게 sample macro·voxel micro 및 TP/FP/FN/bboxFP를 출력한다.
+- `eval_asset_gt_root` config와 `EOCF_EVAL_ASSET_GT_ROOT` 실행 시 override를 추가했다. 저장소에 `EfficientOCF_V1.1_1gpu.py`가 없어 공통 default 및 현재 평가 config(`full.py`, pyramid config)에 반영했다.
+- 검증 중 외부 asset dense tensor의 CPU/CUDA mismatch를 확인해 기존 AABB/Rot과 동일하게 prediction device로 이동하도록 보완했다.
+- Python compile, MMCV config parse, `git diff --check`, 실제 NPZ fine⊆hybrid 검사와 pyramid epoch13 1-sample end-to-end eval을 통과했다. 최종 로그에서 asset IoU2d `0.2896`, IoU3d `0.2005`, Recall3d macro/micro `0.3974` 및 성분 집계 출력을 확인했다.
+
+## 2026-07-15 21:04 KST — f3 단일 GT 기반 Cam4DOcc식 eval metric suite
+
+- **eval GT 통일**: `full.py`의 `model_cfg.eval_gt_root='./data/efficientocf_gt_f3/GMO'` 추가. `efficientocf.py`가 prediction 생성 후 sample token으로 `segmentation_{instance3d,aabb,rot}` 3종 NPZ를 직접 binary dense 로드한다. `EOCF_EVAL_GT_ROOT`로 실행 시 override 가능하며 oracle/matching·학습 loss에는 미사용.
+- **metric 정의**: 동일 `pred_txyz`에 대해 `IoU2d/IoU3d × {nusocc(inst3d), aabb, rot}` confusion matrix를 반환하고 전체 eval voxel 기준 micro IoU로 집계. Recall3D는 inst3d를 base GT로 두고 AABB/Rot 내부 FP를 각각 허용하며 macro(sample 평균)·micro(voxel 합산)와 TP/FP/FN/bboxFP를 모두 출력한다. 기존 metric key는 호환용으로 유지.
+- **분산 집계/출력**: `occupancy/apis/test.py`에 full-suite 누적·all-reduce·중간/최종 로그 추가, `efficientocf_dataset.py`에 최종 결과 key 추가.
+- **test pipeline 정리**: `full.py` test pipeline에서 미사용 `occ_dt` strict 로딩/수집을 비활성화(`use_query_dt_loss=False`; train pipeline은 유지). 누락 DT cache 때문에 eval 시작이 막히던 문제 해소.
+- **PyTorch 2.7/MMCV 1.7 eval 호환**: `tools/test.py`에 제거된 DDP private flag fallback과 scatter CUDA id→`torch.device` 변환 가드 추가. inference 수치/모델에는 영향 없음.
+- **환경/검증**: `eof` Conda 환경에서 `occ_pool_ext`를 CUDA 12.8/SM120으로 재빌드. py_compile·`git diff --check` 통과, `full.py + epoch_15_lss_only.pth` future/oracle-off 2-sample end-to-end smoke 통과. 400-sample eval은 사용자 요청으로 166/400에서 중단(`logs/full/eval/20260715_210422.log`); 마지막 완결 누적값은 150-sample 지점.
+
 ## 2026-07-06 KST — eval 실험 스위치 2종: NMS off + 렌더 가중치 독립화 (`eval_sweep_indep.sh`)
 
 - **`utils_visualization.py`**: `EOCF_EVAL_NMS_RADIUS` env — distance NMS 반경 override (0=off). 미설정 시 config 값(3.0m).
@@ -1201,3 +1226,118 @@ py_compile 통과. 시각화 전용이라 학습/평가 수치 영향 없음.
 - `projects/configs/baselines/test_traj_mcls_occ.py`: `evaluation = dict(...)` 블록 삭제, eval 전용 `val_config`/`data['val']` 삭제, 미사용 `import copy` 삭제. (`test_config`/`test_pipeline`은 tools/test.py용이라 유지)
 
 **영향**: train 중 eval 없음(전역). test.py를 통한 별도 평가는 영향 없음. 다른 실험 config들(test_traj.py, EfficientOCF_V1.1_1gpu.py 등)에 남아있는 `evaluation` dict는 이제 dead code지만 별도 실험 소유라 미수정.
+## 2026-07-20 10:38 KST
+
+### full_attn_cover_pyr_aabb_dice3d_new ABC eval 이식
+
+**핵심 내용**: `Autonomous_Driving_26_new_data`에서 학습한 3-layer coarse-to-fine query-attention checkpoint를 현재 레포의 f3 ABC 평가 경로로 실행할 수 있게 최소 호환 코드를 이식.
+
+**주요 변경사항**:
+- `projects/configs/baselines/full_attn_cover_pyr_aabb_dice3d_new.py` 추가. eval에서는 사용하지 않고 val 캐시도 불완전한 `occ_dt` 로딩/수집만 비활성화
+- `transformer.py`, `efficientocf_config.py`, `efficientocf.py`: layer별 KV 해상도 `(14,25) -> (28,50) -> (56,100)` 지원 및 전달 추가
+- `loading_instance.py`: `gt_bbox_aabb_subdir` 지원, AABB sparse GT 기반 center/id/dimension 생성, voxel center의 `-resolution/2` 좌표 보정 이식
+- `eval_total_abc.sh`: 새 config와 `work_dirs/full_attn_cover_pyr_aabb_dice3d_new/epoch_12_lss_only.pth` 연결
+- `PROJECT_STRUCTURE.md`: 새 baseline config 반영
+
+**검증**:
+- Python compile, shell syntax, MMCV config parse 통과
+- dataset build 및 첫 val sample pipeline 통과 (`5119` samples, center/valid/id 정상 수집)
+- checkpoint 구조 확인: CA layer `0/1/2`, 모델 build 시 KV resolutions 일치, 학습 parameter missing key 없음
+- `EOCF_EVAL_MAX_SAMPLES=1`, GPU 1장 smoke eval 통과. IoU2d/3d nusocc·AABB·Rot, Recall3d AABB·Rot, ABC Strict/A/B/C 최종 metric 출력 확인
+## 2026-07-20 10:53 KST
+
+### pyramid eval query_debug_vis 2D PNG shape 정규화
+
+- 증상: pyramid epoch 12 eval에서 `query_mixture3d_vis`와 `query_cam_gaussian_vis` PNG 및 `query_debug_vis/*.pt`는 저장되지만 `query_debug_vis/*_prob.png`만 생성되지 않음.
+- 원인/수정: 2D renderer에 전달하는 eval prediction을 실제 Z-collapse BEV로 만든 뒤 GT의 XY/Z shape에 맞춰 정규화. eval volume의 Z/XY shape 차이로 renderer가 조용히 반환하는 경로를 제거.
+- 검증: py_compile 및 의도적으로 `(Z,Y,X)=(10,128,128)`인 prediction을 `(40,512,512)` GT canvas로 정규화하는 CPU renderer probe 통과, `probe_000002_prob.png` 생성 확인.
+- 현재 실행 중이던 eval 프로세스는 수정 전 코드를 이미 로드했으므로 재시작한 eval부터 적용.
+## 2026-07-20 11:08 KST
+
+### query_debug_vis shape 정규화 import 누락 수정
+
+- `efficientocf.py`의 eval 2D canvas shape 정규화가 사용하는 `torch.nn.functional as F` import 추가.
+- 수정 전 11:00 시작 run 로그의 `[eval_vis] skipped (err=name 'F' is not defined)` 원인 해소.
+- py_compile 및 모듈 import에서 `F.interpolate` 바인딩 확인.
+## 2026-07-20 11:14 KST
+
+### pyramid query_debug_vis GT 좌표계 정렬
+
+- 동일 sample 비교 결과, 새 f3 pipeline GT를 정렬 전에 2D renderer로 넘겨 GT가 화면 경계로 밀리는 문제 확인.
+- metric이 실제 채점에 사용한 정렬 완료 `gt3d_t [T,Z,Y,X]`를 renderer 형식 `[T,X,Y,Z]`로 변환해 `query_debug_vis`에 전달.
+- 기존 `full_attn_cover`와 동일 renderer/행 구성을 유지하면서 GT와 query/prediction을 model 좌표계에서 일치시킴.
+## 2026-07-20 11:18 KST
+
+### pyramid eval-vis를 기존 renderer 입력 방식으로 환원
+
+- 잘못 추가했던 prediction BEV collapse/interpolate/expand 정규화와 `torch.nn.functional` import를 제거.
+- 기존과 동일하게 원본 full-resolution prediction을 `maybe_save_query_debug_vis`에 직접 전달.
+- 새 f3 pipeline의 축소 GT 대신 metric에서 사용한 aligned 512 GT를 넘기는 변경만 유지. 따라서 pyramid 외 eval/visualization 방식은 기존 `full_attn_cover`와 동일.
+
+## 2026-07-20 13:11 KST
+
+### pyramid epoch 13 ABC Oracle eval 래퍼 추가
+
+- `eval_oracle_abc.sh` 추가: `full_attn_cover_pyr_aabb_dice3d_new.py` + `epoch_13_lss_only.pth` 조합으로 Oracle Hungarian query 선택 평가.
+- future 600 samples, occupancy threshold 0.85, ABC/IoU/Recall3d 메트릭 설정.
+- `PROJECT_STRUCTURE.md`에 신규 루트 스크립트 반영.
+
+## 2026-07-20 13:18 KST
+
+### ABC Oracle eval 시각화를 Hungarian query로 통일
+
+- Oracle 매칭 결과를 visualization bundle의 `selected_*` query/center/sigma/mixture/yaw/weight로 승격해 metric과 시각화가 동일 query를 사용하도록 연결.
+- `query_debug_vis`, `query_mixture3d_vis`, `query_cam_gaussian_vis`가 모두 Oracle Hungarian-matched query 기준으로 저장됨.
+- `eval_oracle_abc.sh`에서 시각화를 활성화하고 48샘플 간격으로 설정.
+
+## 2026-07-20 13:56 KST
+
+### 일반/Oracle eval future trajectory refine 정합화
+
+- `simple_test()` 공통 경로에서 학습과 동일한 `query_head.refine_trajectory_absolute_xy()`를 호출하도록 수정해 일반 eval과 Oracle eval 모두 미래 4프레임 metric/시각화에 refined XY를 사용.
+- 학습 순서를 보존해 Oracle Hungarian cost는 refine 전 `feat_out` raw geometry로 계산하고, matching 이후 trajectory center와 future mixture center에 refine delta를 적용.
+- 새 eval의 첫 sample에서 refine 적용 여부와 XY 평균/최대 이동량을 한 번 출력해 checkpoint 실동작을 확인할 수 있도록 진단 로그 추가.
+- 현재 실행 중인 `20260720_132454` 프로세스는 수정 전 코드를 로드했으므로 기존 unrefined 결과이며, 재실행부터 반영.
+- 검증: py_compile/git diff check 통과. epoch 13 checkpoint로 일반/Oracle 각각 1-sample GPU eval 완료; 두 경로 모두 `mean_abs=1.5250m`, `max_abs=12.6323m` refine 적용 로그와 최종 metric 출력 확인. Oracle 최종 순서(raw Hungarian→refine)에서 query_debug/mixture3d/cam-gaussian 파일 생성도 확인.
+
+## 2026-07-20 14:39 KST
+
+### eval query depth-confidence 진단값 저장
+
+- `simple_test()`에서 present-frame query depth distribution의 entropy와 `1 - H/log(D)` normalized confidence를 계산.
+- eval `query_vis.pt` sidecar에 query별 `depth_entropy_q`, `depth_conf_q`를 추가해 cls/depth score scale을 checkpoint 재학습 없이 비교할 수 있도록 함.
+- future-mode visualization bundle에도 cls/IoU/depth 진단 tensor를 전달해 sidecar에서 누락되지 않도록 함.
+- scoring, query selection, occupancy metric에는 영향을 주지 않는 진단 저장만 추가.
+- `full_attn_cover_pyr_aabb_dice3d_new/epoch_13_lss_only.pth`로 fixed-val 16샘플(3,200 queries) probe 완료: cls median 0.0686/p90 0.8862, depth confidence median 0.3539/p90 0.4565, Pearson 0.6224. 기존 threshold 0.75 사용 시 cls 598개 대비 `cls^0.75*depth^0.25` 283개로 선택 scale이 크게 달라짐; 동일 개수 기준 geometric threshold는 약 0.6394.
+- 검증: 변경 파일 `py_compile`, `git diff --check` 통과. probe 산출물은 `work_dirs/_analysis/depth_conf_scale_pyr_epoch13_16/`에 저장.
+- 같은 probe tensor만 오프라인 분석해 raw 분포, cls-depth 상관, depth exponent별 고정-threshold 선택 수, 동일 선택-budget threshold 및 Top-10 overlap을 한 장으로 정리한 `cls_depth_scale_probe.png`를 생성(추가 GPU eval 없음).
+- 저장된 future candidate mixture와 외부 f3 GT를 사용해 모델 forward 없이 512x512x40 occupancy를 재렌더하고, `eval_total_abc_2.sh` 기준 OCC threshold 0.85에서 standardized-depth logit weight beta={0,0.1,0.2,0.3,0.5} x cls-equivalent selection budget(thr 0.95/0.90/0.85)을 스윕.
+- offline renderer 교차검증: 원 probe 조건(FG/OCC 0.75)에서 기존 eval 대비 IOU3d AABB `0.150661 vs 0.150648`, Recall3d AABB `0.423617 vs 0.423592`로 일치.
+- 16-sample 예비 승자: cls-thr 0.85 동등 budget(382 queries), beta=0.5, combined score를 selection+render weight에 사용 시 IOU3d AABB `0.148287`(cls baseline `0.139606`), Recall3d AABB `0.490590`(baseline `0.463152`). recall 최대 후보는 cls-thr 0.90 동등 budget, beta=0.2, selection-only(`0.130483 / 0.496947`).
+- 산출물: `offline_aabb_score_sweep.csv`, `offline_aabb_score_sweep_coupled.csv`, `offline_aabb_score_sweep.png` (`work_dirs/_analysis/depth_conf_scale_pyr_epoch13_16/`). 16샘플 예비 결과이므로 larger fixed-val 확인 필요.
+
+## 2026-07-20 15:44 KST
+
+### cls+depth confidence 자동 calibration/eval/sweep 파이프라인
+
+- `eval_depth.sh` 추가: 사용자 조정 구간에서 checkpoint/샘플 수, AUTO_STATS, depth mean/std/beta, FG/OCC threshold, render weight, sweep grid를 관리. 기본은 256 calibration → 256 depth eval → offline AABB sweep이며 `0` 지정 시 전체 5,119 samples.
+- eval depth score를 env-gated로 구현: `sigmoid(logit(cls_conf) + beta * ((depth_conf - mean) / std))`; 기존 score는 `EOCF_EVAL_DEPTH_SCORE=0`이면 완전 유지. combined/cls/ones render weight 선택 지원.
+- `EOCF_EVAL_DEPTH_STATS_ONLY=1` 경량 pass와 compact query dump 추가. mixture 저장은 `EOCF_EVAL_DEPTH_SAVE_MIXTURE=1`로 별도 활성화해 용량을 통제.
+- `tools/dbg_probe/eval_depth_stats.py` 추가: dump의 전체 query depth mean/std/quantile을 `depth_stats.json`으로 저장하고 shell 자동 주입값 출력.
+- `tools/dbg_probe/eval_depth_sweep.py` 추가: 저장된 future mixture와 외부 f3 GT로 모델 forward 없이 beta x selection-budget x render-mode의 IOU3d/Recall3d AABB를 재렌더하고 `depth_score_sweep.csv`, `depth_score_best.json` 생성.
+- 저장량 실측/추정: compact dump 1샘플 6.5KB(전체 약 34MB), mixture cache는 기존 16샘플 평균 기준 전체 약 2.6GB.
+- 검증: `bash -n`, 변경 Python `py_compile`, `git diff --check` 통과. pyramid epoch13 1-sample stats-only dump/JSON, combined-score 실제 eval+mixture dump, offline cls/combined sweep smoke 통과.
+- 사용자 실행 단순화를 위해 `eval_depth.sh` 기본값을 기존 epoch13 16-sample probe 통계(mean `0.360986`, std `0.082748`) 고정(`AUTO_STATS=0`) 및 승자 FG threshold `0.891228`로 변경. 기본 실행은 통계 pass 없이 256-sample eval → beta/FG-budget offline sweep.
+- 사용자 확정 workflow에 맞춰 기본 `EVAL_SAMPLES=0`(전체 5,119)으로 변경. 먼저 기존 16-sample mean/std와 승자 hyperparameter로 full eval 결과를 출력한 뒤, 누적 dump 전체의 mean/std를 `eval_depth_stats.json`으로 다시 계산해 그 통계로 offline beta/FG-budget sweep을 수행.
+- workflow를 다시 분리: 기본 `RUN_SWEEP=0`, mixture 저장 OFF. 이번 full eval은 현재 추천 score의 metric만 채점하고 compact cls/depth dump(전체 예상 약 34MB)에서 `eval_depth_stats.json`을 생성한다. 관측 mean/std는 현재 실행 score에 재적용하지 않으며, 추후 별도 sweep/run에 사용.
+- full eval에서도 기존 query/mixture/attention 시각화를 확인할 수 있도록 `SAVE_VIS=1`, `VIS_EVERY=50`을 추가. 출력은 실행별 `eval_vis/`에 격리하며 통계 수집용 calibration pass에는 시각화를 생성하지 않는다.
+- 기존 eval 시각화 주기와 맞추기 위해 `eval_depth.sh`의 `VIS_EVERY`를 50에서 48로 조정. CAM 시각화의 matched query 최대 8개 설정은 기존 config 값을 그대로 사용한다.
+
+## 2026-07-22 13:08 KST
+
+### eval cls+depth score의 통계 calibration 제거
+
+- depth 결합식을 `sigmoid(logit(cls_conf) + beta * depth_confidence)`로 단순화하고 `depth_mean/std`, `depth_z`, stats-only calibration 경로를 제거.
+- `eval_total_abc.sh`에서 raw depth-confidence score를 활성화하고 `beta=1.0`, combined selection/render weight를 사용하도록 연결. 기존 FG/OCC threshold는 각각 `0.75`/`0.85`로 유지.
+- `eval_depth.sh`와 offline sweep도 같은 raw confidence 수식으로 통일하고 epoch 15 checkpoint를 사용하도록 정리. 더 이상 사용하지 않는 `eval_depth_stats.py` 삭제.
+- 검증: `bash -n`, 변경 Python `py_compile`, 관련 파일 `git diff --check` 통과.

@@ -1,4 +1,10 @@
 MODEL_CFG_DEFAULTS = {
+    # Eval-only external GT suite root containing segmentation_{instance3d,aabb,rot}.
+    # None keeps the legacy pipeline/fallback GT behavior.
+    "eval_gt_root": None,
+    # Eval-only hybrid GT root. segmentation_instance_saved_list2 is
+    # fine occupancy union asset occupancy and is used only for asset metrics.
+    "eval_asset_gt_root": None,
     "gmo_ids": (2, 3, 4, 5, 6, 7, 9, 10),
     "use_segmentation_as_query_gt": False,
     "use_gmo_bce_loss": False,
@@ -176,6 +182,9 @@ MODEL_CFG_DEFAULTS = {
     "query_embed_dim": 256,
     "query_num_queries": 100,
     "query_transformer_num_layers": 1,
+    # Per-layer cross-attention KV resolutions. None keeps the legacy behavior
+    # where every layer attends to the original-resolution context tokens.
+    "query_transformer_kv_resolutions": None,
     "query_id_reinject_scale": 0.0,
     "query_ca_kv_identity_init": False,
     "query_ca_attn_tau": 1.0,
@@ -280,6 +289,8 @@ def _merge_cfg(defaults, cfg):
 def apply_model_cfg(self, cfg):
     cfg = _merge_cfg(MODEL_CFG_DEFAULTS, cfg)
 
+    self.eval_gt_root = cfg["eval_gt_root"]
+    self.eval_asset_gt_root = cfg["eval_asset_gt_root"]
     self.gmo_ids = tuple(int(v) for v in cfg["gmo_ids"])
     self.use_segmentation_as_query_gt = bool(cfg["use_segmentation_as_query_gt"])
     self.use_gmo_bce_loss = bool(cfg["use_gmo_bce_loss"])
@@ -450,6 +461,18 @@ def apply_model_cfg(self, cfg):
     self.query_embed_dim = int(cfg["query_embed_dim"])
     self.query_num_queries = int(cfg["query_num_queries"])
     self.query_transformer_num_layers = int(cfg["query_transformer_num_layers"])
+    if cfg["query_transformer_kv_resolutions"] is None:
+        self.query_transformer_kv_resolutions = None
+    else:
+        self.query_transformer_kv_resolutions = tuple(
+            tuple(int(v) for v in hw) for hw in cfg["query_transformer_kv_resolutions"]
+        )
+        if len(self.query_transformer_kv_resolutions) != self.query_transformer_num_layers:
+            raise ValueError(
+                "query_transformer_kv_resolutions length must match "
+                f"query_transformer_num_layers: got {len(self.query_transformer_kv_resolutions)} "
+                f"vs {self.query_transformer_num_layers}"
+            )
     self.query_id_reinject_scale = float(cfg["query_id_reinject_scale"])
     self.query_ca_kv_identity_init = bool(cfg["query_ca_kv_identity_init"])
     self.query_ca_attn_tau = float(cfg["query_ca_attn_tau"])

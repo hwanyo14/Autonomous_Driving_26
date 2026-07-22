@@ -360,3 +360,50 @@
 - `static_graph=True`는 iteration마다 graph 구조(사용 파라미터/분기)가 동일하다는 가정. 조건부로 모듈 일부가 빠지는 구조 변경을 하면 DDP 에러가 날 수 있으니 그 경우 이 옵션부터 의심할 것.
 - `dbg_query_match_cost_*` prefix 키 목록은 `utils_loss.py`의 prefill 루프와 실제 기록 지점이 수동으로 동기화돼 있음. 새 match-cost dbg 키를 추가하면 prefill 루프에도 반드시 같이 추가해야 multi-GPU에서 `log_vars` assert가 재발하지 않음.
 - baseline config는 `samples_per_gpu=1`이라 GPU 수 1~8 어느 쪽이든 per-rank batch shape은 동일. 검증은 아직 안 돌렸음 (smoke run 필요).
+## 2026-07-15 KST — f3 full-suite eval 주의사항
+
+- 일반 benchmark는 반드시 `EOCF_EVAL_ORACLE_MATCH=0`. f3 GT suite는 prediction 이후 metric 단계에서만 직접 로드하므로 정상 eval prediction에는 영향이 없다.
+- 실행 환경은 현재 `eof` Conda env가 필요하다. base에는 mmcv가 없고 `eo_jhh`에는 `mmcv._ext`가 없다. 저장소의 `occ_pool_ext`는 `projects/occ_plugin/ops/occ_pooling/setup.py build_ext --inplace`로 `eof` 환경에서 빌드했다.
+- Cam4DOcc에서 가져온 tolerant Recall3D 정의는 `(TP+bboxFP)/(TP+FN+FP-bboxFP)`이다. bbox 허용 영역이 크면 **1.0을 초과할 수 있다**(2-sample smoke의 AABB micro=1.0917). 이는 구현 오류가 아니라 원본 프로토콜 수식의 성질이며, bounded recall로 해석하면 안 된다.
+- f3 full suite IoU는 전체 confusion matrix를 합산한 **micro IoU**다. 기존 `IOU_3d_*` legacy key는 sample별 IoU 평균(macro) 호환값이라 새 공식 비교에는 `IOU_2d/3d_{nusocc,aabb,rot}` key를 사용할 것.
+- `full.py` test pipeline의 `occ_dt`는 prediction에 쓰이지 않아 비활성화했다(`use_query_dt_loss=False`). 학습 pipeline의 DT 로딩은 유지된다.
+## 2026-07-20 KST — pyramid AABB dice3d checkpoint eval 주의
+
+- `full_attn_cover_pyr_aabb_dice3d_new.py`의 test pipeline은 `occ_dt`를 로드하지 않는다. `use_query_dt_loss=False`라 inference에 사용되지 않으며, 현재 val DT cache에는 누락 파일이 있어 강제 로드하면 첫 sample부터 `FileNotFoundError`가 발생한다. train pipeline의 DT 설정은 유지했다.
+- epoch 12 checkpoint 로드 시 27개 unexpected key 경고가 출력된다. 모두 현재 코드에서 `persistent=False`로 바뀐 고정 lookup/voxelizer buffer이며, 학습 parameter의 missing/unexpected key는 없다. `tools/test.py`의 기본 non-strict checkpoint load로 평가 결과에 영향 없이 로드된다.
+- 이 checkpoint는 transformer CA layer가 3개다. 반드시 `query_transformer_kv_resolutions=((14,25),(28,50),(56,100))`를 지원하는 현재 이식 코드와 함께 평가해야 하며, 기존 1-layer `full_attn_cover` config로 바꾸면 안 된다.
+## 2026-07-20 KST — pyramid eval query_debug_vis 재시작 필요
+
+- 10:43/10:45에 시작한 epoch 12 eval 프로세스는 `query_debug_vis` 2D PNG shape 정규화 수정 전 코드를 로드했다. 해당 프로세스에서는 3D/gaussian PNG와 `.pt`만 저장되고 `*_prob.png`는 계속 빠진다.
+- 수정 후 새로 시작한 `eval_total_abc.sh`부터 `query_debug_vis/sample_*_prob.png`가 적용 대상이다. 실행 중 프로세스를 자동 종료하지는 않았다.
+- GPU 0에 두 eval이 각각 약 34GB를 사용 중이라 수정 후 GPU E2E probe는 OOM으로 실행하지 못했다. CPU renderer shape probe는 통과했다.
+## 2026-07-20 KST — 11:00 epoch13 eval 시각화 import 누락
+
+- `20260720_110038`, `20260720_110039` run은 수정 전 프로세스라 `F` import 누락으로 `[eval_vis] skipped`가 발생한다. metric에는 영향 없지만 해당 run의 query_debug/mixture3d/cam-gaussian 시각화는 저장되지 않는다.
+- import 수정은 새 프로세스에서만 반영된다. 두 기존 run은 자동 종료하지 않았다.
+## 2026-07-20 KST — f3 query_debug_vis는 aligned GT 사용
+
+- f3 sparse GT 원본 좌표계와 query/voxelizer canvas 좌표계 사이에 XY transpose가 있다. metric은 `_apply_3d_align_sequence`를 거치지만 기존 eval-vis 호출은 정렬 전 `gt_inst`를 사용해 GT가 화면 경계에 나타났다.
+- 새 config의 2D query debug canvas에는 metric과 동일하게 정렬된 `gt3d_t`를 `[T,X,Y,Z]`로 되돌려 전달해야 한다.
+- 11:05에 시작한 두 epoch13 run은 이 수정 전 코드를 로드했으므로 자동 반영되지 않는다.
+## 2026-07-20 KST — pyramid eval-vis 최종 원칙
+
+- prediction tensor를 시각화 전용으로 변형하지 않는다. 기존과 동일한 full-resolution eval prediction을 기존 renderer에 그대로 전달한다.
+- 차이는 GT 입력뿐이다. 새 pipeline의 축소 GT가 아니라 metric이 실제 사용한 aligned 512 inst3d GT를 전달해 기존 canvas shape/row4 비교를 유지한다.
+
+## 2026-07-20 KST — eval trajectory refine 적용 시점
+
+- 학습과 eval 모두 Hungarian matching은 refine 전 raw trajectory로 수행해야 한다. `query_traj_xy_refine`은 matching 이후 미래 XY 및 mixture center에만 적용한다.
+- `20260720_132454` Oracle run은 refine 수정 전 시작되어 metric/시각화 모두 base trajectory를 사용한다. 해당 폴더를 수정 후 run과 직접 혼동하지 말 것.
+- epoch 13 첫 val sample 실측 refine 이동량은 전체 query/future XY 기준 mean absolute `1.5250m`, max absolute `12.6323m`였다. 일반/Oracle 값이 동일하므로 selection 전에 동일 refiner가 적용됨을 확인했다.
+
+## 2026-07-20 KST — depth score calibration/eval 분리 원칙
+
+- depth 결합 score는 prediction 통계 calibration 없이 raw normalized entropy confidence를 사용한다: `sigmoid(logit(cls_conf) + beta * depth_conf)`.
+- beta/FG threshold는 AABB GT sweep 후보이며, `depth_score_best.json`은 후보를 제안할 뿐 `eval_depth.sh` 자체나 실행 중 모델 값을 덮어쓰지 않는다.
+- calibration/sweep에 쓴 같은 subset의 최고 수치를 최종 성능으로 보고하지 말고, winner를 별도 held-out/full eval에서 확인할 것.
+- compact score dump는 전체 약 34MB 예상이지만 exact offline AABB 재렌더용 mixture cache는 전체 약 2.6GB 예상이므로 `RUN_SWEEP=1`일 때만 저장한다.
+## 2026-07-20 19:30 KST — asset GT eval device 주의
+
+- 외부 NPZ loader가 만든 hybrid asset dense tensor는 CPU tensor다. 2D/3D align 및 confusion matrix 전에 prediction과 같은 device로 이동해야 한다.
+- 최초 1-sample smoke에서 `cm_2d_asset` 계산 시 CPU/CUDA mismatch를 확인했으며, AABB/Rot GT와 동일하게 `pred_occ3d.device`로 이동하도록 수정했다.

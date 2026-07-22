@@ -1544,6 +1544,7 @@ class EfficientOCFVisualizationMixin:
         mixture_weights_tqg: torch.Tensor = None,
         traj_mode_idx_q: torch.Tensor = None,
         query_attn_cam_score_pack: dict = None,
+        query_depth_conf_q: torch.Tensor = None,
     ):
         if (not torch.is_tensor(centers_world_tq3)) or centers_world_tq3.dim() != 3:
             return None
@@ -1662,13 +1663,21 @@ class EfficientOCFVisualizationMixin:
         score_q = score_num_q / score_den_q.clamp_min(1e-6)
         score_q = score_q.clamp(0.0, 1.0)
 
+        import os as _os
+        if _os.environ.get("EOCF_EVAL_DEPTH_SCORE", "0") == "1":
+            if torch.is_tensor(query_depth_conf_q) and int(query_depth_conf_q.numel()) == q_count:
+                depth_beta = float(_os.environ.get("EOCF_EVAL_DEPTH_BETA", "1.0"))
+                depth_conf_q = query_depth_conf_q.to(
+                    device=score_q.device, dtype=torch.float32).reshape(-1).clamp(0.0, 1.0)
+                cls_logit_q = torch.logit(cls_prob_q.clamp(1e-6, 1.0 - 1e-6))
+                score_q = torch.sigmoid(cls_logit_q + depth_beta * depth_conf_q)
+
         candidate_idx = torch.arange(q_count, device=score_q.device, dtype=torch.long)
 
         fg_mask_q = pred_cls_q != int(self.query_bg_class)
         selected_candidate_idx = torch.nonzero(fg_mask_q, as_tuple=False).squeeze(1)
         if int(selected_candidate_idx.numel()) > 0:
             candidate_scores = score_q.index_select(0, selected_candidate_idx)
-            import os as _os
             _fg_thr = float(_os.environ.get("EOCF_EVAL_FG_THR", self.fg_score_threshold))
             keep_thr = candidate_scores >= _fg_thr
             selected_candidate_idx = selected_candidate_idx[keep_thr]

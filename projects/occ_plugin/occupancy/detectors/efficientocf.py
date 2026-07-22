@@ -130,6 +130,7 @@ class EfficientOCF(
             num_queries=self.query_num_queries,
             num_heads=4,
             num_layers=self.query_transformer_num_layers,
+            kv_resolutions=self.query_transformer_kv_resolutions,
             num_cams=6,
             embed_dim=self.query_embed_dim,
             max_time=self.time_receptive_field,
@@ -1782,6 +1783,56 @@ class EfficientOCF(
         )
 
     @torch.no_grad()
+    def _save_eval_depth_dump(self, img_metas, cls_scores_qc, depth_entropy_q,
+                              depth_conf_q, final_score_q=None, mix_future=None):
+        """Save compact query scores, optionally with future mixtures for offline sweeps."""
+        import os
+        dump_dir = os.environ.get("EOCF_EVAL_DEPTH_DUMP_DIR", "").strip()
+        if not dump_dir or not torch.is_tensor(depth_conf_q):
+            return
+        os.makedirs(dump_dir, exist_ok=True)
+        global_idx = self._extract_eval_global_idx(img_metas)
+        if global_idx is None:
+            step = int(getattr(self, "_eval_depth_dump_step", 0))
+            self._eval_depth_dump_step = step + 1
+            try:
+                from mmcv.runner import get_dist_info
+                rank, _ = get_dist_info()
+            except Exception:
+                rank = 0
+            name = f"rank{int(rank):02d}_{step:06d}_depth.pt"
+        else:
+            name = f"sample_{int(global_idx):06d}_depth.pt"
+
+        cls_scores_qc = cls_scores_qc.to(torch.float32)
+        pred_cls_q = torch.argmax(cls_scores_qc, dim=-1).to(torch.long)
+        cls_conf_q = (1.0 - cls_scores_qc[:, int(self.query_bg_class)]).clamp(0.0, 1.0)
+        payload = {
+            "global_idx": int(global_idx) if global_idx is not None else -1,
+            "sample_key": self._eval_sample_key_from_metas(img_metas),
+            "cls_conf_q": cls_conf_q.detach().cpu(),
+            "depth_entropy_q": depth_entropy_q.detach().cpu(),
+            "depth_conf_q": depth_conf_q.detach().cpu(),
+            "pred_cls_q": pred_cls_q.detach().cpu(),
+        }
+        if torch.is_tensor(final_score_q):
+            payload["final_score_q"] = final_score_q.detach().cpu()
+
+        save_mixture = os.environ.get("EOCF_EVAL_DEPTH_SAVE_MIXTURE", "0") == "1"
+        if save_mixture and isinstance(mix_future, (tuple, list)) and len(mix_future) == 4:
+            candidate_idx = torch.nonzero(
+                pred_cls_q != int(self.query_bg_class), as_tuple=False).reshape(-1)
+            payload["candidate_query_idx_q"] = candidate_idx.detach().cpu()
+            for key, value in zip(
+                ("mixture_centers_tqg3", "mixture_sigmas_tqg3",
+                 "mixture_yaw_tqg", "mixture_weights_tqg"),
+                mix_future,
+            ):
+                if torch.is_tensor(value) and value.dim() >= 2:
+                    payload[key] = value.index_select(1, candidate_idx).detach().cpu()
+        torch.save(payload, os.path.join(dump_dir, name))
+
+    @torch.no_grad()
     def simple_test(self, img_inputs_seq=None, img_metas=None, future_egomotion=None,
                     segmentation=None, segmentation_bev=None, gt_occ=None, gt_occ_inst=None,
                     segmentation_instance3d=None, segmentation_cls_instance3d=None,
@@ -1789,14 +1840,24 @@ class EfficientOCF(
         import os
         import numpy as np
         def _pack(cm):
+            z2 = np.zeros((2, 2), dtype=np.int64)
+            z4 = np.zeros(4, dtype=np.float64)
             return dict(hist_for_iou=cm,
                         hist_for_iou_bbox=np.zeros((2, 2), dtype=np.int64),
                         hist_for_iou_bbox_rot=np.zeros((2, 2), dtype=np.int64),
+                        cm_2d_nusocc=z2.copy(), cm_2d_aabb=z2.copy(),
+                        cm_2d_rot=z2.copy(), cm_2d_asset=z2.copy(),
+                        cm_3d_nusocc=z2.copy(), cm_3d_aabb=z2.copy(),
+                        cm_3d_rot=z2.copy(), cm_3d_asset=z2.copy(),
                         height_l1=torch.tensor(0.0),
                         iou_3d=float("nan"), iou_3d_bbox=float("nan"),
                         iou_3d_bbox_rot=float("nan"),
                         recall_3d=float("nan"),
-                        recall_3d_comps=dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0))
+                        recall_3d_comps=dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0),
+                        recall_3d_aabb=float("nan"), recall_3d_rot=float("nan"),
+                        recall_3d_asset=float("nan"),
+                        recall_aabb_comps=z4.copy(), recall_rot_comps=z4.copy(),
+                        recall_asset_comps=z4.copy())
         empty = _pack(np.zeros((2, 2), dtype=np.int64))
 
         # eval 시각화(EOCF_EVAL_VIS=1)일 때만 attn/cam-gaussian용 디버그 산출물도 함께 반환.
@@ -1826,25 +1887,28 @@ class EfficientOCF(
         centers_world_traj = feat_out[5]     # [F,Q,3] future trajectory geometry when available
         sigmas_world = feat_out[2]           # [T,Q,3]
         cls_scores_qc = feat_out[8]          # [Q,C] (c0=background)
+        query_future_feat_tqd = feat_out[13]
+        traj_offsets_fq2 = feat_out[18]
         traj_mode_idx_q = feat_out[22]
         present_idx = feat_out[23]
         mix_c, mix_s, mix_y, mix_w = feat_out[24], feat_out[25], feat_out[26], feat_out[27]
         sigmas_world_traj = feat_out[28] if len(feat_out) > 28 else None
-        # 미래(trajectory) mixture: future 2D viz의 footprint용. feat_out 인덱스 주의 —
-        # [29]centers/[30]sigmas/[31]yaw/[32]weights (이전에 [30~33]로 잘못 잡아 sigma를 center로
-        # 써서 future footprint가 전부 안 그려졌었음).
-        mix_future = (
-            self._eval_future_tail(feat_out[29]) if len(feat_out) > 29 and torch.is_tensor(feat_out[29]) else None,
-            self._eval_future_tail(feat_out[30]) if len(feat_out) > 30 and torch.is_tensor(feat_out[30]) else None,
-            self._eval_future_tail(feat_out[31]) if len(feat_out) > 31 and torch.is_tensor(feat_out[31]) else None,
-            self._eval_future_tail(feat_out[32]) if len(feat_out) > 32 and torch.is_tensor(feat_out[32]) else None,
-        )
+        mix_c_traj = feat_out[29] if len(feat_out) > 29 else None
         eval_instance_img_debug_bundle = feat_out[16]   # cam-gaussian vis용 (이미지/캘리브)
         if not (torch.is_tensor(centers_world) and torch.is_tensor(cls_scores_qc)
                 and torch.is_tensor(segmentation_bev)):
             return empty
         present_idx = int(present_idx) if present_idx is not None else centers_world.shape[0] - 1
-
+        depth_entropy_q = None
+        depth_conf_q = None
+        query_depth_probs_tqd = feat_out[11] if len(feat_out) > 11 else None
+        if torch.is_tensor(query_depth_probs_tqd) and query_depth_probs_tqd.dim() == 3:
+            depth_prob_qd = query_depth_probs_tqd[present_idx].to(torch.float32).clamp_min(1e-8)
+            depth_entropy_q = -(depth_prob_qd * depth_prob_qd.log()).sum(dim=-1)
+            max_entropy = depth_prob_qd.new_tensor(
+                float(max(2, int(depth_prob_qd.shape[-1])))
+            ).log()
+            depth_conf_q = (1.0 - depth_entropy_q / max_entropy).clamp(0.0, 1.0)
         # ---- GT instance-3d (required by the scoring bundle) ----
         gt_seg_inst3d = self._prepare_segmentation_instance3d(
             segmentation_instance3d=segmentation_instance3d)
@@ -1867,7 +1931,8 @@ class EfficientOCF(
             gaussian_sigmas_world_tq3=sigmas_world,
             mixture_centers_world_tqg3=mix_c, mixture_sigmas_world_tqg3=mix_s,
             mixture_yaw_tqg=mix_y, mixture_weights_tqg=mix_w,
-            traj_mode_idx_q=traj_mode_idx_q, query_attn_cam_score_pack=None)
+            traj_mode_idx_q=traj_mode_idx_q, query_attn_cam_score_pack=None,
+            query_depth_conf_q=depth_conf_q)
         if isinstance(bundle, dict):
             sel_idx = bundle.get("selected_query_idx_q", None)
             selected_score = bundle.get("selected_score_q", None)
@@ -1886,15 +1951,101 @@ class EfficientOCF(
                 gt_instance_centers_valid=kwargs.get("gt_instance_centers_valid", None),
                 gt_instance_ids=kwargs.get("gt_instance_ids", None))
             _mqi = _imr.get("matched_query_idx", None) if isinstance(_imr, dict) else None
-            if torch.is_tensor(_mqi) and int(_mqi.numel()) > 0:
+            if torch.is_tensor(_mqi):
                 sel_idx = torch.unique(
                     _mqi.to(device=centers_world.device, dtype=torch.long), sorted=True)
-                selected_score = torch.ones(
-                    (int(sel_idx.numel()),), device=centers_world.device, dtype=torch.float32)
             else:
-                sel_idx, selected_score = None, None
-            # viz는 normal(eval_total.sh)과 동일 — oracle은 sel_idx(=metric)만 바꾸고
-            # bundle(viz 선택)은 그대로 둔다. (oracle viz == normal viz)
+                sel_idx = torch.empty((0,), device=centers_world.device, dtype=torch.long)
+            selected_score = torch.ones(
+                (int(sel_idx.numel()),), device=centers_world.device, dtype=torch.float32)
+            # Rebuild once with the oracle match result so matched_* contains
+            # the exact Hungarian-selected query geometry, then promote it
+            # to selected_* for every eval renderer (2D/3D/camera).
+            oracle_bundle = self._build_query_visualization_bundle(
+                centers_world_tq3=centers_world,
+                query_cls_scores_qc=cls_scores_qc,
+                inst_match_result=_imr if isinstance(_imr, dict) else {},
+                gt_segmentation_instance3d_txyz=gt_inst,
+                gaussian_sigmas_world_tq3=sigmas_world,
+                mixture_centers_world_tqg3=mix_c,
+                mixture_sigmas_world_tqg3=mix_s,
+                mixture_yaw_tqg=mix_y,
+                mixture_weights_tqg=mix_w,
+                traj_mode_idx_q=traj_mode_idx_q,
+                query_attn_cam_score_pack=None,
+                query_depth_conf_q=depth_conf_q,
+            )
+            if isinstance(oracle_bundle, dict):
+                for suffix in (
+                    "points_tq3", "sigmas_tq3", "pred_cls_q",
+                    "mixture_centers_tqg3", "mixture_sigmas_tqg3",
+                    "mixture_yaw_tqg", "mixture_weights_tqg",
+                ):
+                    oracle_bundle[f"selected_{suffix}"] = oracle_bundle.get(f"matched_{suffix}")
+                oracle_bundle["selected_query_idx_q"] = sel_idx.detach()
+                oracle_bundle["selected_score_q"] = selected_score.detach()
+                oracle_bundle["score_thr"] = 0.0
+            bundle = oracle_bundle
+
+        if isinstance(bundle, dict):
+            if torch.is_tensor(depth_entropy_q):
+                bundle["depth_entropy_q"] = depth_entropy_q.detach()
+            if torch.is_tensor(depth_conf_q):
+                bundle["depth_conf_q"] = depth_conf_q.detach()
+
+        # Training order: raw trajectory로 Hungarian matching을 수행한 뒤 future XY를 refine하고,
+        # 이후 metric/visualization geometry에 refined center와 동일 delta를 적용한다.
+        if (
+            bool(self.query_traj_xy_refine_enabled)
+            and float(self.query_traj_xy_refine_loss_weight) > 0.0
+            and torch.is_tensor(query_future_feat_tqd)
+            and torch.is_tensor(traj_offsets_fq2)
+            and torch.is_tensor(centers_world_traj)
+            and centers_world_traj.dim() == 3
+            and int(centers_world_traj.shape[0]) == int(self.n_future_frames) + 1
+        ):
+            refined_future_xy_fq2, _, _ = self.query_head.refine_trajectory_absolute_xy(
+                query_feat_tqd=query_future_feat_tqd,
+                query_cls_scores_qc=cls_scores_qc,
+                centers_world_tq3=centers_world,
+                pred_traj_offsets_fq2=traj_offsets_fq2,
+                present_local_idx=present_idx,
+            )
+            if torch.is_tensor(refined_future_xy_fq2):
+                base_centers_world_traj = centers_world_traj
+                if not bool(getattr(self, "_eval_traj_refine_logged", False)):
+                    base_future_xy_fq2 = base_centers_world_traj[
+                        1:1 + int(refined_future_xy_fq2.shape[0]), :, :2]
+                    delta_fq2 = refined_future_xy_fq2.to(
+                        device=base_future_xy_fq2.device,
+                        dtype=base_future_xy_fq2.dtype,
+                    ) - base_future_xy_fq2
+                    print(
+                        "[simple_test] trajectory XY refine applied after matching "
+                        f"(mean_abs={float(delta_fq2.abs().mean()):.4f}m, "
+                        f"max_abs={float(delta_fq2.abs().max()):.4f}m)",
+                        flush=True,
+                    )
+                    self._eval_traj_refine_logged = True
+                centers_world_traj = self._replace_future_xy_in_full_centers(
+                    centers_world_traj, refined_future_xy_fq2, present_local_idx=0)
+                mix_c_traj = self._shift_future_mixture_centers_by_refined_xy(
+                    mix_c_traj, base_centers_world_traj,
+                    refined_future_xy_fq2, present_local_idx=0)
+
+        # 미래(trajectory) mixture: future 2D viz의 footprint용. feat_out 인덱스 주의 —
+        # [29]centers/[30]sigmas/[31]yaw/[32]weights.
+        mix_future = (
+            self._eval_future_tail(mix_c_traj) if torch.is_tensor(mix_c_traj) else None,
+            self._eval_future_tail(feat_out[30]) if len(feat_out) > 30 and torch.is_tensor(feat_out[30]) else None,
+            self._eval_future_tail(feat_out[31]) if len(feat_out) > 31 and torch.is_tensor(feat_out[31]) else None,
+            self._eval_future_tail(feat_out[32]) if len(feat_out) > 32 and torch.is_tensor(feat_out[32]) else None,
+        )
+        self._save_eval_depth_dump(
+            img_metas, cls_scores_qc, depth_entropy_q, depth_conf_q,
+            final_score_q=(bundle.get("score_q", None) if isinstance(bundle, dict) else None),
+            mix_future=mix_future,
+        )
 
         # occ 이진화 threshold: config 단일 키(occ_score_threshold)가 기본, env로 override.
         thr = float(os.environ.get("EOCF_EVAL_OCC_THR", getattr(self, "occ_score_threshold", 0.5)))
@@ -1917,8 +2068,12 @@ class EfficientOCF(
             cen = centers_world[present_idx].index_select(0, sel_idx)        # [S,3]
             # 렌더 가중치: 기본 score(blob 높이가 score에 종속 → occ thr가 fg thr를 흡수).
             # EOCF_EVAL_WEIGHT_MODE=ones면 1.0 고정 — fg(선택)/occ(footprint 반경) 완전 독립.
-            if os.environ.get("EOCF_EVAL_WEIGHT_MODE", "score") == "ones":
+            weight_mode = os.environ.get("EOCF_EVAL_DEPTH_RENDER_WEIGHT", "combined").strip().lower()
+            if os.environ.get("EOCF_EVAL_WEIGHT_MODE", "score") == "ones" or weight_mode == "ones":
                 weights_sel = cen.new_ones((n_sel,), dtype=cen.dtype)
+            elif weight_mode == "cls" and torch.is_tensor(sel_idx):
+                cls_conf_all = (1.0 - cls_scores_qc[:, int(self.query_bg_class)]).clamp(0.0, 1.0)
+                weights_sel = cls_conf_all.index_select(0, sel_idx).to(device=cen.device, dtype=cen.dtype)
             else:
                 weights_sel = (
                     selected_score.to(device=cen.device, dtype=cen.dtype).reshape(-1)
@@ -1964,11 +2119,19 @@ class EfficientOCF(
         if eval_mode == "present":
             pred_txyz = pred_occ3d.permute(2, 1, 0).unsqueeze(0).contiguous()  # [1,X,Y,Z]
 
-        # ---- GT BEV movable occupancy: nusocc inst3d(gt_occ_inst)의 z-collapse ----
+        # Eval-only f3 suite is loaded after prediction, so it cannot affect inference.
+        # EOCF_EVAL_GT_ROOT overrides the config path for one-off evaluations.
+        metric_gt = self._eval_load_external_gt_suite(img_metas)
+
+        # ---- GT BEV movable occupancy: nusocc inst3d의 z-collapse ----
         # 학습 dice(loss_gmo_dice)와 동일 소스(dense_inst_txyz; nohuman·query-class 필터 동일).
         # segmentation_bev는 bbox-AABB 렌더링이라 nusocc GT가 아님 → bbox 메트릭 전용으로만 남김.
-        if torch.is_tensor(gt_inst):
-            gt = (gt_inst > 0).any(dim=-1).to(pred_bev.device)   # [T,X,Y]
+        metric_inst = metric_gt.get("inst3d") if isinstance(metric_gt, dict) else None
+        metric_asset = metric_gt.get("asset") if isinstance(metric_gt, dict) else None
+        if torch.is_tensor(metric_inst):
+            gt = (metric_inst > 0).any(dim=-1).to(pred_bev.device)  # [T,X,Y]
+        elif torch.is_tensor(gt_inst):
+            gt = (gt_inst > 0).any(dim=-1).to(pred_bev.device)      # [T,X,Y]
         else:
             gt = segmentation_bev
             while gt.dim() > 3:              # drop batch -> [T,Hb,Wb]
@@ -2009,16 +2172,28 @@ class EfficientOCF(
         # legacy bbox-corrected formula, but on real 3D voxels:
         # (TP + bbox_FP) / (TP + FN + FP - bbox_FP).
         iou_3d, recall_3d = float("nan"), float("nan")
+        recall_3d_rot = float("nan")
+        recall_3d_asset = float("nan")
         iou_3d_bbox = float("nan")
         iou_3d_bbox_rot = float("nan")
         r3d_comps = dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0)
+        r3d_rot_comps = dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0)
+        r3d_asset_comps = dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0)
+        abc_metrics = {}
         cm_bbox = np.zeros((2, 2), dtype=np.int64)
         cm_bbox_rot = np.zeros((2, 2), dtype=np.int64)
+        cm_3d_nusocc = np.zeros((2, 2), dtype=np.int64)
+        cm_3d_bbox = np.zeros((2, 2), dtype=np.int64)
+        cm_3d_bbox_rot = np.zeros((2, 2), dtype=np.int64)
+        cm_2d_asset = np.zeros((2, 2), dtype=np.int64)
+        cm_3d_asset = np.zeros((2, 2), dtype=np.int64)
         # bbox GT v2(annotation 재생성: 생성소멸·사람 필터 + rotated OBB) 우선 사용.
         # 없으면 기존 bboxcls 캐시 fallback (rot 메트릭은 v2 전용이라 NaN 유지).
         gt_bbox_rot_src = None
         bbox_bev_vis = None
-        _bbox_v2 = self._eval_load_bbox_gt_v2(img_metas)
+        inst_bev_vis = None
+        gt_inst_vis = gt_inst
+        _bbox_v2 = metric_gt if isinstance(metric_gt, dict) else self._eval_load_bbox_gt_v2(img_metas)
         if isinstance(_bbox_v2, dict):
             gt_bbox_src = _bbox_v2["aabb"]
             gt_bbox_rot_src = _bbox_v2["rot"]
@@ -2037,10 +2212,15 @@ class EfficientOCF(
             gt_bbox_src = gt_bbox_src.to(device=pred_occ3d.device)
         if torch.is_tensor(gt_bbox_rot_src):
             gt_bbox_rot_src = gt_bbox_rot_src.to(device=pred_occ3d.device)
+        if torch.is_tensor(metric_asset):
+            metric_asset = metric_asset.to(device=pred_occ3d.device)
         # 3D nusocc GT = 학습 감독과 동일한 inst3d(dense_inst). raw gt_occ는 box 밖 잔여(평균 +29%)
         # 와 생성소멸 미필터로 모델이 배우지 않는 voxel을 구조적 FN으로 깔아 사용 중단 (NOTES 2026-07-06).
         # inst3d에는 255(ignore)가 없어 valid 마스크도 불필요.
-        if torch.is_tensor(gt_inst):
+        if torch.is_tensor(metric_inst):
+            gt_occ_fg = (metric_inst > 0).to(device=pred_occ3d.device)
+            gt_occ_valid = None
+        elif torch.is_tensor(gt_inst):
             gt_occ_fg = (gt_inst > 0).to(device=pred_occ3d.device)
             gt_occ_valid = None
         else:
@@ -2067,6 +2247,7 @@ class EfficientOCF(
                 )
                 bbox3d_t = None
                 rot3d_t = None
+                asset3d_t = None
                 if tuple(gt3d_t.shape[1:]) == tuple(pred_occ3d.shape):
                     if torch.is_tensor(gt_bbox_src) and gt_bbox_src.dim() == 4:
                         bbox3d_src_t = self._eval_mode_slice((gt_bbox_src > 0) & (gt_bbox_src != 255))
@@ -2090,10 +2271,27 @@ class EfficientOCF(
                             if t_rot > 0 and tuple(rot_bev_t.shape[1:]) == tuple(pred_bev_t.shape[1:]):
                                 cm_bbox_rot = self._binary_occ_cm(
                                     pred_bev_t[:t_rot], rot_bev_t[:t_rot])
+                    if torch.is_tensor(metric_asset) and metric_asset.dim() == 4:
+                        asset3d_src_t = self._eval_mode_slice(metric_asset > 0)
+                        asset3d_t = self._apply_3d_align_sequence(
+                            asset3d_src_t, transpose, fh, fw, fz)
+                        if torch.is_tensor(asset3d_t):
+                            asset_bev_t = asset3d_t.any(dim=1).contiguous()
+                            t_asset = min(int(pred_bev_t.shape[0]), int(asset_bev_t.shape[0]))
+                            if (t_asset > 0 and
+                                    tuple(asset_bev_t.shape[1:]) == tuple(pred_bev_t.shape[1:])):
+                                cm_2d_asset = self._binary_occ_cm(
+                                    pred_bev_t[:t_asset], asset_bev_t[:t_asset])
                     t_eval = min(int(pred_txyz.shape[0]), int(gt3d_t.shape[0]))
                     if t_eval > 0:
                         pred_zyx_t = pred_txyz[:t_eval].permute(0, 3, 2, 1).contiguous()
                         gt3d_t = gt3d_t[:t_eval]
+                        # query_debug_vis must use the same GT after metric alignment.
+                        # Convert [T,Z,Y,X] back to the renderer's [T,X,Y,Z].
+                        gt_inst_vis = gt3d_t.permute(0, 3, 2, 1).contiguous().to(torch.long)
+                        # Same aligned inst3d GT used by Recall3d, collapsed to
+                        # BEV for the query_debug_vis comparison row.
+                        inst_bev_vis = gt3d_t.any(dim=1).contiguous()
                         if tuple(pred_zyx_t.shape) == tuple(gt3d_t.shape):
                             bbox_arg = bbox3d_t[:t_eval] if (
                                 torch.is_tensor(bbox3d_t) and int(bbox3d_t.shape[0]) >= t_eval
@@ -2103,19 +2301,51 @@ class EfficientOCF(
                             ) else None
                             iou_3d, recall_3d, r3d_comps = self._iou_recall_3d(
                                 pred_zyx_t, gt3d_t, bbox3d=bbox_arg, valid3d=valid_arg)
+                            # Convert the exact scored prediction back to external
+                            # [T,X,Y,Z] coordinates for object-aware AABB variants.
+                            pred_xyz_t = pred_zyx_t
+                            if fz: pred_xyz_t = torch.flip(pred_xyz_t, dims=[1])
+                            if fh: pred_xyz_t = torch.flip(pred_xyz_t, dims=[2])
+                            if fw: pred_xyz_t = torch.flip(pred_xyz_t, dims=[3])
+                            if transpose: pred_xyz_t = pred_xyz_t.transpose(2, 3)
+                            pred_xyz_t = pred_xyz_t.permute(0, 2, 3, 1).contiguous()
+                            inst_xyz_t = self._eval_mode_slice(gt_occ_fg)[:t_eval].bool()
+                            abc_metrics = self._eval_aabb_abc_metrics(
+                                pred_xyz_t, inst_xyz_t, img_metas,
+                                r3d_comps['tp'], r3d_comps['fp'],
+                                r3d_comps['fn'], r3d_comps['bbox_fp'])
+                            rot_arg = rot3d_t[:t_eval] if (
+                                torch.is_tensor(rot3d_t) and int(rot3d_t.shape[0]) >= t_eval
+                            ) else None
+                            asset_arg = asset3d_t[:t_eval] if (
+                                torch.is_tensor(asset3d_t) and int(asset3d_t.shape[0]) >= t_eval
+                            ) else None
+                            if torch.is_tensor(rot_arg):
+                                _, recall_3d_rot, r3d_rot_comps = self._iou_recall_3d(
+                                    pred_zyx_t, gt3d_t, bbox3d=rot_arg, valid3d=valid_arg)
+                            if torch.is_tensor(asset_arg):
+                                _, recall_3d_asset, r3d_asset_comps = self._iou_recall_3d(
+                                    pred_zyx_t, gt3d_t, bbox3d=asset_arg, valid3d=valid_arg)
                             # bbox 3D IoU(AABB/rot): 2D bbox 메트릭과 동일 GT를 3D 그대로 채점.
                             # nusocc valid(255) 마스크·관용항 없음 — IoU2d(bbox_*)와 규칙 일치.
                             if torch.is_tensor(bbox_arg):
                                 iou_3d_bbox, _, _ = self._iou_recall_3d(pred_zyx_t, bbox_arg)
-                            if torch.is_tensor(rot3d_t) and int(rot3d_t.shape[0]) >= t_eval:
+                            if torch.is_tensor(rot_arg):
                                 iou_3d_bbox_rot, _, _ = self._iou_recall_3d(
-                                    pred_zyx_t, rot3d_t[:t_eval])
+                                    pred_zyx_t, rot_arg)
+                            cm_3d_nusocc = self._binary_occ_cm(pred_zyx_t, gt3d_t)
+                            if torch.is_tensor(bbox_arg):
+                                cm_3d_bbox = self._binary_occ_cm(pred_zyx_t, bbox_arg)
+                            if torch.is_tensor(rot_arg):
+                                cm_3d_bbox_rot = self._binary_occ_cm(pred_zyx_t, rot_arg)
+                            if torch.is_tensor(asset_arg):
+                                cm_3d_asset = self._binary_occ_cm(pred_zyx_t, asset_arg)
 
         # ---- eval-time query visualization (opt-in via EOCF_EVAL_VIS) ----
         # metric 계산 뒤로 이동: 4행 비교(eval 실제 pred_bev_t vs aligned AABB GT)를
         # 채점에 쓴 텐서 그대로 넘기기 위함 — threshold/정렬/기준프레임 정의상 동일.
         self._maybe_save_eval_query_vis(
-            pred_occ_prob=_pred_occ_vis, gt_inst=gt_inst, centers_world=centers_world,
+            pred_occ_prob=_pred_occ_vis, gt_inst=gt_inst_vis, centers_world=centers_world,
             present_idx=present_idx, cls_scores_qc=cls_scores_qc, bundle=bundle,
             prob_threshold=thr, img_metas=img_metas,
             img_inputs_seq=img_inputs_seq, future_egomotion=future_egomotion,
@@ -2123,16 +2353,38 @@ class EfficientOCF(
             eval_mode=eval_mode, centers_future_tq3=centers_eval_tq3,
             pred_occ_future=pred_occ_eval, mix_future=mix_future,
             eval_cmp_pack=(
-                dict(pred_bev_t=pred_bev_t.detach(), gt_bev_t=bbox_bev_vis.detach())
-                if torch.is_tensor(bbox_bev_vis) else None
+                dict(
+                    pred_bev_t=pred_bev_t.detach(),
+                    gt_bev_t=bbox_bev_vis.detach(),
+                    inst_bev_t=inst_bev_vis.detach(),
+                )
+                if torch.is_tensor(bbox_bev_vis) and torch.is_tensor(inst_bev_vis) else None
             ))
 
         return dict(hist_for_iou=cm_nusocc, hist_for_iou_bbox=cm_bbox,
                     hist_for_iou_bbox_rot=cm_bbox_rot,
+                    cm_2d_nusocc=cm_nusocc, cm_2d_aabb=cm_bbox, cm_2d_rot=cm_bbox_rot,
+                    cm_2d_asset=cm_2d_asset,
+                    cm_3d_nusocc=cm_3d_nusocc, cm_3d_aabb=cm_3d_bbox,
+                    cm_3d_rot=cm_3d_bbox_rot, cm_3d_asset=cm_3d_asset,
                     height_l1=torch.tensor(0.0),
                     iou_3d=iou_3d, iou_3d_bbox=iou_3d_bbox,
                     iou_3d_bbox_rot=iou_3d_bbox_rot, recall_3d=recall_3d,
-                    recall_3d_comps=r3d_comps)
+                    recall_3d_comps=r3d_comps,
+                    recall_3d_aabb=recall_3d, recall_3d_rot=recall_3d_rot,
+                    recall_3d_asset=recall_3d_asset,
+                    recall_aabb_comps=np.asarray([
+                        r3d_comps['tp'], r3d_comps['fp'], r3d_comps['fn'], r3d_comps['bbox_fp']
+                    ], dtype=np.float64),
+                    recall_rot_comps=np.asarray([
+                        r3d_rot_comps['tp'], r3d_rot_comps['fp'], r3d_rot_comps['fn'],
+                        r3d_rot_comps['bbox_fp']
+                    ], dtype=np.float64),
+                    recall_asset_comps=np.asarray([
+                        r3d_asset_comps['tp'], r3d_asset_comps['fp'], r3d_asset_comps['fn'],
+                        r3d_asset_comps['bbox_fp']
+                    ], dtype=np.float64),
+                    **abc_metrics)
 
     @staticmethod
     def _binary_occ_cm(pred_bin, gt_bin):
@@ -2271,6 +2523,97 @@ class EfficientOCF(
         # comps = voxel 수 성분 (Recall3d 진단용: FN vs 비관용 FP 중 뭐가 갉아먹는지)
         return iou, recall, dict(tp=tp, fp=fp, fn=fn, bbox_fp=bbox_fp)
 
+    def _eval_aabb_abc_metrics(self, pred_txyz, inst_txyz, img_metas,
+                               tp, fp, fn, bbox_fp):
+        """AABB Strict/A/B/C plain, alpha and inverse-density sample metrics."""
+        import collections
+        import os
+        import numpy as np
+        root = os.environ.get("EOCF_EVAL_GT_ROOT", "").strip() or getattr(self, "eval_gt_root", None)
+        key = self._eval_sample_key_from_metas(img_metas)
+        if not root or key is None:
+            return {}
+        frames = {}
+        for name, sub in (("inst", "segmentation_instance3d"), ("box", "segmentation_aabb")):
+            path = os.path.join(root, sub, key + ".npz")
+            with np.load(path, allow_pickle=True) as z:
+                arr = z[z.files[0]]
+            frames[name] = [np.asarray(x) for x in arr[-int(self.n_future_frames):]]
+        p = pred_txyz.detach().cpu().numpy().astype(bool, copy=False)
+        g = inst_txyz.detach().cpu().numpy().astype(bool, copy=False)
+        X, Y, Z = p.shape[1:]
+        gt_n, box_n = collections.defaultdict(int), collections.defaultdict(int)
+        tp_n, fn_n, bfp_n = collections.defaultdict(int), collections.defaultdict(int), collections.defaultdict(int)
+        assigned = 0
+
+        def valid_rows(a):
+            a = np.asarray(a)
+            if a.ndim != 2 or a.shape[0] == 0 or a.shape[1] < 5:
+                return np.empty((0, 3), np.int64), np.empty((0,), np.int64)
+            c, ids = a[:, :3].astype(np.int64), a[:, 4].astype(np.int64)
+            m = ((c[:, 0] >= 0) & (c[:, 0] < X) & (c[:, 1] >= 0) & (c[:, 1] < Y)
+                 & (c[:, 2] >= 0) & (c[:, 2] < Z) & (ids > 0)
+                 & (a[:, 3].astype(np.int64) != 7))
+            return c[m], ids[m]
+
+        for t, (ifr, bfr) in enumerate(zip(frames["inst"], frames["box"])):
+            ic, iid = valid_rows(ifr); bc, bid = valid_rows(bfr)
+            ilin = (ic[:, 0] * Y + ic[:, 1]) * Z + ic[:, 2]
+            blin = (bc[:, 0] * Y + bc[:, 1]) * Z + bc[:, 2]
+            max_id = int(max(iid.max(initial=0), bid.max(initial=0))) + 1
+            if len(ilin):
+                _, u = np.unique(ilin * max_id + iid, return_index=True)
+                ic, iid, ilin = ic[u], iid[u], ilin[u]
+            if len(blin):
+                _, u = np.unique(blin * max_id + bid, return_index=True)
+                bc, bid, blin = bc[u], bid[u], blin[u]
+            vals, cnt = np.unique(iid, return_counts=True)
+            for k, v in zip(vals, cnt): gt_n[int(k)] += int(v)
+            vals, cnt = np.unique(bid, return_counts=True)
+            for k, v in zip(vals, cnt): box_n[int(k)] += int(v)
+            pf, gf = p[t].reshape(-1), g[t].reshape(-1)
+            if len(ilin):
+                hit = pf[ilin]
+                vals, cnt = np.unique(iid[hit], return_counts=True)
+                for k, v in zip(vals, cnt): tp_n[int(k)] += int(v)
+                vals, cnt = np.unique(iid[~hit], return_counts=True)
+                for k, v in zip(vals, cnt): fn_n[int(k)] += int(v)
+            if not len(blin):
+                continue
+            keep = pf[blin] & ~gf[blin]
+            qlin, qid, qc = blin[keep], bid[keep], bc[keep]
+            if not len(qlin):
+                continue
+            centers = {int(k): ic[iid == k].mean(0) for k in np.unique(iid)}
+            dist = np.full(len(qlin), np.inf)
+            for k in np.unique(qid):
+                m = qid == k
+                if int(k) in centers:
+                    d = qc[m].astype(float) - centers[int(k)]
+                    dist[m] = np.einsum('ij,ij->i', d, d)
+            order = np.lexsort((qid, dist, qlin)); sl = qlin[order]
+            first = np.ones(len(order), bool); first[1:] = sl[1:] != sl[:-1]
+            owners = qid[order[first]]; assigned += int(first.sum())
+            vals, cnt = np.unique(owners, return_counts=True)
+            for k, v in zip(vals, cnt): bfp_n[int(k)] += int(v)
+        if assigned != int(bbox_fp):
+            raise AssertionError("AABB bboxFP assignment mismatch: {} vs {}".format(assigned, int(bbox_fp)))
+        q_ref, gamma, wmin, wmax = 0.11620670995670995, 0.5, 0.5, 3.0
+        alpha, weight = {}, {}
+        for k in set(gt_n) | set(box_n):
+            q = float(np.clip(gt_n[k] / box_n[k] if box_n[k] else q_ref, 0.0, 1.0))
+            alpha[k] = q; weight[k] = float(np.clip((q_ref / max(q, 1e-12)) ** gamma, wmin, wmax))
+        ba = sum(alpha.get(k, 0.0) * v for k, v in bfp_n.items())
+        tpw = sum(weight.get(k, 1.0) * v for k, v in tp_n.items())
+        fnw = sum(weight.get(k, 1.0) * v for k, v in fn_n.items())
+        bw = sum(weight.get(k, 1.0) * v for k, v in bfp_n.items())
+        fpw = bw + fp - bbox_fp; den = tp + fp + fn; wden = tpw + fpw + fnw
+        safe = lambda n, d: float(n / d) if d > 0 else float("nan")
+        return dict(iou_strict=safe(tp, den),
+                    iou_a_plain=safe(tp, den-bbox_fp), iou_a_alpha=safe(tp, den-ba), iou_a_density=safe(tpw, wden-bw),
+                    iou_b_plain=safe(tp+bbox_fp, den), iou_b_alpha=safe(tp+ba, den), iou_b_density=safe(tpw+bw, wden),
+                    iou_c_plain=safe(tp+bbox_fp, den-bbox_fp), iou_c_alpha=safe(tp+ba, den-ba), iou_c_density=safe(tpw+bw, wden-bw))
+
     def _eval_nusocc_3d_fg(self, gt_occ, device=None):
         if gt_occ is None:
             return None
@@ -2346,6 +2689,70 @@ class EfficientOCF(
         if isinstance(tok, str) and isinstance(lid, str):
             return tok + "_" + lid
         return None
+
+    def _eval_load_external_gt_suite(self, img_metas):
+        """Load no-human binary inst3d/AABB/rot plus hybrid asset GT.
+
+        External f3 sparse rows use ``[x, y, z, class_id, instance_id]``.
+        Pedestrian is nuScenes occupancy class 7.  Filter it here, before
+        densifying, so evaluation metrics and query-debug visualization share
+        exactly the same no-human GT masks for every GT variant.
+        """
+        import os
+        import numpy as np
+
+        root = os.environ.get("EOCF_EVAL_GT_ROOT", "").strip()
+        if not root:
+            root = getattr(self, "eval_gt_root", None)
+        key = self._eval_sample_key_from_metas(img_metas)
+        if not root or key is None:
+            return None
+        asset_root = os.environ.get("EOCF_EVAL_ASSET_GT_ROOT", "").strip()
+        if not asset_root:
+            asset_root = getattr(self, "eval_asset_gt_root", None)
+        cache = getattr(self, "_eval_external_gt_cache", None)
+        if (isinstance(cache, tuple) and cache[0] == key and cache[1] == root
+                and cache[2] == asset_root):
+            return cache[3]
+
+        dims = (int(self.voxelizer.W), int(self.voxelizer.H), int(self.voxelizer.D))
+        specs = {
+            "inst3d": (root, "segmentation_instance3d", "segmentation_instance_saved_list2"),
+            "aabb": (root, "segmentation_aabb", "segmentation_aabb_saved_list2"),
+            "rot": (root, "segmentation_rot", "segmentation_rot_saved_list2"),
+        }
+        if asset_root:
+            specs["asset"] = (
+                asset_root, "segmentation_instance3d", "segmentation_instance_saved_list2")
+        out = {}
+        for name, (source_root, subdir, npz_key) in specs.items():
+            path = os.path.join(source_root, subdir, key + ".npz")
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Missing external eval GT: {path}")
+            with np.load(path, allow_pickle=True) as data:
+                frames = list(data[npz_key] if npz_key in data.files else data[data.files[0]])
+            dense = torch.zeros((len(frames), *dims), dtype=torch.uint8)
+            for t, rows in enumerate(frames):
+                arr = np.asarray(rows)
+                if arr.dtype == object:
+                    arr = np.vstack(arr) if arr.size else np.zeros((0, 5), dtype=np.int64)
+                arr = np.asarray(arr, dtype=np.int64)
+                if arr.size == 0 or arr.ndim != 2 or arr.shape[1] < 3:
+                    continue
+                if arr.shape[1] < 4:
+                    raise ValueError(
+                        f"External eval GT has no class_id column: "
+                        f"path={path}, frame={t}, shape={arr.shape}"
+                    )
+                # f3 column 3 is the semantic class; class 7 is pedestrian.
+                keep = arr[:, 3] != 7
+                for axis, dim in enumerate(dims):
+                    keep &= (arr[:, axis] >= 0) & (arr[:, axis] < dim)
+                arr = arr[keep]
+                dense[t, arr[:, 0], arr[:, 1], arr[:, 2]] = 1
+            out[name] = dense
+        self._eval_external_gt_cache = (key, root, asset_root, out)
+        return out
 
     def _eval_load_bbox_gt_v2(self, img_metas):
         """재생성 bbox GT v2 lazy-load (tools/gen_data/gen_bbox_gt_v2.py 산출물).
@@ -2517,6 +2924,12 @@ class EfficientOCF(
         fb["selected_mixture_weights_tqg"] = mw_s
         fb["selected_score_q"] = score_q
         fb["selected_pred_cls_q"] = cls_q
+        for key in (
+            "score_q", "iou_q", "cls_prob_q", "pred_cls_q",
+            "depth_entropy_q", "depth_conf_q",
+        ):
+            if key in present_bundle:
+                fb[key] = present_bundle[key]
         # candidate(all 행) = 전체 fg query(background 제외) — present처럼 임계값 못 넘은 저신뢰까지 다 표시.
         cand_idx = None
         if torch.is_tensor(cls_ids_q) and torch.is_tensor(conf_q):

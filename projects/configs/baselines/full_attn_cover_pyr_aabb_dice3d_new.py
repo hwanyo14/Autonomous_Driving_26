@@ -2,6 +2,14 @@
 # Spatiotemporal Decoupling for Efficient Vision-Based Occupancy Forecasting
 # https://github.com/BIT-XJY/EfficientOCF
 #
+# [gt_bbox_aabb = AABB 2026-07-15] gt_bbox_aabb 자리(dice bbox 90% + center/attn/size GT)의 소스를
+# AABB(segmentation_aabb) GT로 사용. train/test LoadInstanceWithFlow 둘 다 gt_bbox_aabb_subdir=
+# 'segmentation_aabb' + gt_bbox_aabb_key='segmentation_aabb_saved_list2'로 배선(loader 기본값과 동일).
+# 이 슬롯 하나가 results['gt_bbox_aabb'](dice)·gt_instance_centers_world(center)·gt_instance_ids·
+# gt_instance_dims(attn/size)를 전부 파생. (_rot 변형은 subset_attn_cover_pyr_aabb_dice3d_rot_new.py)
+# eval의 aabb/rot 분리 비교 지표(_eval_load_bbox_gt_v2, EOCF_BBOX_GT_V2_DIR)는 이 config와 무관하게
+# 별도 lazy-loader — ./data/efficientocf_gt_f3/GMO 기본 경로로 이미 갱신됨(efficientocf.py 참고).
+#
 # [occ 실험] semantic cls를 binary {0=bg, 1=fg}로 통합한 config (car/truck/... 구분 제거).
 # 변경 방법/디버깅 가이드: 레포 루트의 BINARY_FG_CLS_CHANGES.md 참고.
 # 스위치는 model_cfg의 query_cls_binary_fg=True (+ num_classes=2, weights 2개). moving/static과 무관.
@@ -14,6 +22,37 @@
 # 요지: attn map을 카메라 축(Ncam) 합/OR로 눌러 H×W로 비교하던 것을, (Ncam,H,W)를 통째로
 #   flatten해서 비교하도록 변경. 이전엔 서로 다른 카메라의 같은 (h,w) 배열 인덱스가 같은
 #   슬롯으로 취급돼 attn mass/IoU가 섞일 수 있었음(scale/offset/GMO 계열과 무관, attn 전용).
+#
+# [_aabb_dice 실험 2026-07-07] focal-bbox(_aabb) 후속 — bbox 감독을 focal에서 dice(tversky)로 이동.
+#   단일변수(baseline subset_attn_cover 대비) = query_gmo_dice_inst3d_weight(0.1)/
+#   query_gmo_dice_bbox_weight(0.9). focal은 inst3d 1.0/bbox 0으로 baseline 복귀.
+# 근거(_aabb ep9 512샘플 실측, NOTES/CHANGELOG 2026-07-07): focal-bbox 0.9는 TP+14%·FN-4%로
+#   벌리는 덴 성공했지만 '비관용FP(box 밖) +30%'로 IoU·Recall3d 전부 악화 — focal은 FP에 관대해
+#   box 밖에서 멈추는 힘이 없음. tversky는 α=0.7 FP-heavy라 GT를 bbox로 주면
+#   "box 안 확장 허용 + box 밖 강벌"이 정확히 구현됨 (utils_loss.py dice 혼합 주석 참조).
+# [_dice3d 실험 2026-07-10] 위 _aabb_dice(2D z-collapse) 대비 단일변수 = query_gmo_dice_3d=True.
+#   dice/tversky를 z-collapse 없이 [T,1,Z,Y,X] 그대로 계산 → z 방향 과확장(over-spread)도
+#   Tversky FP로 직접 벌함 (2D는 z-sum 후 BEV라 z 두께는 dice에 안 잡힘).
+#   inst3d/bbox weight(0.1/0.9)·tversky α/β 등 나머지는 _aabb_dice와 동일 (utils_loss.py
+#   _compute_matched_pair_gmo_losses dice_3d 분기 참조).
+# bbox GT = data/efficientocf_bboxcls_v3 (train 23,930 전체; ped-포함 cache-parity id 체계.
+#   v2(val용)는 ped-제외 번호라 학습 loss에 쓰면 안 됨 — NOTES 2026-07-06 id 체계 참조).
+# 모니터: dbg_gmo_dice_inst3d vs dbg_gmo_dice_bbox (pair 평균), dbg_gmo_dice_bbox_pair_count.
+#   eval에선 비관용FP([recall3d comps])가 base·_aabb 대비 줄었는지가 1차 판정 기준.
+#
+# [_pyr 실험 2026-07-10] query cross-attention을 coarse->fine KV 해상도 피라미드 3-layer로 확장
+#   (자매 레포 jhh_gi 이식, ksh_local 레포 subset_attn_cover_pyr.py와 동일 이식을 이 레포
+#   transformer.py/efficientocf_config.py/efficientocf.py에도 적용). query_transformer_num_layers=1→3
+#   + query_transformer_kv_resolutions=((14,25),(28,50),(56,100)) — 마지막 해상도는 이 레포
+#   img_neck(SECONDFPN, stride16 통합)의 실제 원본 context feature 해상도와 반드시 일치해야 함.
+#   주의(단일변수 원칙 이탈): subset_attn_cover의 σ-matching + _aabb_dice3d(dice 3D)까지 이미 얹힌
+#   위에 피라미드를 추가한 것이라 세 축이 동시에 바뀜. load_from/resume_from 전부 None(from-scratch
+#   전제) — 레이어 수가 늘어 기존 1-layer 체크포인트로는 resume 불가.
+#
+# [_newgt 재배선 2026-07-13] GT 소스를 구 캐시(nuScenes-Occupancy_inst3d/efficientocf_bboxcls_v3)에서
+#   새 GT 파이프라인(efficientocf_gt_f3)으로 전환. inst3d(D)·bbox(E) 둘 다 이 루트에서 나옴. center/attn
+#   GT는 gt_bbox_aabb(E)에서 생성(loading_instance.py §8.3 분기, load_segmentation_instance3d=False).
+#   구 캐시 로딩 코드 자체도 loading_instance.py에서 완전 삭제됨 — 이 레포는 새 GT 전용. model_cfg 무수정.
 #
 # [_cover 실험 2026-07-02] 위 attn fix 위에 σ-matching(attn 폭 감독) 추가 — subset_attn 대비
 # 단일변수 = query_attn_sigma_match_* 3키.
@@ -55,8 +94,9 @@ ocf_dataset_path = "./data/efficientocf/"
 occ_path = "./data/nuScenes-Occupancy"
 nusc_root = './data/nuscenes/'
 occ_dt_path = "./data/occ_dt"
-segmentation_cls_dataset_path = "./data/efficientocf_bboxcls/"
-gt_occ_inst_dataset_path = "./data/nuScenes-Occupancy_inst3d/"
+gt_occ_inst_dataset_path = "./data/efficientocf_gt_f3/"
+# focal3d/dice bbox 혼합용 AABB GT — 새 GT 파이프라인 루트(gt_occ_inst와 동일 id 공간)
+gt_bbox_aabb_dataset_path = "./data/efficientocf_gt_f3/"
 
 # Query/GMO foreground semantic classes use sparse raw nuScenes occupancy ids:
 # [2, 3, 4, 5, 6, 9, 10] + background(0); pedestrian(7) excluded
@@ -72,7 +112,6 @@ class_names = [
 query_class_ids = [0, 2, 3, 4, 5, 6, 9, 10]
 query_class_names = ['background'] + class_names
 exclude_occ_class_ids = (7,)  # pedestrian: 로드 단계에서 제거 (nohuman)
-validate_segmentation_cls_instance3d_alignment = True
 strict_query_class_id_validation = True
 use_separate_classes = False
 use_fine_occ = False
@@ -155,12 +194,13 @@ train_pipeline = [
         use_separate_classes=use_separate_classes,
         validate_cache=validate_instance_cache,
         write_cache=write_instance_cache,
-        load_segmentation_instance3d=True,
-        load_segmentation_cls_instance3d=True,
-        segmentation_cls_dataset_path=segmentation_cls_dataset_path,
-        validate_segmentation_cls_instance3d_alignment=validate_segmentation_cls_instance3d_alignment,
         load_gt_occ_inst=True,
         gt_occ_inst_dataset_path=gt_occ_inst_dataset_path,
+        load_gt_bbox_aabb=True,
+        gt_bbox_aabb_dataset_path=gt_bbox_aabb_dataset_path,
+        # gt_bbox_aabb 자리(dice bbox 90% + center/attn GT) = AABB(축정렬 OBB) GT.
+        gt_bbox_aabb_subdir='segmentation_aabb',
+        gt_bbox_aabb_key='segmentation_aabb_saved_list2',
         exclude_occ_class_ids=exclude_occ_class_ids,
     ),
     dict(
@@ -204,9 +244,8 @@ train_pipeline = [
             'segmentation',
             'segmentation_bev',
             'instance_bev',
-            'segmentation_instance3d',
-            'segmentation_cls_instance3d',
             'gt_occ_inst',
+            'gt_bbox_aabb',
             'gt_instance_centers_world',
             'gt_instance_centers_valid',
             'gt_instance_ids',
@@ -255,12 +294,14 @@ test_pipeline = [
         use_separate_classes=use_separate_classes,
         validate_cache=validate_instance_cache,
         write_cache=write_instance_cache,
-        load_segmentation_instance3d=True,
-        load_segmentation_cls_instance3d=True,
-        segmentation_cls_dataset_path=segmentation_cls_dataset_path,
-        validate_segmentation_cls_instance3d_alignment=validate_segmentation_cls_instance3d_alignment,
         load_gt_occ_inst=True,
         gt_occ_inst_dataset_path=gt_occ_inst_dataset_path,
+        load_gt_bbox_aabb=True,
+        gt_bbox_aabb_dataset_path=gt_bbox_aabb_dataset_path,
+        # train과 동일하게 AABB로 통일 — gt_instance_centers_world가 train 감독 소스(aabb)와
+        # 다른 기준으로 갈리지 않도록 val도 aabb 기준으로 맞춤.
+        gt_bbox_aabb_subdir='segmentation_aabb',
+        gt_bbox_aabb_key='segmentation_aabb_saved_list2',
         exclude_occ_class_ids=exclude_occ_class_ids,
     ),
     dict(
@@ -286,11 +327,10 @@ test_pipeline = [
         use_fine_occ=use_fine_occ,
         test_mode=True,
         dt_path=occ_dt_path,
-        # occ_dt is training-only supervision. forward_test/simple_test do not
-        # consume it, so do not require the generated cache for evaluation.
+        # DT is training-loss-only and the val cache is incomplete; do not load it for eval.
         load_occ_dt=False,
         dt_type='float16',
-        strict_dt=True,
+        strict_dt=False,
         validate_height_cache=False,
         write_height_cache=write_height_cache,
     ),
@@ -304,8 +344,6 @@ test_pipeline = [
             'segmentation',
             'segmentation_bev',
             'instance_bev',
-            'segmentation_instance3d',
-            'segmentation_cls_instance3d',
             'gt_occ_inst',
             'gt_instance_centers_world',
             'gt_instance_centers_valid',
@@ -381,9 +419,16 @@ numC_Trans = bev_feat_dim
 
 gn_cfg = dict(type='GN', num_groups=16, requires_grad=True)
 model_cfg = dict(
+    eval_asset_gt_root='./data/nuscenes_gmo_full_hybrid_solid_data_v1/val',
     use_segmentation_as_query_gt=True,
     use_gmo_bce_loss=True,
     query_gmo_loss_type='focal',
+    # [_aabb_dice 실험] focal은 baseline 복귀(inst3d 1.0), dice를 0.1 inst3d + 0.9 AABB로 혼합.
+    query_gmo_focal_inst3d_weight=1.0,
+    query_gmo_focal_bbox_weight=0.0,
+    query_gmo_dice_inst3d_weight=0.1,
+    query_gmo_dice_bbox_weight=0.9,
+    query_gmo_dice_3d=True,  # z-collapse 없이 3D로 dice/tversky 계산 (_dice3d 실험, 단일변수)
     # [dice 실험] focal-only는 over-spread에서 occ focal이 clamp 포화 + 전격자 mean 희석으로
     # FP gradient ≈0 → shape 못 잡음(NOTES 2026-06-25). Tversky(FP-heavy)를 켜서 FP를
     # foreground 크기로 정규화 → 퍼짐에 안 사라지는 gradient 부여. 격자 불변, β가 recall 방어.
@@ -425,6 +470,12 @@ model_cfg = dict(
     query_require_history_all_valid=True,
     query_attn_cam_gaussian_truncate_sigma=1.777,
     query_num_queries=200,
+    # [pyr 실험] cross-attention을 coarse->fine KV 해상도 피라미드 3-layer로 확장.
+    # jhh_gi 레포 transformer.py 이식(NOTES.md 2026-07-07). data_config['input_size']=
+    # (896,1600) 기준 context feature 원본 해상도가 (56,100)이므로 최종 layer를 원본 해상도로 맞춤.
+    # layer1(14,25) 전역 대략 위치 -> layer2(28,50) 중간 정제 -> layer3(56,100) 원본 해상도 정밀화.
+    query_transformer_num_layers=3,
+    query_transformer_kv_resolutions=((14, 25), (28, 50), (56, 100)),
     query_cls_match_cost_weight=0.2,
     query_center_match_cost_weight=10.0,
     query_temporal_offset_match_cost_weight=0.0, #0으로 제거

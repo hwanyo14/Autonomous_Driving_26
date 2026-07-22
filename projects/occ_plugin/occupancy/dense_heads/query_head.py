@@ -3216,13 +3216,17 @@ class QueryHead(nn.Module):
         # matched 행을 교체 렌더 (임계값·정렬·기준프레임이 metric과 정의상 동일).
         eval_cmp_pred_np = None
         eval_cmp_gt_np = None
+        eval_cmp_inst_np = None
         eval_cmp_iou_t = []
         if isinstance(eval_cmp_pack, dict):
             _ecp = eval_cmp_pack.get("pred_bev_t", None)
             _ecg = eval_cmp_pack.get("gt_bev_t", None)
+            _eci = eval_cmp_pack.get("inst_bev_t", None)
             if torch.is_tensor(_ecp) and torch.is_tensor(_ecg) and _ecp.dim() == 3 and _ecg.dim() == 3:
                 eval_cmp_pred_np = _ecp.detach().cpu().numpy().astype(np.bool_)
                 eval_cmp_gt_np = _ecg.detach().cpu().numpy().astype(np.bool_)
+                if torch.is_tensor(_eci) and _eci.dim() == 3 and tuple(_eci.shape) == tuple(_ecp.shape):
+                    eval_cmp_inst_np = _eci.detach().cpu().numpy().astype(np.bool_)
         bundle_top_k = 0
         bundle_score_thr = float(getattr(self, "fg_score_threshold", 0.5))
         bundle_w_iou = 0.5
@@ -3771,7 +3775,10 @@ class QueryHead(nn.Module):
                 _overlay_pred_bev(hi_ov, pred_bev, gt_bev, hi_color)
                 _overlay_pred_bev(hi_cls_ov, pred_bev, gt_bev, hi_color)
 
-            # eval 비교 행: matched 대신 'eval 실제 pred occ(빨강) vs bbox AABB GT(초록), 겹침 흰색'
+            # Eval comparison row.  With inst3d, use the same diagnostic colors
+            # as the standalone Recall3d FP overlay:
+            # white=TP, blue=inst3d FN, yellow=bboxFP,
+            # red=FP outside AABB, green=unpredicted AABB.
             if (
                 eval_cmp_pred_np is not None and eval_cmp_gt_np is not None
                 and t < int(eval_cmp_pred_np.shape[0]) and t < int(eval_cmp_gt_np.shape[0])
@@ -3780,9 +3787,17 @@ class QueryHead(nn.Module):
                 _ep = eval_cmp_pred_np[t]
                 _eg = eval_cmp_gt_np[t]
                 matched_ov = np.zeros((Y, X, 3), dtype=np.uint8)
-                matched_ov[_eg & ~_ep] = (0, 190, 60)
-                matched_ov[_ep & ~_eg] = (220, 45, 40)
-                matched_ov[_ep & _eg] = (255, 255, 255)
+                if eval_cmp_inst_np is not None and t < int(eval_cmp_inst_np.shape[0]):
+                    _ei_gt = eval_cmp_inst_np[t]
+                    matched_ov[_eg & ~_ep] = (0, 210, 60)              # unpredicted AABB
+                    matched_ov[_ep & ~_eg] = (235, 45, 40)             # FP outside AABB
+                    matched_ov[_ep & _eg & ~_ei_gt] = (255, 225, 0)    # bboxFP
+                    matched_ov[_ei_gt & ~_ep] = (30, 110, 255)         # inst3d FN
+                    matched_ov[_ep & _ei_gt] = (255, 255, 255)         # TP
+                else:
+                    matched_ov[_eg & ~_ep] = (0, 190, 60)
+                    matched_ov[_ep & ~_eg] = (220, 45, 40)
+                    matched_ov[_ep & _eg] = (255, 255, 255)
                 _ei = int((_ep & _eg).sum())
                 _eu = int((_ep | _eg).sum())
                 eval_cmp_iou_t.append((_ei / _eu) if _eu > 0 else float("nan"))
@@ -3904,6 +3919,8 @@ class QueryHead(nn.Module):
                 f"{'row5: refined traj(prev->cur; pred=red, all GT=cyan)  ' if not skip_traj_rows else ''}"
                 f"{'row6: base traj(prev->cur; pred=red, all GT=cyan)' if (not skip_traj_rows) and has_base_traj_row else ''}"
             )
+        if eval_cmp_inst_np is not None:
+            header += " | row4: white=TP blue=inst3d_FN yellow=bboxFP red=FP_outside_AABB green=unpredicted_AABB"
         if ego_visible:
             header += f" | ego(+)=xy(0,0)->pix({ego_ix},{ego_iy})"
         else:
@@ -3926,7 +3943,7 @@ class QueryHead(nn.Module):
             draw.text((x0 + 2, y2 + 2), f"hi(class)={stats_hi[t]}", fill=(255, 255, 255))
             draw.text(
                 (x0 + 2, y3 + 2),
-                (f"pred occ vs bbox_aabb  IoU={eval_cmp_iou_t[t]:.3f}"
+                (f"pred/inst3d/AABB  IoU_aabb={eval_cmp_iou_t[t]:.3f}"
                  if t < len(eval_cmp_iou_t) else f"matched={stats_matched[t]}"),
                 fill=(255, 255, 255))
             if not skip_traj_rows:
@@ -4456,6 +4473,8 @@ class QueryHead(nn.Module):
                     "score_q",
                     "iou_q",
                     "cls_prob_q",
+                    "depth_entropy_q",
+                    "depth_conf_q",
                     "cam_attn_score_q",
                     "cam_attn_score_valid_q",
                     "pred_cls_q",

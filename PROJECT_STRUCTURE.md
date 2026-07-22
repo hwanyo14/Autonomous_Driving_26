@@ -15,7 +15,10 @@
 ├── train_total.sh  # 8GPU 학습 원클릭 래퍼; CUDA_VISIBLE_DEVICES 지정 후 dist_train.sh 호출
 ├── eval_total.sh  # 단일 eval 원클릭 래퍼; CONFIG/checkpoint/GPU 값만 수정 후 dist_test.sh 호출
 ├── eval_oracle.sh  # Oracle(GT 치팅) eval 래퍼; EOCF_EVAL_ORACLE_MATCH=1로 query↔GT center Hungarian 선택 → 스코어링 병목 진단
+├── eval_oracle_abc.sh  # pyramid epoch 13 ABC Oracle eval 래퍼; future 600 samples, OCC threshold 0.85
+├── eval_depth.sh  # raw cls+depth confidence 결합 eval 및 optional offline AABB score sweep 래퍼
 ├── eval_sweep_thr.sh  # (FG_THR,OCC_THR) 조합 순차 스윕 래퍼; 부분 eval(EOCF_EVAL_MAX_SAMPLES=512)로 짧게 비교, 타 eval 종료 대기 후 시작
+├── eval_sweep_asset_top2.sh  # FG 3개×OCC 4개를 600샘플로 순차 평가해 IoU3d(asset) 상위 2개를 전체 5,119샘플로 자동 재평가
 ├── data/  # 외부 데이터와 전처리 캐시를 가리키는 심볼릭 링크 모음
 │   ├── efficientocf -> /home/user/jhh/Projects/EfficientOCF/data/efficientocf  # OCF instance/flow 전처리 캐시
 │   ├── efficientocf_bboxcls -> /home/user/jhh/Projects/EOCF_qg_distil_dev/data/efficientocf_bboxcls  # bbox/class 기반 segmentation 캐시
@@ -42,6 +45,7 @@
 │   │   │       └── seg_cosine_50e.py  # segmentation용 cosine 50epoch 템플릿
 │   │   ├── baselines/
 │   │   │   ├── full.py  # 전체 train셋 학습 config
+│   │   │   ├── full_attn_cover_pyr_aabb_dice3d_new.py  # 3-layer coarse-to-fine query attention + AABB/dice3d checkpoint 평가 config
 │   │   │   ├── subset.py  # 4000-sample subset 학습 config (빠른 실험용 베이스)
 │   │   │   ├── subset_scale.py  # subset + spread forcing 1차(σ-포함 메트릭, σ-loophole로 무효 판명)
 │   │   │   ├── subset_scale_offset.py  # subset + offset-only spread forcing (weight-loophole로 무압력 판명, NOTES 2026-07-02)
@@ -159,7 +163,7 @@
     ├── dist_train.sh  # torch.distributed.run 기반 분산 학습 실행기
     ├── test.py  # config/checkpoint 로드 후 custom test API를 호출하는 평가 엔트리포인트
     ├── train.py  # config 로드, plugin import, runner 구성 후 custom train API를 호출하는 학습 엔트리포인트
-    ├── dbg_probe/  # 체크포인트 오프라인 진단 프로브 모음 (spread/feature/attn/BEV 크기 분석 + BEV 비교 플롯); 사용법은 내부 README.md
+    ├── dbg_probe/  # 체크포인트 오프라인 진단 프로브 모음 (spread/feature/attn/BEV 크기/depth confidence score 분석 + BEV 비교 플롯); 사용법은 내부 README.md
     ├── gen_data/
     │   ├── gen_bbox_gt_v2.py  # bbox GT 재생성기 (AABB+rotated OBB, [x,y,z,cls,inst], 생성소멸·사람 필터 상속). --split train/--aabb_only/--include_ped_ids(cache-parity id)로 v3 train 캐시도 생성
     │   ├── gen_depth_gt.py  # nuScenes lidar를 카메라로 투영해 depth GT bin 파일 생성

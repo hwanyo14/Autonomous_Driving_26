@@ -265,9 +265,9 @@ test_pipeline = [
         use_fine_occ=use_fine_occ,
         test_mode=True,
         dt_path=occ_dt_path,
-        load_occ_dt=True,
+        load_occ_dt=False,
         dt_type='float16',
-        strict_dt=True,
+        strict_dt=False,
         validate_height_cache=False,
         write_height_cache=write_height_cache,
     ),
@@ -287,7 +287,6 @@ test_pipeline = [
             'gt_instance_centers_world',
             'gt_instance_centers_valid',
             'gt_instance_ids',
-            'occ_dt',
         ],
         meta_keys=['pc_range', 'occ_size', 'scene_token', 'lidar_token'],
     ),
@@ -359,6 +358,9 @@ numC_Trans = bev_feat_dim
 
 gn_cfg = dict(type='GN', num_groups=16, requires_grad=True)
 model_cfg = dict(
+    # Eval metrics only: direct-load inst3d/AABB/rot GT by sample token.
+    eval_gt_root='./data/efficientocf_gt_f3/GMO',
+    eval_asset_gt_root='./data/nuscenes_gmo_full_hybrid_solid_data_v1/val',
     use_segmentation_as_query_gt=True,
     use_gmo_bce_loss=True,
     query_gmo_loss_type='focal',

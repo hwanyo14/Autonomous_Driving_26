@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # ----- 대상 config / checkpoint / GPU -----
-CONFIG=./projects/configs/baselines/full.py
-CHECKPOINT=./work_dirs/full/latest.pth
+CONFIG=./projects/configs/baselines/full_attn_cover.py
+CHECKPOINT=./work_dirs/full_attn_cover/epoch_14_lss_only.pth
 GPUS=8
 export PORT=50031
 

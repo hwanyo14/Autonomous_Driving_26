@@ -20,6 +20,20 @@ import numpy as np
 import pycocotools.mask as mask_util
 from fvcore.nn import FlopCountAnalysis, parameter_count_table
 
+FULL_CM_KEYS = (
+    'cm_2d_nusocc', 'cm_2d_aabb', 'cm_2d_rot', 'cm_2d_asset',
+    'cm_3d_nusocc', 'cm_3d_aabb', 'cm_3d_rot', 'cm_3d_asset',
+)
+FULL_COMP_KEYS = ('recall_aabb_comps', 'recall_rot_comps', 'recall_asset_comps')
+FULL_RECALL_KEYS = ('recall_3d_aabb', 'recall_3d_rot', 'recall_3d_asset')
+FULL_ABC_KEYS = (
+    'iou_strict',
+    'iou_a_plain', 'iou_a_alpha', 'iou_a_density',
+    'iou_b_plain', 'iou_b_alpha', 'iou_b_density',
+    'iou_c_plain', 'iou_c_alpha', 'iou_c_density',
+)
+FULL_METRIC_KEYS = FULL_CM_KEYS + FULL_COMP_KEYS + FULL_RECALL_KEYS + FULL_ABC_KEYS
+
 def custom_encode_mask_results(mask_results):
     """Encode bitmap mask to RLE code. Semantic Masks only
     Args:
@@ -66,6 +80,75 @@ def _append_live_eval_log(msg):
             f.write(msg + "\n")
     except Exception:
         pass
+
+
+def _full_eval_msg(n, accum, distributed=False):
+    """Cam4DOcc-style micro IoUs and macro/micro tolerant Recall3d."""
+    from projects.occ_plugin.utils.formating import cm_to_ious
+
+    values = []
+    for key in FULL_CM_KEYS:
+        values.extend(np.asarray(sum(accum[key]) if accum[key] else np.zeros((2, 2))).reshape(-1))
+    for key in FULL_COMP_KEYS:
+        values.extend(np.asarray(sum(accum[key]) if accum[key] else np.zeros(4)).reshape(-1))
+    for key in FULL_RECALL_KEYS:
+        xs = [float(x) for x in accum[key] if not np.isnan(float(x))]
+        values.extend((sum(xs), len(xs)))
+    for key in FULL_ABC_KEYS:
+        xs = [float(x) for x in accum[key] if not np.isnan(float(x))]
+        values.extend((sum(xs), len(xs)))
+
+    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    packed = torch.as_tensor(values, dtype=torch.float64, device=device)
+    if distributed:
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+    values = packed.cpu().numpy()
+    offset = 0
+    cms = {}
+    for key in FULL_CM_KEYS:
+        cms[key] = values[offset:offset + 4].reshape(2, 2).astype(np.int64)
+        offset += 4
+    comps = {}
+    for key in FULL_COMP_KEYS:
+        comps[key] = values[offset:offset + 4]
+        offset += 4
+    recalls = {}
+    for key in FULL_RECALL_KEYS:
+        total, count = values[offset:offset + 2]
+        recalls[key] = total / count if count > 0 else float('nan')
+        offset += 2
+    abc = {}
+    for key in FULL_ABC_KEYS:
+        total, count = values[offset:offset + 2]
+        abc[key] = total / count if count > 0 else float('nan')
+        offset += 2
+
+    def _iou(key):
+        return float(cm_to_ious(cms[key])[1])
+
+    lines = [
+        "[eval][{}] IoU2d nusocc={:.4f} aabb={:.4f} rot={:.4f} asset={:.4f}".format(
+            n, _iou('cm_2d_nusocc'), _iou('cm_2d_aabb'), _iou('cm_2d_rot'),
+            _iou('cm_2d_asset')),
+        "           IoU3d nusocc={:.4f} aabb={:.4f} rot={:.4f} asset={:.4f}".format(
+            _iou('cm_3d_nusocc'), _iou('cm_3d_aabb'), _iou('cm_3d_rot'),
+            _iou('cm_3d_asset')),
+    ]
+    for source in ('aabb', 'rot', 'asset'):
+        tp, fp, fn, bbox_fp = comps['recall_{}_comps'.format(source)]
+        denom = tp + fn + fp - bbox_fp
+        micro = (tp + bbox_fp) / denom if denom > 0 else float('nan')
+        lines.append(
+            "           Recall3d {} macro={:.4f} micro={:.4f} "
+            "(TP={:.0f} FP={:.0f} FN={:.0f} bboxFP={:.0f})".format(
+                source, recalls['recall_3d_{}'.format(source)], micro,
+                tp, fp, fn, bbox_fp))
+    lines.append("           AABB macro Strict={:.4f}".format(abc['iou_strict']))
+    for method in ('a', 'b', 'c'):
+        lines.append("             {} plain={:.4f} alpha={:.4f} density={:.4f}".format(
+            method.upper(), abc['iou_{}_plain'.format(method)],
+            abc['iou_{}_alpha'.format(method)], abc['iou_{}_density'.format(method)]))
+    return "\n".join(lines)
 
 
 def _distributed_running_eval_msg(n, dataset_size, iou_cm, bbox_cm, bbox_rot_cm,
@@ -133,6 +216,7 @@ def custom_single_gpu_test(model, data_loader, show=False, out_dir=None, show_sc
     iou_metric, iou_bbox_metric, iou_bbox_rot_metric = [], [], []
     iou_3d_metric, iou_3d_bbox_metric, iou_3d_bbox_rot_metric, recall_3d_metric = [], [], [], []
     r3d_comps_sum = np.zeros(4, dtype=np.float64)
+    full_acc = {key: [] for key in FULL_METRIC_KEYS}
 
     for i, data in enumerate(data_loader):
         with torch.no_grad():
@@ -156,6 +240,10 @@ def custom_single_gpu_test(model, data_loader, show=False, out_dir=None, show_sc
                 c = result['recall_3d_comps']
                 r3d_comps_sum += np.array(
                     [c.get('tp', 0.0), c.get('fp', 0.0), c.get('fn', 0.0), c.get('bbox_fp', 0.0)])
+        for key in FULL_METRIC_KEYS:
+            if key in result and not (
+                    key in FULL_RECALL_KEYS and np.isnan(float(result[key]))):
+                full_acc[key].append(result[key])
 
         prog_bar.update()
         if (i + 1) % 50 == 0:
@@ -164,10 +252,14 @@ def custom_single_gpu_test(model, data_loader, show=False, out_dir=None, show_sc
                                            iou_3d_bbox_metric, iou_3d_bbox_rot_metric,
                                            recall_3d_metric), flush=True)
 
-    final_msg = _running_eval_msg(len(dataset), iou_metric, iou_bbox_metric,
-                                  iou_bbox_rot_metric, iou_3d_metric,
-                                  iou_3d_bbox_metric, iou_3d_bbox_rot_metric,
-                                  recall_3d_metric) + "  [FINAL]"
+    final_msg = (
+        _full_eval_msg(len(dataset), full_acc)
+        if full_acc['cm_3d_nusocc'] else
+        _running_eval_msg(len(dataset), iou_metric, iou_bbox_metric,
+                          iou_bbox_rot_metric, iou_3d_metric,
+                          iou_3d_bbox_metric, iou_3d_bbox_rot_metric,
+                          recall_3d_metric)
+    ) + "  [FINAL]"
     print("\n" + final_msg, flush=True)
     _append_live_eval_log(final_msg)
 
@@ -181,6 +273,10 @@ def custom_single_gpu_test(model, data_loader, show=False, out_dir=None, show_sc
         'recall_3d': recall_3d_metric,
         'recall_3d_comps': [r3d_comps_sum],
     }
+    for key in FULL_CM_KEYS + FULL_COMP_KEYS:
+        res[key] = [sum(full_acc[key])] if full_acc[key] else []
+    for key in FULL_RECALL_KEYS:
+        res[key] = full_acc[key]
     return res
 
 def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, show=False, out_dir=None):
@@ -213,6 +309,7 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
     iou_3d_bbox_rot_metric = []
     recall_3d_metric = []
     r3d_comps_sum = np.zeros(4, dtype=np.float64)   # [tp, fp, fn, bbox_fp] voxel 합
+    full_acc = {key: [] for key in FULL_METRIC_KEYS}
 
     dataset = data_loader.dataset
     rank, world_size = get_dist_info()
@@ -268,23 +365,24 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
                         c = result['recall_3d_comps']
                         r3d_comps_sum += np.array(
                             [c.get('tp', 0.0), c.get('fp', 0.0), c.get('fn', 0.0), c.get('bbox_fp', 0.0)])
+            for key in FULL_METRIC_KEYS:
+                if key in result and not (
+                        key in FULL_RECALL_KEYS and np.isnan(float(result[key]))):
+                    full_acc[key].append(result[key])
 
             batch_size = 1
                 
         if rank == 0:
             for _ in range(batch_size * world_size):
                 prog_bar.update()
-        if metric_every > 0 and (i + 1) % metric_every == 0:
-            msg = _distributed_running_eval_msg(
-                (i + 1) * world_size,
-                len(dataset),
-                iou_metric,
-                iou_bbox_metric,
-                iou_bbox_rot_metric,
-                iou_3d_metric,
-                iou_3d_bbox_metric,
-                iou_3d_bbox_rot_metric,
-                recall_3d_metric,
+        if metric_every > 0 and ((i + 1) == 10 or (i + 1) % metric_every == 0):
+            msg = (
+                _full_eval_msg((i + 1) * world_size, full_acc, distributed=True)
+                if full_acc['cm_3d_nusocc'] else
+                _distributed_running_eval_msg(
+                    (i + 1) * world_size, len(dataset), iou_metric,
+                    iou_bbox_metric, iou_bbox_rot_metric, iou_3d_metric,
+                    iou_3d_bbox_metric, iou_3d_bbox_rot_metric, recall_3d_metric)
             )
             if rank == 0:
                 print("\n" + msg, flush=True)
@@ -300,16 +398,13 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
     # (_distributed_running_eval_msg는 all_reduce collective라 전 rank가 함께 호출)
     if metric_every > 0:
         n_done = (i + 1) * world_size if max_samples > 0 else len(dataset)
-        final_msg = _distributed_running_eval_msg(
-            n_done,
-            len(dataset),
-            iou_metric,
-            iou_bbox_metric,
-            iou_bbox_rot_metric,
-            iou_3d_metric,
-            iou_3d_bbox_metric,
-            iou_3d_bbox_rot_metric,
-            recall_3d_metric,
+        final_msg = (
+            _full_eval_msg(n_done, full_acc, distributed=True)
+            if full_acc['cm_3d_nusocc'] else
+            _distributed_running_eval_msg(
+                n_done, len(dataset), iou_metric, iou_bbox_metric,
+                iou_bbox_rot_metric, iou_3d_metric, iou_3d_bbox_metric,
+                iou_3d_bbox_rot_metric, recall_3d_metric)
         ) + "  [FINAL]"
         # Recall3d 성분 합산 (all_reduce — 전 rank 공동 호출)
         device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
@@ -370,6 +465,14 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
         vpq_metric = [sum(vpq_metric)]
         vpq_metric = collect_results_cpu(vpq_metric, len(dataset), tmpdir)
         res['vpq_metric'] = vpq_metric
+
+    for key in FULL_CM_KEYS + FULL_COMP_KEYS:
+        if key in result:
+            local_sum = [sum(full_acc[key])]
+            res[key] = collect_results_cpu(local_sum, len(dataset), tmpdir)
+    for key in FULL_RECALL_KEYS + FULL_ABC_KEYS:
+        if key in result:
+            res[key] = collect_results_cpu(full_acc[key], len(dataset), tmpdir)
 
     return res
 

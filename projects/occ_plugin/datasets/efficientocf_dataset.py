@@ -516,6 +516,42 @@ class EfficientOCFDataset(NuScenesDataset):
             eval_results['Recall_3d_bboxFP'] = bfp
             eval_results['Recall_3d_micro'] = (tp + bfp) / denom if denom > 0 else float('nan')
 
+        # Cam4DOcc-style full suite from one external f3 GT root. IoUs are
+        # micro-aggregated by summing confusion matrices over the validation set.
+        if results.get('cm_3d_nusocc'):
+            for dim in ('2d', '3d'):
+                for source in ('nusocc', 'aabb', 'rot', 'asset'):
+                    key = 'cm_{}_{}'.format(dim, source)
+                    if results.get(key):
+                        eval_results['IOU_{}_{}'.format(dim, source)] = float(
+                            cm_to_ious(sum(results[key]))[1])
+            for source in ('aabb', 'rot', 'asset'):
+                comp_key = 'recall_{}_comps'.format(source)
+                recall_key = 'recall_3d_{}'.format(source)
+                if not results.get(comp_key):
+                    continue
+                values = np.asarray(results.get(recall_key, []), dtype=np.float64)
+                values = values[~np.isnan(values)]
+                tp, fp, fn, bbox_fp = np.asarray(sum(results[comp_key]), dtype=np.float64)
+                denom = tp + fn + fp - bbox_fp
+                eval_results['Recall3d_{}'.format(source)] = (
+                    float(values.mean()) if values.size else float('nan'))
+                eval_results['Recall3d_{}_micro'.format(source)] = (
+                    float((tp + bbox_fp) / denom) if denom > 0 else float('nan'))
+                eval_results['Recall3d_{}_TP'.format(source)] = float(tp)
+                eval_results['Recall3d_{}_FP'.format(source)] = float(fp)
+                eval_results['Recall3d_{}_FN'.format(source)] = float(fn)
+                eval_results['Recall3d_{}_bboxFP'.format(source)] = float(bbox_fp)
+            for key in ('iou_strict', 'iou_a_plain', 'iou_a_alpha', 'iou_a_density',
+                        'iou_b_plain', 'iou_b_alpha', 'iou_b_density',
+                        'iou_c_plain', 'iou_c_alpha', 'iou_c_density'):
+                values = np.asarray(results.get(key, []), dtype=np.float64)
+                values = values[~np.isnan(values)]
+                eval_results['{}_macro'.format(key.upper())] = (
+                    float(values.mean()) if values.size else float('nan'))
+            if 'IOU_C_PLAIN_macro' in eval_results:
+                eval_results['Recall3d_aabb'] = eval_results['IOU_C_PLAIN_macro']
+
         def _to_py(val):
             if torch.is_tensor(val):
                 val = val.detach().cpu()

@@ -41,6 +41,7 @@ class TransformerModule(nn.Module):
                  num_queries=100, 
                  num_heads=4,
                  num_layers=1,
+                 kv_resolutions=None,
                  num_cams=6,
                  embed_dim=128,
                  max_time=3,
@@ -69,6 +70,7 @@ class TransformerModule(nn.Module):
         self.num_layers = int(num_layers)
         if self.num_layers <= 0:
             raise ValueError(f"num_layers must be positive, got {self.num_layers}")
+        self.kv_resolutions = self._normalize_kv_resolutions(kv_resolutions)
         self.num_cams = num_cams
         self.embed_dim = embed_dim
         self.max_time = max_time
@@ -164,6 +166,41 @@ class TransformerModule(nn.Module):
         self.last_query_attn_overlap_loss_raw = None
         self._install_debug_grad_hooks()
 
+
+    def _normalize_kv_resolutions(self, kv_resolutions):
+        if kv_resolutions is None:
+            return None
+        kv_resolutions = tuple(tuple(int(v) for v in hw) for hw in kv_resolutions)
+        if len(kv_resolutions) != self.num_layers:
+            raise ValueError(
+                "kv_resolutions length must match num_layers: "
+                f"got {len(kv_resolutions)} vs {self.num_layers}"
+            )
+        for h, w in kv_resolutions:
+            if h <= 0 or w <= 0:
+                raise ValueError(f"kv_resolutions must be positive, got {(h, w)}")
+        return kv_resolutions
+
+    def _build_layer_kv_tokens(self, x, t, ncam, c, h, w):
+        if self.kv_resolutions is None:
+            s = int(ncam) * int(h) * int(w)
+            return [x.reshape(t, s, c) for _ in range(self.num_layers)]
+
+        x_hw = x.reshape(t, ncam, h, w, c).permute(0, 1, 4, 2, 3).reshape(t * ncam, c, h, w)
+        layer_kv_tokens = []
+        for target_h, target_w in self.kv_resolutions:
+            if target_h == h and target_w == w:
+                pooled = x_hw
+            elif target_h < h and target_w < w and h % target_h == 0 and w % target_w == 0:
+                kernel = (h // target_h, w // target_w)
+                pooled = F.avg_pool2d(x_hw, kernel_size=kernel, stride=kernel)
+            else:
+                pooled = F.adaptive_avg_pool2d(x_hw, output_size=(target_h, target_w))
+            pooled = pooled.reshape(t, ncam, c, target_h, target_w)
+            layer_kv_tokens.append(
+                pooled.permute(0, 1, 3, 4, 2).reshape(t, ncam * target_h * target_w, c)
+            )
+        return layer_kv_tokens
 
     def _is_rank0(self):
         return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
@@ -578,6 +615,7 @@ class TransformerModule(nn.Module):
         
         # Ablation 필요. 껐다 켰다. (img feat을 그대로 재사용하기 위한 목적이면 끄는 게 맞을 듯 함)
         # x = self.token_ln(x)
+        layer_kv_tokens = self._build_layer_kv_tokens(x, T, Ncam, C, H, W)
 
         if dbg_now and self._is_rank0():
             # img token은 "pos+cam+time"이 이미 더해진 x이므로, 순수 img feat norm은 따로 보고 싶으면 get_cam_pos_embed에서 뽑아야 함
@@ -610,7 +648,6 @@ class TransformerModule(nn.Module):
         need_weights = bool(return_attn_pool or return_attn_weights or attn_vis_now or use_attn_overlap_loss)
 
         for t in range(T):
-            kv = x[t].reshape(1, S, C)  # [1, S, C]
             q_in = q
             if query_id_embed is not None:
                 q_in = q_in + (self.query_id_reinject_scale * query_id_embed)
@@ -621,6 +658,7 @@ class TransformerModule(nn.Module):
                 q_attn = q_in / self.ca_attn_tau
 
                 # CA1
+                kv = layer_kv_tokens[layer_idx][t].unsqueeze(0)  # [1, S_layer, C]
                 out1, w1 = self.ca_layers[layer_idx](
                     q_attn,
                     kv,

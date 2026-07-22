@@ -13,7 +13,7 @@ import copy
 
 @PIPELINES.register_module()
 class LoadInstanceWithFlow(object):
-    def __init__(self, ocf_dataset_path, grid_size=[512, 512, 40], pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0], background=0, use_flow=True, use_separate_classes=False, use_lyft=False, validate_cache=False, write_cache=True, load_segmentation_instance3d=False, segmentation_instance3d_path=None, segmentation_instance3d_key='segmentation_instance_saved_list2', load_segmentation_cls_instance3d=False, segmentation_cls_dataset_path=None, segmentation_cls_key='segmentation_saved_list2', validate_segmentation_cls_instance3d_alignment=False, load_gt_occ_inst=False, gt_occ_inst_dataset_path=None, gt_occ_inst_key='segmentation_instance_saved_list2', load_gt_bbox_aabb=False, gt_bbox_aabb_dataset_path=None, gt_bbox_aabb_key='segmentation_aabb_saved_list2', exclude_occ_class_ids=()):
+    def __init__(self, ocf_dataset_path, grid_size=[512, 512, 40], pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0], background=0, use_flow=True, use_separate_classes=False, use_lyft=False, validate_cache=False, write_cache=True, load_segmentation_instance3d=False, segmentation_instance3d_path=None, segmentation_instance3d_key='segmentation_instance_saved_list2', load_segmentation_cls_instance3d=False, segmentation_cls_dataset_path=None, segmentation_cls_key='segmentation_saved_list2', validate_segmentation_cls_instance3d_alignment=False, load_gt_occ_inst=False, gt_occ_inst_dataset_path=None, gt_occ_inst_key='segmentation_instance_saved_list2', load_gt_bbox_aabb=False, gt_bbox_aabb_dataset_path=None, gt_bbox_aabb_key='segmentation_aabb_saved_list2', gt_bbox_aabb_subdir='segmentation_aabb', exclude_occ_class_ids=()):
         '''
         Loading sequential occupancy labels and instance flows for training and testing
         '''
@@ -47,6 +47,7 @@ class LoadInstanceWithFlow(object):
         self.load_gt_bbox_aabb = bool(load_gt_bbox_aabb)
         self.gt_bbox_aabb_dataset_path = gt_bbox_aabb_dataset_path
         self.gt_bbox_aabb_key = str(gt_bbox_aabb_key)
+        self.gt_bbox_aabb_subdir = str(gt_bbox_aabb_subdir)
         self.exclude_occ_class_ids = tuple(int(v) for v in exclude_occ_class_ids)
         if self.load_segmentation_cls_instance3d and (not self.load_segmentation_instance3d):
             raise ValueError(
@@ -105,10 +106,10 @@ class LoadInstanceWithFlow(object):
 
         base = os.path.normpath(self.gt_bbox_aabb_dataset_path)
         candidates = []
-        if os.path.basename(base) == "segmentation_aabb":
+        if os.path.basename(base) == self.gt_bbox_aabb_subdir:
             candidates.append(self.gt_bbox_aabb_dataset_path)
-        candidates.append(os.path.join(self.gt_bbox_aabb_dataset_path, prefix, "segmentation_aabb"))
-        candidates.append(os.path.join(self.gt_bbox_aabb_dataset_path, "segmentation_aabb"))
+        candidates.append(os.path.join(self.gt_bbox_aabb_dataset_path, prefix, self.gt_bbox_aabb_subdir))
+        candidates.append(os.path.join(self.gt_bbox_aabb_dataset_path, self.gt_bbox_aabb_subdir))
 
         for c in candidates:
             if c is not None and os.path.isdir(c):
@@ -656,7 +657,8 @@ class LoadInstanceWithFlow(object):
                 if col is not None:
                     sizes_voxel[col] = ext
 
-        centers_world = centers_voxel * self.resolution[:3].reshape(1, 1, 3) + self.start_position[:3].reshape(1, 1, 3)
+        centers_world = centers_voxel * self.resolution[:3].reshape(1, 1, 3) \
+            + self.start_position[:3].reshape(1, 1, 3) - self.resolution[:3].reshape(1, 1, 3) / 2.0
         centers_world = centers_world.astype(np.float32, copy=False)
         centers_world[~valid_mask] = 0.0
 
@@ -1067,6 +1069,8 @@ class LoadInstanceWithFlow(object):
             self.load_gt_bbox_aabb = False
             self.gt_bbox_aabb_dataset_path = None
             self.gt_bbox_aabb_key = "segmentation_aabb_saved_list2"
+        if not hasattr(self, "gt_bbox_aabb_subdir"):
+            self.gt_bbox_aabb_subdir = "segmentation_aabb"
         assert 'attribute_label' not in results.keys()
         assert 'segmentation_bev' not in results.keys()
         assert 'instance_bev' not in results.keys()
@@ -1520,7 +1524,16 @@ class LoadInstanceWithFlow(object):
             results['segmentation_bev'] = torch.cat(segmentation_bev_list, dim=0)
             results['instance_bev'] = torch.cat(instance_bev_list, dim=0)
             results['flow_bev'] = torch.cat(flow_bev_list, dim=0).float()
-            if self.load_segmentation_instance3d:
+            if self.load_gt_bbox_aabb and gt_bbox_aabb_sparse_list is not None:
+                centers_world, centers_valid, instance_ids, instance_sizes = \
+                    self.build_instance_center_world_targets(gt_bbox_aabb_sparse_list)
+                results['gt_instance_centers_world'] = centers_world
+                results['gt_instance_centers_valid'] = centers_valid
+                results['gt_instance_ids'] = instance_ids
+                results['gt_instance_sizes'] = instance_sizes
+                results['gt_instance_dims'] = self.build_instance_dims_targets(
+                    results.get('instance_dict'), instance_ids)
+            elif self.load_segmentation_instance3d:
                 results['segmentation_instance3d'] = torch.cat(segmentation_instance3d_list, dim=0).long()
                 if segmentation_instance3d_sparse_list is None:
                     raise ValueError("segmentation_instance3d sparse list is missing while cache is used")
@@ -1682,7 +1695,16 @@ class LoadInstanceWithFlow(object):
         ).unsqueeze(0)
         results['segmentation_bev'] = torch.cat(results['segmentation_bev'], dim=0)
         results['instance_bev'] = torch.cat(results['instance_bev'], dim=0)
-        if self.load_segmentation_instance3d:
+        if self.load_gt_bbox_aabb and gt_bbox_aabb_sparse_list is not None:
+            centers_world, centers_valid, instance_ids, instance_sizes = \
+                self.build_instance_center_world_targets(gt_bbox_aabb_sparse_list)
+            results['gt_instance_centers_world'] = centers_world
+            results['gt_instance_centers_valid'] = centers_valid
+            results['gt_instance_ids'] = instance_ids
+            results['gt_instance_sizes'] = instance_sizes
+            results['gt_instance_dims'] = self.build_instance_dims_targets(
+                results.get('instance_dict'), instance_ids)
+        elif self.load_segmentation_instance3d:
             results['segmentation_instance3d'] = torch.cat(results['segmentation_instance3d'], dim=0).long()
             centers_world, centers_valid, instance_ids, instance_sizes = self.build_instance_center_world_targets(segmentation_instance3d_sparse_list)
             results['gt_instance_centers_world'] = centers_world

@@ -258,10 +258,27 @@ def main():
         model = MMDataParallel(model, device_ids=[0])
         outputs = custom_single_gpu_test(model, data_loader, args.show, args.show_dir)
     else:
+        # PyTorch 2.7 changed parallel._get_stream to require torch.device,
+        # while MMCV 1.7 still passes integer CUDA ids from its scatter path.
+        import mmcv.parallel._functions as mmcv_parallel_functions
+        if not getattr(mmcv_parallel_functions._get_stream, '_eocf_torch27_compat', False):
+            _get_stream = mmcv_parallel_functions._get_stream
+
+            def _get_stream_compat(device):
+                if isinstance(device, int):
+                    device = torch.device('cuda', device)
+                return _get_stream(device)
+
+            _get_stream_compat._eocf_torch27_compat = True
+            mmcv_parallel_functions._get_stream = _get_stream_compat
         model = MMDistributedDataParallel(
             model.cuda(),
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=False)
+        # MMCV 1.7 expects this private DDP flag, which PyTorch 2.7 no longer
+        # initializes. False keeps the standard self.module forward path.
+        if not hasattr(model, '_use_replicated_tensor_module'):
+            model._use_replicated_tensor_module = False
         outputs = custom_multi_gpu_test(model, data_loader, args.tmpdir,
                                         args.gpu_collect, args.show, args.show_dir)
 
