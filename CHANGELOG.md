@@ -1,5 +1,200 @@
 # Changelog
 
+## 2026-07-23 19:58 KST — asset-all 학습 config visibility 필터 적용
+
+- `subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter.py`의 train/test dataset과
+  `LoadInstanceWithFlow`에 `filter_f3_first_visibility=True`를 연결했다. 과거 3프레임 최초
+  annotation이 `visibility_token==1`인 f3 raw instance ID가 train asset-union D,
+  E(AABB), E에서 파생되는 center/valid/ID의 t0~t6 전체에서 제외된다.
+- train/test `Collect3D.meta_keys`에 `gt_visibility_drop_ids`를 전달해 eval lazy AABB/rot 및
+  asset 지표도 동일 blacklist를 사용하도록 맞췄다. filter 실험의 query/cam/mixture/attention
+  시각화 경로를 전용 work_dir 아래로 분리했다.
+- config 파싱·문법·배선 검사를 통과했다. asset train 캐시와 f3 캐시가 23,930개 sample key를
+  전부 공유하며 무작위 100개 실제 7프레임 샘플의 instance ID 집합도 모두 일치해 f3 blacklist를
+  asset instance 열에 적용할 수 있음을 확인했다.
+
+## 2026-07-23 19:39 KST — visibility 필터 전후 D/E 시각 검증
+
+- 실제 val 시퀀스 3개에 대해 D(nusocc instance3d)와 E(AABB)를 각각 `before`,
+  `after`, `removed`로 나눈 7프레임 BEV 비교 이미지를
+  `data_vis/visibility_filter_compare/`에 생성했다.
+- 제거 대상은 instance별 동일 색상, 유지 대상은 before에서 회색/after에서 초록색으로 표시하고
+  현재 프레임 t2는 노란 테두리로 구분했다. 세 샘플 모두 동일 blacklist가 D/E의 t0~t6 전체에
+  적용되며 `before = after + removed`인 것을 픽셀 수와 시각 결과로 확인했다.
+
+## 2026-07-23 19:31 KST — f3 최초등장 visibility=1 런타임 필터 추가
+
+- `subset_attn_cover_pyr_aabb_dice3d_new_filter.py`에서만 과거 3프레임 내 instance 최초
+  annotation의 `visibility_token==1`을 판정해 해당 f3 raw instance ID를 7프레임 전체에서
+  제외하도록 활성화했다. 최초 visibility가 2~4면 이후 과거/미래 프레임의 visibility=1은
+  제거 조건으로 사용하지 않는다.
+- dataset이 원본 nuScenes annotation 순서와 `vehicle`/`human` 포함 규칙으로 f3 raw ID를 별도
+  재현한다. 기존 `instance_dict`는 저가시성·사람 필터 후 ID라 f3와 다르므로 사용하지 않는다.
+- `LoadInstanceWithFlow`가 D(`gt_occ_inst`)와 E(`gt_bbox_aabb`)를 읽은 직후 동일 blacklist로
+  sparse row를 필터링하고, 그 다음 center/valid/ID/size를 생성한다. 따라서 matching/class,
+  focal/Dice, center/trajectory와 query 시각화가 모두 필터된 D/E에서 파생된다.
+- attention softargmax 시각화의 bbox 입력을 legacy fallback 대신 실제 필터된 AABB(E)로 수정했다.
+  filter 실험의 query/cam/mixture/attn 시각화 출력 경로도 전용 work_dir 아래로 분리했다.
+- test meta에도 blacklist를 전달해 eval lazy AABB/rot 및 부가 asset 지표가 동일 ID를 제거하도록
+  맞췄다. 관련 파일 `py_compile`, config/dataset/loader build를 통과했다. val 100시퀀스에서
+  D 429,613행/E 9,169,093행 제거, 후속 과거 visibility=1 객체 162개와 미래 visibility=1 객체
+  307개 유지 확인. 실제 loader 샘플에서도 제거 ID의 D/E row와 파생 center ID가 모두 0개였다.
+
+## 2026-07-23 18:29 KST — Asset IoU3D TP/FP/FN eval 출력 추가
+
+- `IOU_3d_asset` 계산에서 이미 만들어지던 voxel TP/FP/FN을 버리지 않고 detector 결과로 반환하도록
+  연결했다. 기존 Asset GT, 3D 정렬, occupancy threshold와 frame 범위를 그대로 공유한다.
+- single/multi-GPU eval에서 성분을 전체 샘플·rank에 걸쳐 합산하고 final/live 로그에
+  `[iou3d comps asset] TP=... FP=... FN=... | micro IoU3d=...`를 출력한다.
+- dataset 최종 결과에 `IOU_3d_asset_TP`, `IOU_3d_asset_FP`, `IOU_3d_asset_FN`,
+  `IOU_3d_asset_micro`를 추가했다. 기존 `IOU_3d_asset` sample-macro 평균은 변경하지 않았다.
+- 관련 파일 `py_compile`, 합성 TP/FP/FN 계산과 dataset aggregation smoke test를 통과했다.
+
+## 2026-07-23 16:22 KST — Asset scene BCE 빈-instance 배치 temporal guard 수정
+
+- 첫 8GPU 실행에서 scene BCE는 현재+미래 5프레임으로 4 iteration까지 정상 계산됐지만,
+  다섯 번째 배치의 GT center full-timeline pack이 비어 `use_full7_temporal_sup=False`가 되자
+  BCE가 불필요하게 full7 center 정렬을 요구하며 rank 4에서 종료되는 문제를 확인했다.
+- scene BCE는 GT instance center를 사용하지 않으므로, full-timeline 선택 조건을 예측 Gaussian
+  timeline과 Asset occupancy GT의 존재 여부로 분리했다. full timeline을 사용할 수 없는 경우에는
+  정렬된 present+future horizon으로 안전하게 fallback한다.
+- 관련 detector/loss 파일 `py_compile`, config parse와 checkpoint 존재 여부를 다시 확인했다.
+  scene BCE 가중치 `0.1`, hard-pair 비활성, 3 epoch/LR `1e-5`/warmup 100 설정은 변경하지 않았다.
+
+## 2026-07-23 16:09 KST — 현재+미래 all-query Asset scene BCE fine-tuning 추가
+
+- `subset_attn_cover_pyr_aabb_dice3d_new_asset_all_ft_bce.py`에서 현재 1+미래 4프레임을 각각
+  하나의 scene occupancy로 렌더하고 Asset 합집합 GT와 foreground-normalized BCE를 계산하도록
+  활성화했다. 모든 200 query×48 Gaussian을 사용하며 query foreground confidence를 연속 opacity로
+  곱한다. Hungarian/hard mining, score/occupancy threshold, NMS, top-k는 이 loss 경로에 없다.
+- positive/negative voxel 가중치는 `1.0/1.0`, scene loss 가중치는 `0.1`이다. 프레임별 BCE 합을
+  GT foreground voxel 수로 정규화한 뒤 현재+미래 5프레임을 평균한다. 빈 GT 프레임은 background
+  평균 BCE만 계산한다.
+- 평가용 in-place scene renderer는 backward 시 version error가 나므로, query별 full volume 대신
+  실제 Gaussian bbox patch만 모아 `scatter_reduce(amax)`로 단일 scene을 만드는 differentiable
+  경로를 추가했다. 기존 eval 경로와 합성 입력 출력 최대 오차 `0`, center/sigma/yaw/Gaussian
+  opacity/query confidence gradient 유효를 확인했다.
+- hard-pair gate는 config에 명시적으로 `False`로 고정했다. covariance/direction shape loss도
+  기본 비활성이다. full epoch-15 checkpoint는 유지하고 전체 FT LR을 `1e-5`, image backbone을
+  `1e-6`, linear warmup을 100 iter, cosine 3 epoch로 보수적으로 조정했다.
+- 관련 Python 파일 `py_compile`, MMCV config/model/optimizer build, scene BCE 단독 backward smoke
+  test를 통과했다. 지정 epoch-15 checkpoint도 정상 로드됐고 epoch metadata=15를 확인했다
+  (출력된 unexpected key는 기존 checkpoint의 non-persistent buffer들뿐이며 학습 파라미터 누락은 없음).
+
+## 2026-07-23 13:37 KST — Dice-loss top-k matched-pair Asset FT 추가
+
+- `subset_attn_cover_pyr_aabb_dice3d_new_asset_all_ft_hard_dice.py`를 full epoch-15 기반
+  3-epoch fine-tuning 설정으로 구성했다. Hungarian matching 뒤 각 matched pair의 raw Dice loss를
+  계산하고, rank별 상위 30%(`ceil`, 최소 1 pair)를 hard pair로 선택한다.
+- 선택된 동일 hard pair에만 GMO focal/Dice loss를 적용하며 easy pair weight는 `0.0`으로 설정했다.
+  선택 점수는 `detach`하므로 top-k 선택 자체에는 gradient가 없고, 선택된 loss에만 역전파된다.
+- 공용 설정에 `geometry`/`loss_topk` 모드와 top-k 비율, easy weight, 최소 pair 수를 추가했다.
+  기본 모드는 기존 `geometry`라 기존 config 동작은 유지된다.
+- large/far 기준은 해당 설정에서 선택 조건이 아니라 진단값으로만 유지했다. hard/easy raw loss,
+  선택 비율, Dice cutoff 및 선택된 hard 중 large/far 수를 DBG로 기록하며 hard DBG가 로그 필터에서
+  제거되던 문제도 함께 수정했다.
+- optimizer는 전체 `3e-5`, image backbone `3e-6`만 사용하고 특정 Gaussian head 2배 LR은 제거했다.
+  기존 200-iteration warmup, cosine schedule, full epoch-15 `load_from`은 유지했다.
+- 관련 파일 `py_compile`, 신규/기존 config parse, full model/optimizer build와 합성 gradient 검증을
+  통과했다. 합성 검증에서 Dice loss 상위 pair에만 focal/Dice gradient가 생기고 geometry 모드의
+  기존 large/far 선택도 유지됨을 확인했다.
+
+## 2026-07-23 11:16 KST — 큰·원거리 matched-pair Asset FT 추가
+
+- `subset_attn_cover_pyr_aabb_dice3d_new_asset_all_ft_hard.py`에서 Hungarian matching은 유지하고,
+  실제 annotation `max(w,l) >= 6m` 또는 present-frame LiDAR/BEV 거리 `>= 30m`인 pair만
+  Asset focal/Dice loss에 포함하도록 설정했다. 회전 조건은 현재 미래 shape가 프레임 불변인 구조적
+  한계 때문에 포함하지 않았다.
+- 공용 hard-pair gate/threshold 기본값을 `efficientocf_config.py`에 비활성 상태로 추가하고,
+  `utils_loss.py`에서 matched GT id 기준 실제 크기와 present-frame 중심 거리를 정렬해 focal/Dice만
+  필터링했다. hard가 없는 rank는 기존 graph-connected zero loss 경로를 유지한다.
+- 전체/hard/easy 및 large/far/overlap pair 수, metadata 유효 수, hard 비율·평균 크기·거리,
+  hard/easy focal·Dice raw loss DBG를 추가했다.
+- 전체 LR `3e-5`, image backbone `3e-6`은 유지하고 Gaussian offset/sigma/yaw/weight 출력 head만
+  `6e-5`로 설정했다. 기존 200-iteration linear warmup, 3-epoch cosine, full epoch-15 load_from은 유지했다.
+
+## 2026-07-23 10:31 KST — Asset focal/Dice 기본 fine-tuning 설정 분리
+
+- `subset_attn_cover_pyr_aabb_dice3d_new_asset_all_ft.py`에서 covariance/rendered-direction
+  shape loss와 관련 진단 플래그를 제거하고, 기존 full epoch-15 모델을 asset-union focal/Dice로
+  미세조정하는 설정만 유지했다.
+- `train_ft.sh`가 새 `_asset_all_ft.py` 설정을 실행하도록 변경했다.
+
+## 2026-07-21 18:44 KST — `_cov_weight` detached-opacity covariance variation 추가
+
+- `subset_attn_cover_pyr_aabb_dice3d_new_asset_all_cov_weight.py`에서 shape loss weight `0.1`은
+  유지하고, 예측 Gaussian 중심 공분산만 detached opacity로 가중하도록 활성화했다.
+- 공용 설정 `query_gmo_shape_pred_weight_mode`을 추가했다. 기본 `equal`은 기존 cov 수식을
+  유지하며, `detached_opacity`는 opacity를 정규화해 weighted mean/covariance에 사용하되
+  detach하여 shape loss가 opacity head를 직접 조절하지 못하게 한다.
+- 검증: 기존 equal 수식과 최대 오차 `2.38e-7`, offset gradient 유효, opacity gradient 없음,
+  기존 cov=`equal`/신규 cov_weight=`detached_opacity` 모델 build 및 py_compile 통과.
+
+## 2026-07-21 11:30 KST — `_asset_all_cov` 학습 전용 covariance shape loss 추가
+
+- `subset_attn_cover_pyr_aabb_dice3d_new_asset_all_cov.py`에서만 matched asset-union GT BEV와
+  48개 Gaussian 중심의 trace-normalized XY covariance를 비교하는 `loss_gmo_shape`를 활성화했다.
+- shape loss weight는 `0.1`, 유효 GT 하한은 low-res BEV 4 voxel이며 opacity는 공분산 가중에
+  사용하지 않는다. 기존 focal/Tversky/Gaussian/추론 설정은 유지했다.
+- 공용 config 기본값은 비활성(`False`, `0.0`)이라 다른 config와 추론에는 영향이 없다.
+- raw loss, valid pair-frame 수, 장축 각도 오차와 예측/GT 장단축비 debug 로그를 추가했다.
+- 검증: 관련 파일 `py_compile`, MMCV config parse, 동일/45도 회전/정사각형 covariance 합성 검증 통과.
+
+## 2026-07-20 19:39 KST — `_asset_all` Dice3D를 asset-union 단독 감독으로 변경
+
+- `subset_attn_cover_pyr_aabb_dice3d_new_asset_all.py`의 Dice3D 비율을 inst3d/AABB `0.0/1.0`에서
+  `1.0/0.0`으로 변경했다. 해당 config의 train `gt_occ_inst`는 병합 key
+  `segmentation_instance_saved_list2`이므로 실제 Dice GT는 기존 inst3d와 asset의 합집합이다.
+- focal은 기존대로 asset-union을 사용하며 center/trajectory/ID/size용 AABB 배선은 유지했다.
+
+## 2026-07-20 19:23 KST — asset-union eval 지표 추가
+
+- `efficientocf.py`에 eval 전용 asset GT lazy-loader를 추가했다. 기본 경로는
+  `nuscenes_gmo_full_hybrid_solid_data_v1/val/segmentation_instance3d`, key는 train과 같은
+  `segmentation_instance_saved_list2`이며 `EOCF_ASSET_GT_DIR`로 override할 수 있다.
+- 기존 정렬을 그대로 적용해 `IOU_2d_asset`, `IOU_3d_asset`을 계산하고, 기존 inst3d를 필수 GT,
+  asset-union을 추가 예측 허용 영역으로 쓰는 `Recall3d(asset)` 및 TP/FP/FN/assetFP 성분을 추가했다.
+- single/multi-GPU 결과 수집, distributed running/final 로그와 dataset 최종 평가 출력을 모두 배선했다.
+
+## 2026-07-20 15:18 KST — `_asset` train inst3d를 asset 보강 합집합 GT로 전환
+
+- `subset_attn_cover_pyr_aabb_dice3d_new_asset.py`의 train `gt_occ_inst`를
+  `nuscenes_gmo_full_hybrid_solid_data_v1/train/segmentation_instance3d`의
+  `segmentation_instance_saved_list2`로 연결했다. 이 key는 기존 sparse inst3d를 보존하고 빈 xyz에
+  asset voxel을 추가한 병합 완료 GT다.
+- test `gt_occ_inst`와 AABB GT 경로는 기존 `efficientocf_gt_f3`를 유지한다.
+- GMO focal은 병합 inst3d를 사용하고, Dice3D는 기존 설정대로 inst3d/AABB `0.0/1.0`을 사용한다.
+
+## 2026-07-20 15:18 KST — `_asset` Dice3D를 AABB 단독 감독으로 변경
+
+- `subset_attn_cover_pyr_aabb_dice3d_new_asset.py`에서 Dice3D 혼합 비율을
+  inst3d/AABB `0.1/0.9`에서 `0.0/1.0`으로 변경했다.
+- focal 비율(inst3d/AABB `1.0/0.0`)과 데이터 및 train/test 배선은 변경하지 않았다.
+
+## 2026-07-16 18:56 KST — AABB 크기 기반 연속 Tversky (`_tver`)
+
+- `subset_attn_cover_pyr_aabb_dice3d_new_tver.py`에서만 크기 스케줄 활성화. 현재 연결된
+  `efficientocf_gt_f3/GMO/segmentation_aabb`에서 loader가 만든 `gt_instance_sizes`의 XY 최대 span을
+  사용해 6m 이하 `α/β=0.7/0.3`, 10m 이상 `0.4/0.6`, 중간은 선형 보간한다.
+- `efficientocf_config.py`: 크기 스케줄 gate/start/end/alpha_end 기본값 추가. gate 기본값은 `False`라
+  기존 config 동작은 유지한다.
+- `efficientocf.py`, `utils_loss.py`: matched instance id로 AABB size를 정렬해 pair별 Tversky α/β를
+  적용. size가 없거나 id 정렬에 실패한 pair는 기존 고정 α/β로 fallback한다.
+- 대상 config의 train `Collect3D`에 `gt_instance_sizes`를 추가해 loader에서 만든 AABB 크기가
+  `forward_train`까지 전달되도록 배선했다. 최초 실행 18 iter에서 이 key 누락으로 size fallback만
+  동작한 것을 TensorBoard(`alpha_mean=0.7`, `large_pair_count=0`)로 확인 후 보완했다.
+- 디버그 값 `dbg_gmo_dice_alpha_mean`, `dbg_gmo_dice_beta_mean`,
+  `dbg_gmo_dice_size_large_pair_count`를 추가했다.
+
+## 2026-07-16 18:04 KST — 특정 config용 learnable KV pyramid downsampling
+
+- `transformer.py`: coarse-to-fine KV pyramid의 고정 average pooling을 선택적으로 대체하는
+  depthwise stride conv + pointwise 1x1 conv downsampler 추가. average pooling + identity와 같은
+  초기값을 사용하고 마지막 full-resolution layer는 identity로 유지.
+- `efficientocf_config.py`, `efficientocf.py`: `query_transformer_learnable_kv_downsample` gate 추가.
+  기본값은 `False`라 기존 config 동작은 유지.
+- `subset_attn_cover_pyr_aabb_dice3d_new_conv.py`에서만 gate를 `True`로 활성화.
+
 ## 2026-07-15 KST — subset_attn_cover_pyr_aabb_dice3d_new.py: 학습 GT를 rot→AABB로 전환
 
 - **문제**: 이 config는 파일명이 `aabb`인데 실제 GT 배선은 `segmentation_rot`이었음(`_rot_new` 복사 후
@@ -1571,3 +1766,68 @@ py_compile 통과. 시각화 전용이라 학습/평가 수치 영향 없음.
 - `projects/configs/baselines/test_traj_mcls_occ.py`: `evaluation = dict(...)` 블록 삭제, eval 전용 `val_config`/`data['val']` 삭제, 미사용 `import copy` 삭제. (`test_config`/`test_pipeline`은 tools/test.py용이라 유지)
 
 **영향**: train 중 eval 없음(전역). test.py를 통한 별도 평가는 영향 없음. 다른 실험 config들(test_traj.py, EfficientOCF_V1.1_1gpu.py 등)에 남아있는 `evaluation` dict는 이제 dead code지만 별도 실험 소유라 미수정.
+## 2026-07-22 10:00 KST — GMO covariance 장축 효과 오프라인 probe 추가
+
+- `tools/dbg_probe/probe_gmo_axis.py` 추가: 모델의 실제 matched-pair low-resolution GMO 경로를 hook해 asset-union GT 대비 Gaussian center(equal/opacity-weighted)와 렌더링 BEV(0.5/0.75 threshold)의 주축 각도 오차 및 장단축비를 JSON으로 기록.
+- 별도 매칭 재구현 없이 학습 시 사용되는 matching과 GT를 그대로 사용하며, 동일 sample/augmentation 비교를 위해 sample별 seed를 고정.
+- `tools/dbg_probe/README.md`, `PROJECT_STRUCTURE.md`에 새 probe를 반영.
+
+## 2026-07-22 11:40 KST — `_cov_dir` offset 장축 direction-only loss 추가
+
+- `subset_attn_cover_pyr_aabb_dice3d_new_asset_all_cov_dir.py`에 기존 covariance 원소 MSE 대신
+  `[(Cxx-Cyy), 2*Cxy]`를 단위 방향으로 비교하는 `direction` shape-loss 모드를 적용했다.
+- 실측상 불안정한 GT를 제외하도록 BEV 최소 10 voxel, GT 장단축비 최소 2.0을 사용하고,
+  loss 범위(0~1)에 맞춰 weight를 0.02로 설정했다.
+- 공용 기본 모드는 `covariance`, 최소 GT 장단축비는 1.0으로 두어 기존 no-cov/cov/cov_weight
+  config의 동작을 유지했다. direction loss는 Gaussian center offset에만 gradient를 전달하며
+  sigma/yaw/opacity 및 추론 경로는 변경하지 않는다.
+
+## 2026-07-22 13:10 KST — GMO 장축 paired BEV 시각화 도구 추가
+
+- `tools/dbg_probe/visualize_gmo_axis_pair.py` 추가: 동일 sample/augmentation/matched GT에서 두
+  checkpoint의 asset BEV, 48 Gaussian centers, threshold 0.75 render, GT/예측 장축선을 나란히 표시한다.
+- epoch1 probe 통계에 따라 개선/중립/악화 각 2건을 고정 선택해 성공 사례만 보는 편향을 방지했다.
+### 2026-07-22 13:23 KST — paired axis visualization reproducibility fix
+
+- `tools/dbg_probe/visualize_gmo_axis_pair.py` now advances the training dataset in the same sequential order as the source probe and immediately copies selected visualization data to CPU, preserving augmentation identity while avoiding retained GPU captures.
+- Selected examples are resolved by the probe's stable matched-pair index; run-local remapped instance IDs are retained only as plot annotations.
+- Default comparison cases use reproducible matched samples 5, 9, and 12 (two improved, two neutral, two degraded); sample 18 was excluded because the rerun augmentation produced no prepared matched pairs.
+### 2026-07-22 14:25 KST — rendered-direction offset-only feasibility probe
+
+- Added differentiable `render_direction` GMO shape supervision using the final soft rendered occupancy's XY covariance.
+- Added diagnostic flags that freeze every parameter except `query_head.gaussian_offset_head` and expose only `loss_gmo_shape` to the runner.
+- Extended shape-loss config validation to accept `render_direction` and explicitly apply both diagnostic flags.
+- Added `subset_attn_cover_pyr_aabb_dice3d_new_asset_all_render_dir_probe.py` and `train_render_dir_probe.sh`: load Asset-all epoch 15 weights, use fixed LR `1e-4`, and train one epoch without replaying trajectory warmup stages.
+- Pinned the probe launcher to the `eo` Conda environment so distributed launch does not fall back to the base Python without PyTorch.
+- Runtime incident: the probe reached iteration 13, then one rank received a batch with no valid shape pair and returned a detached zero loss; its backward failure tore down the shared NCCL job and also aborted the concurrently running `cov_dir` job. The probe was not relaunched.
+- Fixed the zero-valid-pair DDP failure by connecting the zero shape loss to rendered mixture centers (and therefore the offset head). Updated the standalone probe recipe to 3 epochs with a short 200-iteration linear warmup followed by cosine decay; trajectory warmup remains removed.
+### 2026-07-22 16:50 KST — FT 경로/이름 확정
+
+- Fine-tuning config를 사용자가 지정한 `subset_attn_cover_pyr_aabb_dice3d_new_asset_all_cov_dir_ft.py`로 통합하고, 초기 weight를 `/home/hwanhee/Autonomous_Driving_26_new_data/work_dirs/subset_attn_cover_pyr_aabb_dice3d_new/epoch_15_lss_only.pth`로 변경했다.
+- 설정은 rendered-direction shape loss 단독, Gaussian offset head만 trainable, 3 epochs, LR `1e-4`, 200-iteration linear warmup 후 cosine decay이며 trajectory warmup hook은 제거했다.
+- 실행 파일을 `train_ft.sh`로 교체하고 이전 `train_render_dir_probe.sh` 및 중복 probe config를 제거했다.
+### 2026-07-22 16:55 KST — FT 전체 파라미터 unfreeze
+
+- 사용자 요청에 따라 `_cov_dir_ft.py`의 `query_offset_only_finetune`과 `query_shape_only_finetune`을 모두 비활성화했다. 전체 모델과 기존 Asset focal/Dice/기타 loss가 다시 학습되며, rendered-direction 종류와 현재 shape weight `1.0`은 후속 결정 전까지 변경하지 않았다.
+### 2026-07-22 17:00 KST — epoch-15 full-model fine-tuning schedule 정렬
+
+- `_cov_dir_ft.py`의 전체 LR warmup을 제거했다. 3-epoch cosine schedule은 첫 iteration부터 적용된다.
+- TrajectoryWarmupHook 없이 trajectory 설정을 기존 schedule의 마지막 stage로 고정했다: trajectory `0.5`, XY refine `0.1`, mode classification `0.1`, teacher-forcing GT ratio `0.0`.
+- 전체 unfreeze에 맞춰 AdamW weight decay `0.01`과 image backbone LR multiplier `0.1`을 복구했다. 기본 LR은 `1e-4`로 유지했다.
+### 2026-07-22 17:05 KST — FT 초기 checkpoint 변경
+
+- `_cov_dir_ft.py`의 `load_from`을 `/home/hwanhee/Autonomous_Driving_26_new_data/work_dirs/full_attn_cover_pyr_aabb_dice3d_new/epoch_15_lss_only.pth`로 변경했다. 나머지 FT 설정과 현재 subset train capacity(4000)는 유지했다.
+### 2026-07-22 17:10 KST — full epoch-15 안정 FT LR schedule
+
+- `_cov_dir_ft.py`의 일반 LR을 `3e-5`로 낮추고 image backbone은 기존 multiplier `0.1`로 `3e-6` peak를 사용한다.
+- 첫 200 iterations는 ratio `0.1`의 linear warmup(일반 `3e-6→3e-5`, backbone `3e-7→3e-6`)을 적용하고, 이후 cosine으로 3 epochs 종료 시 peak의 `0.1`까지 낮춘다. epoch-15 마지막 LR과 급격한 불연속을 줄이는 목적이다.
+### 2026-07-22 17:15 KST — FT rendered-direction weight 확정
+
+- `_cov_dir_ft.py`의 `query_gmo_shape_loss_weight`를 `1.0`에서 `0.1`로 확정했다. 기존 center `cov_dir`의 `0.02`보다 coefficient는 5배 강하지만 Asset focal `0.1`/Dice `0.5`와 병행 가능한 수준이다.
+
+### 2026-07-23 14:25 KST — hard FT epoch 2 resume 연결
+
+- `train_ft.sh`가 `subset_attn_cover_pyr_aabb_dice3d_new_asset_all_ft_hard`의
+  `epoch_2_lss_only.pth`에서 resume하도록 연결했다.
+- checkpoint의 epoch/iteration, optimizer 및 LR scheduler 진행 상태를 복구하여
+  warmup을 재실행하지 않고 epoch 3 학습을 이어간다.

@@ -2,13 +2,13 @@
 # Spatiotemporal Decoupling for Efficient Vision-Based Occupancy Forecasting
 # https://github.com/BIT-XJY/EfficientOCF
 #
-# [_rot 실험 2026-07-13] subset_attn_cover_pyr_aabb_dice3d.py 대비 단일변수 = gt_bbox_aabb 자리
-# (dice bbox 90% + center/attn GT)의 소스를 AABB(segmentation_aabb)에서 회전(OBB, segmentation_rot)
-# GT로 교체. train/test LoadInstanceWithFlow 둘 다 gt_bbox_aabb_subdir='segmentation_rot' +
-# gt_bbox_aabb_key='segmentation_rot_saved_list2'로 배선(loading_instance.py에 subdir 파라미터화
-# 추가, results 키/이후 loss 코드는 gt_bbox_aabb 그대로 재사용). eval의 aabb/rot 분리 비교 지표
-# (_eval_load_bbox_gt_v2, EOCF_BBOX_GT_V2_DIR)는 이 config와 무관하게 별도 lazy-loader — 그쪽은
-# ./data/efficientocf_gt_f3/GMO 기본 경로로 이미 갱신됨(efficientocf.py 참고).
+# [gt_bbox_aabb = AABB 2026-07-15] gt_bbox_aabb 자리(dice bbox 90% + center/attn/size GT)의 소스를
+# AABB(segmentation_aabb) GT로 사용. train/test LoadInstanceWithFlow 둘 다 gt_bbox_aabb_subdir=
+# 'segmentation_aabb' + gt_bbox_aabb_key='segmentation_aabb_saved_list2'로 배선(loader 기본값과 동일).
+# 이 슬롯 하나가 results['gt_bbox_aabb'](dice)·gt_instance_centers_world(center)·gt_instance_ids·
+# gt_instance_dims(attn/size)를 전부 파생. (_rot 변형은 subset_attn_cover_pyr_aabb_dice3d_rot_new.py)
+# eval의 aabb/rot 분리 비교 지표(_eval_load_bbox_gt_v2, EOCF_BBOX_GT_V2_DIR)는 이 config와 무관하게
+# 별도 lazy-loader — ./data/efficientocf_gt_f3/GMO 기본 경로로 이미 갱신됨(efficientocf.py 참고).
 #
 # [occ 실험] semantic cls를 binary {0=bg, 1=fg}로 통합한 config (car/truck/... 구분 제거).
 # 변경 방법/디버깅 가이드: 레포 루트의 BINARY_FG_CLS_CHANGES.md 참고.
@@ -24,8 +24,7 @@
 #   슬롯으로 취급돼 attn mass/IoU가 섞일 수 있었음(scale/offset/GMO 계열과 무관, attn 전용).
 #
 # [_aabb_dice 실험 2026-07-07] focal-bbox(_aabb) 후속 — bbox 감독을 focal에서 dice(tversky)로 이동.
-#   단일변수(baseline subset_attn_cover 대비) = query_gmo_dice_inst3d_weight(0.1)/
-#   query_gmo_dice_bbox_weight(0.9). focal은 inst3d 1.0/bbox 0으로 baseline 복귀.
+#   이 _asset_all 변형은 focal과 dice 모두 asset-union만 사용(inst3d/bbox 1.0/0.0).
 # 근거(_aabb ep9 512샘플 실측, NOTES/CHANGELOG 2026-07-07): focal-bbox 0.9는 TP+14%·FN-4%로
 #   벌리는 덴 성공했지만 '비관용FP(box 밖) +30%'로 IoU·Recall3d 전부 악화 — focal은 FP에 관대해
 #   box 밖에서 멈추는 힘이 없음. tversky는 α=0.7 FP-heavy라 GT를 bbox로 주면
@@ -33,7 +32,7 @@
 # [_dice3d 실험 2026-07-10] 위 _aabb_dice(2D z-collapse) 대비 단일변수 = query_gmo_dice_3d=True.
 #   dice/tversky를 z-collapse 없이 [T,1,Z,Y,X] 그대로 계산 → z 방향 과확장(over-spread)도
 #   Tversky FP로 직접 벌함 (2D는 z-sum 후 BEV라 z 두께는 dice에 안 잡힘).
-#   inst3d/bbox weight(0.1/0.9)·tversky α/β 등 나머지는 _aabb_dice와 동일 (utils_loss.py
+#   이 _asset_all 변형의 inst3d/bbox weight는 1.0/0.0이며 tversky α/β 등 나머지는 동일 (utils_loss.py
 #   _compute_matched_pair_gmo_losses dice_3d 분기 참조).
 # bbox GT = data/efficientocf_bboxcls_v3 (train 23,930 전체; ped-포함 cache-parity id 체계.
 #   v2(val용)는 ped-제외 번호라 학습 loss에 쓰면 안 됨 — NOTES 2026-07-06 id 체계 참조).
@@ -95,6 +94,10 @@ occ_path = "./data/nuScenes-Occupancy"
 nusc_root = './data/nuscenes/'
 occ_dt_path = "./data/occ_dt"
 gt_occ_inst_dataset_path = "./data/efficientocf_gt_f3/"
+# train focal GT: 기존 sparse inst3d와 asset voxel이 병합된 새 캐시.
+train_gt_occ_inst_dataset_path = (
+    "./data/nuscenes_gmo_full_hybrid_solid_data_v1/train/segmentation_instance3d"
+)
 # focal3d/dice bbox 혼합용 AABB GT — 새 GT 파이프라인 루트(gt_occ_inst와 동일 id 공간)
 gt_bbox_aabb_dataset_path = "./data/efficientocf_gt_f3/"
 
@@ -113,6 +116,7 @@ query_class_ids = [0, 2, 3, 4, 5, 6, 9, 10]
 query_class_names = ['background'] + class_names
 exclude_occ_class_ids = (7,)  # pedestrian: 로드 단계에서 제거 (nohuman)
 strict_query_class_id_validation = True
+filter_f3_first_visibility = True
 use_separate_classes = False
 use_fine_occ = False
 
@@ -195,14 +199,15 @@ train_pipeline = [
         validate_cache=validate_instance_cache,
         write_cache=write_instance_cache,
         load_gt_occ_inst=True,
-        gt_occ_inst_dataset_path=gt_occ_inst_dataset_path,
+        gt_occ_inst_dataset_path=train_gt_occ_inst_dataset_path,
+        gt_occ_inst_key='segmentation_instance_saved_list2',
         load_gt_bbox_aabb=True,
         gt_bbox_aabb_dataset_path=gt_bbox_aabb_dataset_path,
-        # [_rot 실험] gt_bbox_aabb 자리(dice bbox 90% + center/attn GT)를 AABB 대신 회전(OBB) GT로
-        # 대체 — 같은 배선(results['gt_bbox_aabb'])을 재사용, 소스 서브폴더/키만 rot으로 교체.
-        gt_bbox_aabb_subdir='segmentation_rot',
-        gt_bbox_aabb_key='segmentation_rot_saved_list2',
+        # gt_bbox_aabb는 center/attn/size GT용으로 유지(Dice3D에는 사용하지 않음).
+        gt_bbox_aabb_subdir='segmentation_aabb',
+        gt_bbox_aabb_key='segmentation_aabb_saved_list2',
         exclude_occ_class_ids=exclude_occ_class_ids,
+        filter_f3_first_visibility=filter_f3_first_visibility,
     ),
     dict(
         type='LoadMultiViewImageFromFiles_BEVDet',
@@ -280,6 +285,7 @@ train_pipeline = [
             'lidar_token',
             'pc_range',
             'occ_size',
+            'gt_visibility_drop_ids',
         ),
     ),
 ]
@@ -299,11 +305,12 @@ test_pipeline = [
         gt_occ_inst_dataset_path=gt_occ_inst_dataset_path,
         load_gt_bbox_aabb=True,
         gt_bbox_aabb_dataset_path=gt_bbox_aabb_dataset_path,
-        # [_rot 실험] train과 동일하게 rot GT로 통일 — gt_instance_centers_world가 train 감독
-        # 소스(rot)와 다른 기준(aabb)으로 갈리지 않도록 val도 rot 기준으로 맞춤.
-        gt_bbox_aabb_subdir='segmentation_rot',
-        gt_bbox_aabb_key='segmentation_rot_saved_list2',
+        # train과 동일하게 AABB로 통일 — gt_instance_centers_world가 train 감독 소스(aabb)와
+        # 다른 기준으로 갈리지 않도록 val도 aabb 기준으로 맞춤.
+        gt_bbox_aabb_subdir='segmentation_aabb',
+        gt_bbox_aabb_key='segmentation_aabb_saved_list2',
         exclude_occ_class_ids=exclude_occ_class_ids,
+        filter_f3_first_visibility=filter_f3_first_visibility,
     ),
     dict(
         type='LoadMultiViewImageFromFiles_BEVDet',
@@ -350,7 +357,10 @@ test_pipeline = [
             'gt_instance_ids',
             'occ_dt',
         ],
-        meta_keys=['pc_range', 'occ_size', 'scene_token', 'lidar_token'],
+        meta_keys=[
+            'pc_range', 'occ_size', 'scene_token', 'lidar_token',
+            'gt_visibility_drop_ids',
+        ],
     ),
 ]
 
@@ -375,6 +385,7 @@ train_config = dict(
     n_future_frames=n_future_frames,
     train_capacity=train_capacity,
     test_capacity=test_capacity,
+    filter_f3_first_visibility=filter_f3_first_visibility,
 )
 
 test_config = dict(
@@ -395,6 +406,7 @@ test_config = dict(
     n_future_frames=n_future_frames,
     train_capacity=train_capacity,
     test_capacity=test_capacity,
+    filter_f3_first_visibility=filter_f3_first_visibility,
 )
 
 # In our work we use 8 NVIDIA A100 GPUs.
@@ -423,11 +435,11 @@ model_cfg = dict(
     use_segmentation_as_query_gt=True,
     use_gmo_bce_loss=True,
     query_gmo_loss_type='focal',
-    # [_aabb_dice 실험] focal은 baseline 복귀(inst3d 1.0), dice를 0.1 inst3d + 0.9 AABB로 혼합.
+    # [_asset_all 실험] focal과 dice 모두 asset-union GT를 사용.
     query_gmo_focal_inst3d_weight=1.0,
     query_gmo_focal_bbox_weight=0.0,
-    query_gmo_dice_inst3d_weight=0.1,
-    query_gmo_dice_bbox_weight=0.9,
+    query_gmo_dice_inst3d_weight=1.0,
+    query_gmo_dice_bbox_weight=0.0,
     query_gmo_dice_3d=True,  # z-collapse 없이 3D로 dice/tversky 계산 (_dice3d 실험, 단일변수)
     # [dice 실험] focal-only는 over-spread에서 occ focal이 clamp 포화 + 전격자 mean 희석으로
     # FP gradient ≈0 → shape 못 잡음(NOTES 2026-06-25). Tversky(FP-heavy)를 켜서 FP를
@@ -581,20 +593,23 @@ debug_cfg = dict(
 
 visualization_cfg = dict(
     # ── 2D query_debug_vis ─────────────────────────────────────────────
-    debug_query_vis_dir="./work_dirs/query_debug_vis_no_pretrain",
+    debug_query_vis_dir="./work_dirs/subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter/query_debug_vis",
     debug_query_gaussian_vis_mode='prob',     # footprint 렌더 외형(prob heatmap)
     # ── cam_gaussian ───────────────────────────────────────────────────
-    debug_query_cam_gaussian_vis_dir="./work_dirs/query_cam_gaussian_vis_no_pretrain",
+    debug_query_cam_gaussian_vis_dir="./work_dirs/subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter/query_cam_gaussian_vis",
     debug_query_cam_gaussian_vis_max_frames=3,
     debug_query_cam_gaussian_vis_gt_overlay_enabled=True,
     debug_query_cam_gaussian_vis_topk_matched=8,
     # ── 3D mixture3d ───────────────────────────────────────────────────
-    debug_query_mixture3d_vis_dir="./work_dirs/query_mixture3d_vis_no_pretrain",
+    debug_query_mixture3d_vis_dir="./work_dirs/subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter/query_mixture3d_vis",
     debug_query_mixture3d_vis_max_queries=50,
     debug_query_mixture3d_vis_max_gt_points=40000,
     debug_query_mixture3d_vis_occ_max_voxels_per_query=4000,
     # eval mixture3d도 lightweight 128x128x10으로 렌더해 train 중 eval/debug vis 메모리 spike를 줄임.
     debug_query_mixture3d_vis_eval_occ_size=(128, 128, 10),
+    debug_query_attn_softargmax_vis_dir=(
+        "./work_dirs/subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter/query_attn_softargmax_vis"
+    ),
 )
 
 model = dict(

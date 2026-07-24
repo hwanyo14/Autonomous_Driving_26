@@ -1,5 +1,55 @@
 # NOTES
 
+## 2026-07-23 KST — f3 visibility 필터 ID/시간 규칙
+
+- `subset_attn_cover_pyr_aabb_dice3d_new_filter.py`의 제거 조건은 **7프레임 중 임의의
+  visibility=1**이 아니다. 과거 3프레임에서 instance의 첫 annotation만 보고, 그 값이 1일 때만
+  해당 instance를 7프레임 D/E 전체에서 제거한다. 첫 값이 2~4이면 이후 visibility=1은 유지하며
+  미래 4프레임은 판정에 사용하지 않는다.
+- f3 raw ID는 `vehicle`/`human` annotation을 visibility 필터 전에 등록한 순서다. 현재 dataset의
+  `instance_dict` ID는 사람과 최초 저가시성 필터 뒤에 만들어져 숫자가 다를 수 있으므로 blacklist
+  생성에 절대 재사용하지 말 것. `refine_instance_poly`는 attribute를 보정하므로 visibility 원본
+  판정에도 사용하면 안 된다.
+- 필터는 D(`segmentation_instance3d`)와 E(`segmentation_aabb`) sparse row에 동시에, center target
+  생성 전에 적용해야 한다. 한쪽만 필터하면 matching/focal과 center/trajectory/AABB Dice가 다른
+  instance 집합을 보게 된다.
+- 실행 중인 worker에는 소스 변경이 반영되지 않는다. 이 config의 필터 실험은 반드시 새 학습
+  프로세스로 시작할 것.
+
+## 2026-07-23 KST — Asset IoU3D macro와 TP/FP/FN micro 해석
+
+- 기존 `IOU_3d_asset`은 유효 샘플별 IoU를 평균한 macro 값이다.
+- 신규 `IOU_3d_asset_TP/FP/FN`은 모든 평가 샘플·rank의 voxel 수를 합한 값이며,
+  `IOU_3d_asset_micro = TP / (TP + FP + FN)`이다. 샘플 크기 가중 방식이 다르므로
+  `IOU_3d_asset`과 `IOU_3d_asset_micro`가 서로 정확히 같지 않은 것이 정상이다.
+- `Recall3d(asset)_TP/FP/FN`은 base inst3d와 asset 관용 영역으로 계산되는 별도 지표다.
+  Asset 자체를 GT로 직접 비교하는 신규 `IOU_3d_asset_TP/FP/FN`과 혼동하지 말 것.
+
+## 2026-07-23 KST — all-query Asset scene BCE 첫 실행 결과 및 수정
+
+- 첫 실행은 `Epoch [1][4/500]`까지 정상 진행한 뒤, 빈 GT-center pack이 있는 다섯 번째 배치에서
+  scene BCE의 과도한 full7 guard 때문에 종료됐다. 이는 Asset occupancy/예측 timeline의 정렬
+  실패가 아니며 guard를 GT center 유무와 분리해 수정했다. 종료 전에 checkpoint는 생성되지 않았다.
+- 정상 4개 배치에서 가중치 적용 후 `loss_query_scene_asset_bce=1.3253~3.0932`로 기존
+  `loss_gmo_dice=0.2849~0.3513`보다 훨씬 컸다. `0.1`은 효과를 확실히 보는 공격적인 설정이며,
+  안정적인 FT가 목적이면 후속 실험에서 전체 가중치를 낮추는 것을 검토할 것.
+- 첫 배치 89초는 데이터/초기화 시간을 포함하며 이후 iteration은 약 11~13초, 관측 peak memory는
+  rank 로그 기준 약 37.6GB였다.
+
+## 2026-07-23 KST — all-query Asset scene BCE FT 주의사항
+
+- `subset_attn_cover_pyr_aabb_dice3d_new_asset_all_ft_bce.py`의 scene BCE는 추론과 같은 query-axis
+  `max`를 쓰므로 한 voxel에서는 최댓값 query에만 gradient가 간다. query confidence는 프레임별
+  head가 아니라 현재/미래 5프레임이 공유하는 foreground score다.
+- query별 full `[5,200,20,128,128]` volume은 만들지 않지만, 200×48 Gaussian의 유효 bbox patch는
+  backward를 위해 유지된다. 실제 8GPU 첫 실행에서 peak memory와 iteration time을 확인할 것.
+- `query_scene_asset_bce_pos_weight/neg_weight=1/1`로 시작한다. IoU가 오르며 recall이 급락하면
+  geometry 개선보다 confidence/opacity 억제가 우세한 것이므로 neg weight 또는 전체 weight를
+  낮춰야 한다. `dbg_query_scene_asset_{bce_pos_raw,bce_neg_raw,pred_gt_mass_ratio,conf_mean}`을 함께 본다.
+- AGENTS.md가 함께 고려하라고 명시한 `projects/configs/baselines/EfficientOCF_V1.1_1gpu.py`는
+  현재 repository에 존재하지 않는다. 공용 신규 키는 `efficientocf_config.py`에 기본 비활성으로
+  추가했으며, 해당 1GPU config가 복구되면 필요할 때 명시적으로 배선할 것.
+
 ## 2026-07-13 KST — mixture3d 시각화의 GT class 라벨은 binary-fg 모드에서 전부 "bicycle"로 잘못 찍힘 (표시 전용, 수정 안 함)
 
 `utils_visualization.py:1207`의 `_QUERY_CLS_NAMES_8` 이름표를 compact class id로 인덱싱하는데,
@@ -519,3 +569,44 @@ class를 정확히 안 따지고 "instance에 유효 voxel이 있냐"만 봐도 
 - `static_graph=True`는 iteration마다 graph 구조(사용 파라미터/분기)가 동일하다는 가정. 조건부로 모듈 일부가 빠지는 구조 변경을 하면 DDP 에러가 날 수 있으니 그 경우 이 옵션부터 의심할 것.
 - `dbg_query_match_cost_*` prefix 키 목록은 `utils_loss.py`의 prefill 루프와 실제 기록 지점이 수동으로 동기화돼 있음. 새 match-cost dbg 키를 추가하면 prefill 루프에도 반드시 같이 추가해야 multi-GPU에서 `log_vars` assert가 재발하지 않음.
 - baseline config는 `samples_per_gpu=1`이라 GPU 수 1~8 어느 쪽이든 per-rank batch shape은 동일. 검증은 아직 안 돌렸음 (smoke run 필요).
+## 2026-07-16 — `_tver` 최초 실행 재시작 필요
+
+- 19:11 시작한 `subset_attn_cover_pyr_aabb_dice3d_new_tver` 최초 프로세스는 train `Collect3D`의
+  `gt_instance_sizes` 누락 상태로 실행되어 크기 스케줄이 적용되지 않았다. TensorBoard 1~18 iter에서
+  `dbg/gmo_dice_alpha_mean=0.7`, `dbg/gmo_dice_size_large_pair_count=0` 고정을 확인했다.
+- config에 key를 보완했지만 실행 중 프로세스에는 반영되지 않으므로 재시작해야 한다. 재시작 후
+  `large_pair_count>0`인 step에서 `alpha_mean<0.7`, `beta_mean>0.3`인지 확인할 것.
+## 2026-07-22 — Rendered-direction feasibility probe
+
+- `query_offset_only_finetune=True` is a diagnostic mode, not the final training recipe: only `query_head.gaussian_offset_head` is trainable.
+- `query_shape_only_finetune=True` removes every other loss from the returned loss dictionary. It tests whether the frozen epoch-15 representation already contains enough orientation information to rotate Gaussian offsets.
+- `projects/configs/baselines/EfficientOCF_V1.1_1gpu.py` is absent in this repository, so the new defaults were added to `efficientocf_config.py`; the dedicated probe config explicitly overrides them.
+- A zero-valid-shape-pair rank is now handled by a zero loss connected to `mixture_centers_world_tqg3`, keeping DDP backward collective-safe. Even with this fix, do not co-run experimental NCCL jobs with a valuable job on the same GPUs without accepting shared-resource failure risk.
+
+## 2026-07-23 — Hard matched-pair Asset FT 주의
+
+- hard 조건은 GT 실제 `max(w,l) >= 6m` OR present-frame LiDAR/BEV 거리 `>= 30m`이며,
+  matched GMO focal/Dice에만 적용된다. class/center/attention/trajectory 및 기타 regularization은
+  전체 query/pair에 기존대로 적용되므로 전체 모델 gradient가 hard pair로만 제한되는 모드는 아니다.
+- 시간에 따른 회전은 present Gaussian offset/sigma/yaw/weight를 미래에 그대로 복제하는 현재 구조로
+  표현할 수 없어 hard 조건에서 제외했다. 이를 포함하면 실제 회전보다 축소·등방화로 타협할 수 있다.
+- `dbg_gmo_hard_pair_ratio`, `dbg_gmo_hard_zero_batch`, metadata valid count를 먼저 확인할 것.
+  hard 비율이 10% 미만이면 전체 LR을 올리기보다 hard sample 공급 빈도를 조정하는 편이 안전하다.
+- `projects/configs/baselines/EfficientOCF_V1.1_1gpu.py`는 이 저장소에 없으므로 신규 기본값은
+  `efficientocf_config.py`에 추가하고 hard FT config에서 명시적으로 override했다.
+
+## 2026-07-23 — Dice-loss top-k hard FT 주의
+
+- `_hard_dice.py`의 hard 선택은 각 rank/iteration에서 Hungarian matched pair의 raw Dice loss
+  상위 30%를 동적으로 고른다. 점수는 `detach`하고 `ceil` 및 최소 1 pair를 적용하므로 유효 pair가
+  있다면 모두 쉬운 batch여도 최소 1 pair는 선택된다.
+- `query_gmo_hard_easy_weight=0.0`이므로 선택된 pair에만 GMO focal/Dice gradient가 흐른다.
+  class/center/attention/trajectory 및 다른 regularization loss는 기존대로 전체 대상에 적용되므로
+  모델 전체의 모든 gradient를 hard pair로만 제한하는 설정은 아니다.
+- `large >= 6m`, `far >= 40m`는 `_hard_dice.py`에서 hard 선택 조건이 아니라 DBG 진단 기준이다.
+  실제 선택 여부는 `dbg_gmo_hard_pair_ratio`, `dbg_gmo_hard_score_cutoff`,
+  `dbg_gmo_hard_focal_raw`, `dbg_gmo_hard_dice_raw`로 확인할 것.
+- 소스 수정 전에 시작된 학습 프로세스에는 새 로직이 반영되지 않는다. `_hard_dice.py` 설정으로
+  새 프로세스를 시작해야 한다.
+- `projects/configs/baselines/EfficientOCF_V1.1_1gpu.py`는 이 저장소에 없으므로 신규 기본값은
+  `efficientocf_config.py`에만 추가하고 대상 config에서 명시적으로 override했다.

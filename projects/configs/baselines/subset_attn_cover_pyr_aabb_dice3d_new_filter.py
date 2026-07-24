@@ -2,13 +2,13 @@
 # Spatiotemporal Decoupling for Efficient Vision-Based Occupancy Forecasting
 # https://github.com/BIT-XJY/EfficientOCF
 #
-# [_rot 실험 2026-07-13] subset_attn_cover_pyr_aabb_dice3d.py 대비 단일변수 = gt_bbox_aabb 자리
-# (dice bbox 90% + center/attn GT)의 소스를 AABB(segmentation_aabb)에서 회전(OBB, segmentation_rot)
-# GT로 교체. train/test LoadInstanceWithFlow 둘 다 gt_bbox_aabb_subdir='segmentation_rot' +
-# gt_bbox_aabb_key='segmentation_rot_saved_list2'로 배선(loading_instance.py에 subdir 파라미터화
-# 추가, results 키/이후 loss 코드는 gt_bbox_aabb 그대로 재사용). eval의 aabb/rot 분리 비교 지표
-# (_eval_load_bbox_gt_v2, EOCF_BBOX_GT_V2_DIR)는 이 config와 무관하게 별도 lazy-loader — 그쪽은
-# ./data/efficientocf_gt_f3/GMO 기본 경로로 이미 갱신됨(efficientocf.py 참고).
+# [gt_bbox_aabb = AABB 2026-07-15] gt_bbox_aabb 자리(dice bbox 90% + center/attn/size GT)의 소스를
+# AABB(segmentation_aabb) GT로 사용. train/test LoadInstanceWithFlow 둘 다 gt_bbox_aabb_subdir=
+# 'segmentation_aabb' + gt_bbox_aabb_key='segmentation_aabb_saved_list2'로 배선(loader 기본값과 동일).
+# 이 슬롯 하나가 results['gt_bbox_aabb'](dice)·gt_instance_centers_world(center)·gt_instance_ids·
+# gt_instance_dims(attn/size)를 전부 파생. (_rot 변형은 subset_attn_cover_pyr_aabb_dice3d_rot_new.py)
+# eval의 aabb/rot 분리 비교 지표(_eval_load_bbox_gt_v2, EOCF_BBOX_GT_V2_DIR)는 이 config와 무관하게
+# 별도 lazy-loader — ./data/efficientocf_gt_f3/GMO 기본 경로로 이미 갱신됨(efficientocf.py 참고).
 #
 # [occ 실험] semantic cls를 binary {0=bg, 1=fg}로 통합한 config (car/truck/... 구분 제거).
 # 변경 방법/디버깅 가이드: 레포 루트의 BINARY_FG_CLS_CHANGES.md 참고.
@@ -113,6 +113,7 @@ query_class_ids = [0, 2, 3, 4, 5, 6, 9, 10]
 query_class_names = ['background'] + class_names
 exclude_occ_class_ids = (7,)  # pedestrian: 로드 단계에서 제거 (nohuman)
 strict_query_class_id_validation = True
+filter_f3_first_visibility = True
 use_separate_classes = False
 use_fine_occ = False
 
@@ -198,11 +199,11 @@ train_pipeline = [
         gt_occ_inst_dataset_path=gt_occ_inst_dataset_path,
         load_gt_bbox_aabb=True,
         gt_bbox_aabb_dataset_path=gt_bbox_aabb_dataset_path,
-        # [_rot 실험] gt_bbox_aabb 자리(dice bbox 90% + center/attn GT)를 AABB 대신 회전(OBB) GT로
-        # 대체 — 같은 배선(results['gt_bbox_aabb'])을 재사용, 소스 서브폴더/키만 rot으로 교체.
-        gt_bbox_aabb_subdir='segmentation_rot',
-        gt_bbox_aabb_key='segmentation_rot_saved_list2',
+        # gt_bbox_aabb 자리(dice bbox 90% + center/attn GT) = AABB(축정렬 OBB) GT.
+        gt_bbox_aabb_subdir='segmentation_aabb',
+        gt_bbox_aabb_key='segmentation_aabb_saved_list2',
         exclude_occ_class_ids=exclude_occ_class_ids,
+        filter_f3_first_visibility=filter_f3_first_visibility,
     ),
     dict(
         type='LoadMultiViewImageFromFiles_BEVDet',
@@ -280,6 +281,7 @@ train_pipeline = [
             'lidar_token',
             'pc_range',
             'occ_size',
+            'gt_visibility_drop_ids',
         ),
     ),
 ]
@@ -299,11 +301,12 @@ test_pipeline = [
         gt_occ_inst_dataset_path=gt_occ_inst_dataset_path,
         load_gt_bbox_aabb=True,
         gt_bbox_aabb_dataset_path=gt_bbox_aabb_dataset_path,
-        # [_rot 실험] train과 동일하게 rot GT로 통일 — gt_instance_centers_world가 train 감독
-        # 소스(rot)와 다른 기준(aabb)으로 갈리지 않도록 val도 rot 기준으로 맞춤.
-        gt_bbox_aabb_subdir='segmentation_rot',
-        gt_bbox_aabb_key='segmentation_rot_saved_list2',
+        # train과 동일하게 AABB로 통일 — gt_instance_centers_world가 train 감독 소스(aabb)와
+        # 다른 기준으로 갈리지 않도록 val도 aabb 기준으로 맞춤.
+        gt_bbox_aabb_subdir='segmentation_aabb',
+        gt_bbox_aabb_key='segmentation_aabb_saved_list2',
         exclude_occ_class_ids=exclude_occ_class_ids,
+        filter_f3_first_visibility=filter_f3_first_visibility,
     ),
     dict(
         type='LoadMultiViewImageFromFiles_BEVDet',
@@ -350,7 +353,10 @@ test_pipeline = [
             'gt_instance_ids',
             'occ_dt',
         ],
-        meta_keys=['pc_range', 'occ_size', 'scene_token', 'lidar_token'],
+        meta_keys=[
+            'pc_range', 'occ_size', 'scene_token', 'lidar_token',
+            'gt_visibility_drop_ids',
+        ],
     ),
 ]
 
@@ -375,6 +381,7 @@ train_config = dict(
     n_future_frames=n_future_frames,
     train_capacity=train_capacity,
     test_capacity=test_capacity,
+    filter_f3_first_visibility=filter_f3_first_visibility,
 )
 
 test_config = dict(
@@ -395,6 +402,7 @@ test_config = dict(
     n_future_frames=n_future_frames,
     train_capacity=train_capacity,
     test_capacity=test_capacity,
+    filter_f3_first_visibility=filter_f3_first_visibility,
 )
 
 # In our work we use 8 NVIDIA A100 GPUs.
@@ -581,20 +589,23 @@ debug_cfg = dict(
 
 visualization_cfg = dict(
     # ── 2D query_debug_vis ─────────────────────────────────────────────
-    debug_query_vis_dir="./work_dirs/query_debug_vis_no_pretrain",
+    debug_query_vis_dir="./work_dirs/subset_attn_cover_pyr_aabb_dice3d_new_filter/query_debug_vis",
     debug_query_gaussian_vis_mode='prob',     # footprint 렌더 외형(prob heatmap)
     # ── cam_gaussian ───────────────────────────────────────────────────
-    debug_query_cam_gaussian_vis_dir="./work_dirs/query_cam_gaussian_vis_no_pretrain",
+    debug_query_cam_gaussian_vis_dir="./work_dirs/subset_attn_cover_pyr_aabb_dice3d_new_filter/query_cam_gaussian_vis",
     debug_query_cam_gaussian_vis_max_frames=3,
     debug_query_cam_gaussian_vis_gt_overlay_enabled=True,
     debug_query_cam_gaussian_vis_topk_matched=8,
     # ── 3D mixture3d ───────────────────────────────────────────────────
-    debug_query_mixture3d_vis_dir="./work_dirs/query_mixture3d_vis_no_pretrain",
+    debug_query_mixture3d_vis_dir="./work_dirs/subset_attn_cover_pyr_aabb_dice3d_new_filter/query_mixture3d_vis",
     debug_query_mixture3d_vis_max_queries=50,
     debug_query_mixture3d_vis_max_gt_points=40000,
     debug_query_mixture3d_vis_occ_max_voxels_per_query=4000,
     # eval mixture3d도 lightweight 128x128x10으로 렌더해 train 중 eval/debug vis 메모리 spike를 줄임.
     debug_query_mixture3d_vis_eval_occ_size=(128, 128, 10),
+    debug_query_attn_softargmax_vis_dir=(
+        "./work_dirs/subset_attn_cover_pyr_aabb_dice3d_new_filter/query_attn_softargmax_vis"
+    ),
 )
 
 model = dict(

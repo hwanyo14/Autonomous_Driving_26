@@ -19,5 +19,7 @@
 | `probe_feat_size.py` | query feature에서 GT 크기가 선형 디코딩되는지 (ridge, group CV, 셔플 컨트롤) | feat_probe_ep10.npz |
 | `probe_bev_size.py` | LSS BEV feature 고정창/instance-pool에서 크기 디코딩 여부 | bev_probe_ep10.npz |
 | `probe_attn_geometry.py` | attn 폭(σ) vs 마스크 폭, coverage/inside-mass, σ×depth 크기 상관 | attn_geom_ep10.json |
+| `probe_gmo_axis.py` | 동일 seed train subset에서 matched asset GT 대비 Gaussian center·렌더링 BEV 장축 각도 측정 | 지정 JSON (`--output`) |
+| `visualize_gmo_axis_pair.py` | 두 checkpoint의 동일 matched asset GT·48 centers·render BEV·장축선을 사례별 비교 | 지정 PNG (`--output`) |
 
 주요 실측 결과와 해석은 NOTES.md 2026-07-02~03 항목 참조.

@@ -13,7 +13,7 @@ import copy
 
 @PIPELINES.register_module()
 class LoadInstanceWithFlow(object):
-    def __init__(self, ocf_dataset_path, grid_size=[512, 512, 40], pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0], background=0, use_flow=True, use_separate_classes=False, use_lyft=False, validate_cache=False, write_cache=True, load_gt_occ_inst=False, gt_occ_inst_dataset_path=None, gt_occ_inst_key='segmentation_instance_saved_list2', load_gt_bbox_aabb=False, gt_bbox_aabb_dataset_path=None, gt_bbox_aabb_key='segmentation_aabb_saved_list2', gt_bbox_aabb_subdir='segmentation_aabb', exclude_occ_class_ids=()):
+    def __init__(self, ocf_dataset_path, grid_size=[512, 512, 40], pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0], background=0, use_flow=True, use_separate_classes=False, use_lyft=False, validate_cache=False, write_cache=True, load_gt_occ_inst=False, gt_occ_inst_dataset_path=None, gt_occ_inst_key='segmentation_instance_saved_list2', load_gt_bbox_aabb=False, gt_bbox_aabb_dataset_path=None, gt_bbox_aabb_key='segmentation_aabb_saved_list2', gt_bbox_aabb_subdir='segmentation_aabb', exclude_occ_class_ids=(), filter_f3_first_visibility=False):
         '''
         Loading sequential occupancy labels and instance flows for training and testing
         '''
@@ -46,6 +46,7 @@ class LoadInstanceWithFlow(object):
         # 'segmentation_rot_saved_list2'로 같이 바꿔야 함).
         self.gt_bbox_aabb_subdir = str(gt_bbox_aabb_subdir)
         self.exclude_occ_class_ids = tuple(int(v) for v in exclude_occ_class_ids)
+        self.filter_f3_first_visibility = bool(filter_f3_first_visibility)
 
     def resolve_gt_occ_inst_dir(self, prefix):
         if self.gt_occ_inst_dataset_path is None:
@@ -92,6 +93,16 @@ class LoadInstanceWithFlow(object):
         if arr.ndim != 2 or arr.shape[1] < min_cols:
             raise ValueError(f"{label} row shape is invalid: {arr.shape}")
         return arr
+
+    @staticmethod
+    def _filter_sparse_frames_by_instance_ids(sparse_list, drop_ids):
+        if sparse_list is None or drop_ids.size == 0:
+            return sparse_list
+        out = []
+        for rows in sparse_list:
+            keep = ~np.isin(rows[:, 4], drop_ids)
+            out.append(np.ascontiguousarray(rows[keep]))
+        return out
 
     def _sort_rows_by_xyz(self, rows):
         if rows.shape[0] <= 1:
@@ -976,6 +987,8 @@ class LoadInstanceWithFlow(object):
             self.gt_bbox_aabb_key = "segmentation_aabb_saved_list2"
         if not hasattr(self, "gt_bbox_aabb_subdir"):
             self.gt_bbox_aabb_subdir = "segmentation_aabb"
+        if not hasattr(self, "filter_f3_first_visibility"):
+            self.filter_f3_first_visibility = False
         assert 'attribute_label' not in results.keys()
         assert 'segmentation_bev' not in results.keys()
         assert 'instance_bev' not in results.keys()
@@ -1286,6 +1299,19 @@ class LoadInstanceWithFlow(object):
                 expected_seq_len=results['sequence_length']
             )
 
+        if self.filter_f3_first_visibility:
+            if 'gt_visibility_drop_ids' not in results:
+                raise KeyError(
+                    "filter_f3_first_visibility=True requires "
+                    "EfficientOCFDataset(filter_f3_first_visibility=True)."
+                )
+            visibility_drop_ids = np.asarray(
+                results['gt_visibility_drop_ids'], dtype=np.int64).reshape(-1)
+            gt_occ_inst_sparse_list = self._filter_sparse_frames_by_instance_ids(
+                gt_occ_inst_sparse_list, visibility_drop_ids)
+            gt_bbox_aabb_sparse_list = self._filter_sparse_frames_by_instance_ids(
+                gt_bbox_aabb_sparse_list, visibility_drop_ids)
+
         # ---------------- decide cache usage ----------------
         use_cache = (not need_regen) \
             and os.path.exists(seg_label_path + ".npz") \
@@ -1335,6 +1361,7 @@ class LoadInstanceWithFlow(object):
                     'segmentation', 'segmentation_bev', 'instance_bev', 'attribute_label',
                     'gt_occ_inst', 'gt_bbox_aabb',
                     'gt_instance_centers_world', 'gt_instance_centers_valid', 'gt_instance_ids', 'gt_instance_sizes', 'gt_instance_dims',
+                    'gt_visibility_drop_ids',
                     'sequence_length', 'instance_dict', 'instance_map', 'input_dict',
                     'egopose_list', 'ego2lidar_list', 'scene_token', 'instance', 'global_idx'
                 ]:
@@ -1479,6 +1506,7 @@ class LoadInstanceWithFlow(object):
                 'segmentation', 'segmentation_bev', 'instance_bev', 'attribute_label',
                 'gt_occ_inst', 'gt_bbox_aabb',
                 'gt_instance_centers_world', 'gt_instance_centers_valid', 'gt_instance_ids', 'gt_instance_sizes', 'gt_instance_dims',
+                'gt_visibility_drop_ids',
                 'sequence_length', 'instance_dict', 'instance_map', 'input_dict',
                 'egopose_list', 'ego2lidar_list', 'scene_token', 'instance', 'global_idx'
             ]:

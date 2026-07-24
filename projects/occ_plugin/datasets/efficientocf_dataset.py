@@ -19,7 +19,8 @@ import time
 @DATASETS.register_module()
 class EfficientOCFDataset(NuScenesDataset):
     def __init__(self, occ_size, pc_range, occ_root, idx_root, ori_data_root, save_local_root, data_root, time_receptive_field, n_future_frames, classes, use_separate_classes,
-                  train_capacity, test_capacity, fixed_val=True, fixed_val_seed=2, **kwargs):
+                  train_capacity, test_capacity, fixed_val=True, fixed_val_seed=2,
+                  filter_f3_first_visibility=False, **kwargs):
         '''
         EfficientOCFDataset contains sequential occupancy states as well as instance flow for training occupancy forecasting models. We unify the related operations in the LiDAR coordinate system following OpenOccupancy.
         '''
@@ -28,6 +29,7 @@ class EfficientOCFDataset(NuScenesDataset):
         self.test_capacity = test_capacity
         self.fixed_val = fixed_val
         self.fixed_val_seed = fixed_val_seed
+        self.filter_f3_first_visibility = bool(filter_f3_first_visibility)
 
         super().__init__(**kwargs)
 
@@ -174,6 +176,19 @@ class EfficientOCFDataset(NuScenesDataset):
         current_sample = self.nusc.get('sample', rec['token'])
         for annotation_token in current_sample['anns']:
             annotation = self.nusc.get('sample_annotation', annotation_token)
+            if self.filter_f3_first_visibility and self.counter < self.time_receptive_field:
+                # f3 raw 캐시 생성기의 ID 규칙을 그대로 재현한다:
+                # vehicle/human을 visibility 필터 전에 최초 등장 순서로 번호화한다.
+                # 현재 dataset instance_map은 저가시성/사람 필터가 선행되어 f3 ID와 다르므로
+                # visibility blacklist 생성에 재사용하면 안 된다.
+                category_name = annotation['category_name']
+                if any(name in category_name for name in ('vehicle', 'human')):
+                    instance_token = annotation['instance_token']
+                    if instance_token not in self._f3_raw_instance_map:
+                        instance_id = len(self._f3_raw_instance_map) + 1
+                        self._f3_raw_instance_map[instance_token] = instance_id
+                        if int(annotation['visibility_token']) == 1:
+                            self._f3_visibility_drop_ids.add(instance_id)
             # Filter out all non vehicle instances
             gmo_flag = False
             for class_name in self.classes:
@@ -329,6 +344,9 @@ class EfficientOCFDataset(NuScenesDataset):
         return example
     
     def prepare_sequential_data(self, index):
+        if self.filter_f3_first_visibility:
+            self._f3_raw_instance_map = {}
+            self._f3_visibility_drop_ids = set()
         instance_map = {}
         input_seq_data = {}
         keys = ['input_dict','future_egomotion', 'sample_token']
@@ -375,6 +393,9 @@ class EfficientOCFDataset(NuScenesDataset):
                 indices=self.indices[index],
                 scene_token=self.present_scene_lidar_token,
             ))
+        if self.filter_f3_first_visibility:
+            input_seq_data['gt_visibility_drop_ids'] = np.asarray(
+                sorted(self._f3_visibility_drop_ids), dtype=np.int64)
 
         example = self.pipeline(input_seq_data)
 
@@ -486,6 +507,18 @@ class EfficientOCFDataset(NuScenesDataset):
                 logger.info('IOU (bbox rotated-OBB) 2D Evaluation')
                 logger.info(res_table_r)
 
+        ''' calculate IOU 2D (asset-union GT) '''
+        if results.get('hist_for_iou_asset'):
+            hist_asset = sum(results['hist_for_iou_asset'])
+            ious_asset = cm_to_ious(hist_asset)
+            res_table_asset, res_dic_asset = format_iou_results(ious_asset, return_dic=True)
+            for key, val in res_dic_asset.items():
+                eval_results['IOU_asset_{}'.format(key)] = val
+            eval_results['IOU_2d_asset'] = float(ious_asset[1])
+            if logger is not None:
+                logger.info('IOU (asset-union) 2D Evaluation')
+                logger.info(res_table_asset)
+
         ''' calculate height metric '''
         if results.get('height_l1'):
             height_l1 = sum(results['height_l1'])
@@ -504,6 +537,18 @@ class EfficientOCFDataset(NuScenesDataset):
             eval_results['IOU_3d_bbox_aabb'] = sum(results['iou_3d_bbox']) / len(results['iou_3d_bbox'])
         if results.get('iou_3d_bbox_rot'):
             eval_results['IOU_3d_bbox_rot'] = sum(results['iou_3d_bbox_rot']) / len(results['iou_3d_bbox_rot'])
+        if results.get('iou_3d_asset'):
+            eval_results['IOU_3d_asset'] = sum(results['iou_3d_asset']) / len(results['iou_3d_asset'])
+        if results.get('iou_3d_asset_comps') is not None and len(results['iou_3d_asset_comps']) > 0:
+            comps = np.sum(np.stack([
+                np.asarray(c) for c in results['iou_3d_asset_comps']
+            ]), axis=0)
+            tp, fp, fn = [float(v) for v in comps]
+            denom = tp + fp + fn
+            eval_results['IOU_3d_asset_TP'] = tp
+            eval_results['IOU_3d_asset_FP'] = fp
+            eval_results['IOU_3d_asset_FN'] = fn
+            eval_results['IOU_3d_asset_micro'] = tp / denom if denom > 0 else float('nan')
         # Recall3d(bbox_aabb): base=inst3d, 관용=AABB box. Recall3d(bbox_rot): 관용=rot OBB (더 엄격).
         if results.get('recall_3d'):
             eval_results['Recall3d(bbox_aabb)'] = sum(results['recall_3d']) / len(results['recall_3d'])
@@ -527,6 +572,17 @@ class EfficientOCFDataset(NuScenesDataset):
             eval_results['Recall3d(bbox_rot)_FN'] = fn
             eval_results['Recall3d(bbox_rot)_bboxFP'] = bfp
             eval_results['Recall3d(bbox_rot)_micro'] = (tp + bfp) / denom if denom > 0 else float('nan')
+        if results.get('recall_3d_asset'):
+            eval_results['Recall3d(asset)'] = sum(results['recall_3d_asset']) / len(results['recall_3d_asset'])
+        if results.get('recall_3d_asset_comps') is not None and len(results['recall_3d_asset_comps']) > 0:
+            comps = np.sum(np.stack([np.asarray(c) for c in results['recall_3d_asset_comps']]), axis=0)
+            tp, fp, fn, bfp = [float(v) for v in comps]
+            denom = tp + fn + fp - bfp
+            eval_results['Recall3d(asset)_TP'] = tp
+            eval_results['Recall3d(asset)_FP'] = fp
+            eval_results['Recall3d(asset)_FN'] = fn
+            eval_results['Recall3d(asset)_assetFP'] = bfp
+            eval_results['Recall3d(asset)_micro'] = (tp + bfp) / denom if denom > 0 else float('nan')
 
         def _to_py(val):
             if torch.is_tensor(val):

@@ -1,4 +1,0 @@
--------------
-load config from local path: ./projects/configs/baselines/subset_attn_cover_pyr_aabb_dice3d_rot.py
-[dist_train] console logging -> logs/subset_attn_cover_pyr_aabb_dice3d_rot/20260713_144027.log  (실시간 보기: tail -f logs/subset_attn_cover_pyr_aabb_dice3d_rot/20260713_144027.log)
-Terminated

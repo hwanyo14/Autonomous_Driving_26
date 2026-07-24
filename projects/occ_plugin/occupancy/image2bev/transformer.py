@@ -33,6 +33,49 @@ class CrossAttentionModule(nn.Module):
         return attn_output, attn_weights
 
 
+class LightweightKVDownsample(nn.Module):
+    def __init__(self, channels, full_hw, target_hw):
+        super(LightweightKVDownsample, self).__init__()
+        self.target_hw = tuple(int(v) for v in target_hw)
+        full_h, full_w = (int(v) for v in full_hw)
+        target_h, target_w = self.target_hw
+
+        if target_h == full_h and target_w == full_w:
+            self.downsample = nn.Identity()
+            return
+        if target_h > full_h or target_w > full_w:
+            raise ValueError(f"target_hw must not exceed full_hw: target={self.target_hw}, full={(full_h, full_w)}")
+        if full_h % target_h != 0 or full_w % target_w != 0:
+            raise ValueError(
+                "learnable KV downsampling requires integer scale: "
+                f"target={self.target_hw}, full={(full_h, full_w)}"
+            )
+
+        stride = (full_h // target_h, full_w // target_w)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=stride, stride=stride, groups=channels, bias=False),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+        )
+        self._init_avg_identity()
+
+    def _init_avg_identity(self):
+        if isinstance(self.downsample, nn.Identity):
+            return
+        depthwise, pointwise = self.downsample
+        depthwise.weight.data.fill_(1.0 / float(depthwise.weight.shape[-2] * depthwise.weight.shape[-1]))
+        pointwise.weight.data.zero_()
+        diag = torch.arange(pointwise.weight.shape[0])
+        pointwise.weight.data[diag, diag, 0, 0] = 1.0
+
+    def forward(self, x):
+        x = self.downsample(x)
+        if tuple(int(v) for v in x.shape[-2:]) != self.target_hw:
+            raise RuntimeError(
+                f"unexpected KV downsample shape: got {tuple(x.shape[-2:])}, expected {self.target_hw}"
+            )
+        return x
+
+
 class TransformerModule(nn.Module):
     def __init__(self, 
                  feat_dim, 
@@ -42,6 +85,7 @@ class TransformerModule(nn.Module):
                  num_heads=4,
                  num_layers=1,
                  kv_resolutions=None,
+                 learnable_kv_downsample=False,
                  num_cams=6,
                  embed_dim=128,
                  max_time=3,
@@ -71,6 +115,8 @@ class TransformerModule(nn.Module):
         if self.num_layers <= 0:
             raise ValueError(f"num_layers must be positive, got {self.num_layers}")
         self.kv_resolutions = self._normalize_kv_resolutions(kv_resolutions)
+        self.learnable_kv_downsample = bool(learnable_kv_downsample)
+        self.kv_full_resolution = None if self.kv_resolutions is None else self.kv_resolutions[-1]
         self.num_cams = num_cams
         self.embed_dim = embed_dim
         self.max_time = max_time
@@ -112,6 +158,7 @@ class TransformerModule(nn.Module):
         self.query_id_embed = nn.Embedding(num_embeddings=self.num_queries, embedding_dim=self.embed_dim)
         self.cam_id_embed = nn.Embedding(num_embeddings=num_cams, embedding_dim=self.feat_dim)
         self.time_embed = nn.Embedding(num_embeddings=max_time, embedding_dim=self.feat_dim)
+        self.kv_downsamplers = self._build_kv_downsamplers()
 
         self.ca_layers = nn.ModuleList([
             CrossAttentionModule(
@@ -186,10 +233,18 @@ class TransformerModule(nn.Module):
             s = int(ncam) * int(h) * int(w)
             return [x.reshape(t, s, c) for _ in range(self.num_layers)]
 
+        if self.learnable_kv_downsample and (int(h), int(w)) != self.kv_full_resolution:
+            raise ValueError(
+                "input context_seq resolution must match kv_resolutions[-1]: "
+                f"got {(int(h), int(w))}, expected {self.kv_full_resolution}"
+            )
+
         x_hw = x.reshape(t, ncam, h, w, c).permute(0, 1, 4, 2, 3).reshape(t * ncam, c, h, w)
         layer_kv_tokens = []
-        for target_h, target_w in self.kv_resolutions:
-            if target_h == h and target_w == w:
+        for layer_idx, (target_h, target_w) in enumerate(self.kv_resolutions):
+            if self.learnable_kv_downsample:
+                pooled = self.kv_downsamplers[layer_idx](x_hw)
+            elif target_h == h and target_w == w:
                 pooled = x_hw
             elif (target_h < h and target_w < w and h % target_h == 0 and w % target_w == 0):
                 kernel = (h // target_h, w // target_w)
@@ -199,6 +254,14 @@ class TransformerModule(nn.Module):
             pooled = pooled.reshape(t, ncam, c, target_h, target_w)
             layer_kv_tokens.append(pooled.permute(0, 1, 3, 4, 2).reshape(t, ncam * target_h * target_w, c))
         return layer_kv_tokens
+
+    def _build_kv_downsamplers(self):
+        if not self.learnable_kv_downsample or self.kv_resolutions is None:
+            return None
+        return nn.ModuleList([
+            LightweightKVDownsample(self.feat_dim, self.kv_full_resolution, target_hw)
+            for target_hw in self.kv_resolutions
+        ])
 
     def _is_rank0(self):
         return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0

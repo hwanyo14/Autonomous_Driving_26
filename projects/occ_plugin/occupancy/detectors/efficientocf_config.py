@@ -16,8 +16,39 @@ MODEL_CFG_DEFAULTS = {
     "query_gmo_dice_bbox_weight": 0.0,
     "query_gmo_dice_loss_weight": 0.5,
     "query_gmo_dice_3d": False,   # True면 dice/Tversky를 z collapse 없이 3D로 (z 과확장 억제)
+    # All-query scene supervision on present+future frames. Continuous foreground
+    # confidence gates each query; no threshold, Hungarian selection, NMS, or top-k.
+    "use_query_scene_asset_bce_loss": False,
+    "query_scene_asset_bce_loss_weight": 0.0,
+    "query_scene_asset_bce_pos_weight": 1.0,
+    "query_scene_asset_bce_neg_weight": 1.0,
+    "query_scene_asset_bce_eps": 1e-6,
+    # Matched-pair GMO focal/Dice hard mining. geometry는 크기/거리,
+    # loss_topk는 pair raw Dice 상위 비율을 선택한다.
+    "query_gmo_hard_pair_enabled": False,
+    "query_gmo_hard_pair_mode": "geometry",
+    "query_gmo_hard_topk_ratio": 0.3,
+    "query_gmo_hard_easy_weight": 0.0,
+    "query_gmo_hard_min_pairs": 1,
+    "query_gmo_hard_large_min_m": 6.0,
+    "query_gmo_hard_far_min_m": 30.0,
+    # 학습 전용: matched Gaussian-center/GT-BEV의 trace-normalized XY covariance 감독.
+    "use_query_gmo_shape_loss": False,
+    "query_gmo_shape_loss_weight": 0.0,
+    "query_gmo_shape_loss_type": "covariance",
+    "query_gmo_shape_min_bev_voxels": 4,
+    "query_gmo_shape_min_gt_axis_ratio": 1.0,
+    "query_gmo_shape_pred_weight_mode": "equal",
+    # Diagnostic fine-tuning: optimize only the Gaussian offset output head and
+    # expose only the GMO shape loss to the runner.
+    "query_offset_only_finetune": False,
+    "query_shape_only_finetune": False,
     "query_gmo_tversky_alpha": 0.7,
     "query_gmo_tversky_beta": 0.3,
+    "query_gmo_tversky_size_enabled": False,
+    "query_gmo_tversky_size_start_m": 6.0,
+    "query_gmo_tversky_size_end_m": 10.0,
+    "query_gmo_tversky_size_alpha_end": 0.4,
     "query_gmo_soft_gt_enabled": False,
     "query_gmo_soft_gt_sigma_vox": 2.5,
     "query_gmo_soft_gt_truncate_sigma": 3.0,
@@ -183,6 +214,7 @@ MODEL_CFG_DEFAULTS = {
     # Per-layer cross-attention KV 해상도 (coarse->fine 피라미드). None=기존 동작(전 layer가
     # 원본 해상도 KV 공유). 지정 시 len()이 query_transformer_num_layers와 일치해야 함.
     "query_transformer_kv_resolutions": None,
+    "query_transformer_learnable_kv_downsample": False,
     "query_id_reinject_scale": 0.0,
     "query_ca_kv_identity_init": False,
     "query_ca_attn_tau": 1.0,
@@ -300,12 +332,81 @@ def apply_model_cfg(self, cfg):
     self.query_gmo_dice_bbox_weight = float(cfg["query_gmo_dice_bbox_weight"])
     self.query_gmo_dice_loss_weight = float(cfg["query_gmo_dice_loss_weight"])
     self.query_gmo_dice_3d = bool(cfg["query_gmo_dice_3d"])
+    self.use_query_scene_asset_bce_loss = bool(cfg["use_query_scene_asset_bce_loss"])
+    self.query_scene_asset_bce_loss_weight = float(cfg["query_scene_asset_bce_loss_weight"])
+    self.query_scene_asset_bce_pos_weight = float(cfg["query_scene_asset_bce_pos_weight"])
+    self.query_scene_asset_bce_neg_weight = float(cfg["query_scene_asset_bce_neg_weight"])
+    self.query_scene_asset_bce_eps = float(cfg["query_scene_asset_bce_eps"])
+    if min(
+        self.query_scene_asset_bce_loss_weight,
+        self.query_scene_asset_bce_pos_weight,
+        self.query_scene_asset_bce_neg_weight,
+    ) < 0.0:
+        raise ValueError("query scene asset BCE weights must be >= 0")
+    if self.query_scene_asset_bce_eps <= 0.0:
+        raise ValueError("query_scene_asset_bce_eps must be > 0")
+    self.query_gmo_hard_pair_enabled = bool(cfg["query_gmo_hard_pair_enabled"])
+    self.query_gmo_hard_pair_mode = str(cfg["query_gmo_hard_pair_mode"]).lower()
+    self.query_gmo_hard_topk_ratio = float(cfg["query_gmo_hard_topk_ratio"])
+    self.query_gmo_hard_easy_weight = float(cfg["query_gmo_hard_easy_weight"])
+    self.query_gmo_hard_min_pairs = int(cfg["query_gmo_hard_min_pairs"])
+    self.query_gmo_hard_large_min_m = float(cfg["query_gmo_hard_large_min_m"])
+    self.query_gmo_hard_far_min_m = float(cfg["query_gmo_hard_far_min_m"])
+    if self.query_gmo_hard_pair_mode not in ("geometry", "loss_topk"):
+        raise ValueError("query_gmo_hard_pair_mode must be 'geometry' or 'loss_topk'")
+    if not 0.0 < self.query_gmo_hard_topk_ratio <= 1.0:
+        raise ValueError("query_gmo_hard_topk_ratio must be in (0, 1]")
+    if not 0.0 <= self.query_gmo_hard_easy_weight <= 1.0:
+        raise ValueError("query_gmo_hard_easy_weight must be in [0, 1]")
+    if self.query_gmo_hard_min_pairs < 1:
+        raise ValueError("query_gmo_hard_min_pairs must be >= 1")
+    if self.query_gmo_hard_large_min_m <= 0.0:
+        raise ValueError("query_gmo_hard_large_min_m must be > 0")
+    if self.query_gmo_hard_far_min_m <= 0.0:
+        raise ValueError("query_gmo_hard_far_min_m must be > 0")
+    self.use_query_gmo_shape_loss = bool(cfg["use_query_gmo_shape_loss"])
+    self.query_gmo_shape_loss_weight = float(cfg["query_gmo_shape_loss_weight"])
+    self.query_gmo_shape_loss_type = str(cfg["query_gmo_shape_loss_type"]).lower()
+    self.query_gmo_shape_min_bev_voxels = int(cfg["query_gmo_shape_min_bev_voxels"])
+    self.query_gmo_shape_min_gt_axis_ratio = float(cfg["query_gmo_shape_min_gt_axis_ratio"])
+    self.query_gmo_shape_pred_weight_mode = str(cfg["query_gmo_shape_pred_weight_mode"]).lower()
+    self.query_offset_only_finetune = bool(cfg["query_offset_only_finetune"])
+    self.query_shape_only_finetune = bool(cfg["query_shape_only_finetune"])
+    if self.query_gmo_shape_loss_weight < 0.0:
+        raise ValueError("query_gmo_shape_loss_weight must be >= 0")
+    if self.query_gmo_shape_min_bev_voxels < 2:
+        raise ValueError("query_gmo_shape_min_bev_voxels must be >= 2")
+    if self.query_gmo_shape_loss_type not in ("covariance", "direction", "render_direction"):
+        raise ValueError(
+            "query_gmo_shape_loss_type must be 'covariance', 'direction', or 'render_direction'"
+        )
+    if self.query_gmo_shape_min_gt_axis_ratio < 1.0:
+        raise ValueError("query_gmo_shape_min_gt_axis_ratio must be >= 1")
+    if self.query_gmo_shape_pred_weight_mode not in ("equal", "detached_opacity"):
+        raise ValueError(
+            "query_gmo_shape_pred_weight_mode must be 'equal' or 'detached_opacity'"
+        )
     self.query_gmo_tversky_alpha = float(cfg["query_gmo_tversky_alpha"])
     self.query_gmo_tversky_beta = float(cfg["query_gmo_tversky_beta"])
+    self.query_gmo_tversky_size_enabled = bool(cfg["query_gmo_tversky_size_enabled"])
+    self.query_gmo_tversky_size_start_m = float(cfg["query_gmo_tversky_size_start_m"])
+    self.query_gmo_tversky_size_end_m = float(cfg["query_gmo_tversky_size_end_m"])
+    self.query_gmo_tversky_size_alpha_end = float(cfg["query_gmo_tversky_size_alpha_end"])
+    if self.query_gmo_tversky_size_enabled:
+        if self.query_gmo_tversky_size_end_m <= self.query_gmo_tversky_size_start_m:
+            raise ValueError("query_gmo_tversky_size_end_m must be greater than start_m")
+        if not 0.0 <= self.query_gmo_tversky_size_alpha_end <= 1.0:
+            raise ValueError("query_gmo_tversky_size_alpha_end must be in [0, 1]")
     self.query_gmo_soft_gt_enabled = bool(cfg["query_gmo_soft_gt_enabled"])
     self.query_gmo_soft_gt_sigma_vox = float(cfg["query_gmo_soft_gt_sigma_vox"])
     self.query_gmo_soft_gt_truncate_sigma = float(cfg["query_gmo_soft_gt_truncate_sigma"])
     self.use_query_gmo_dice_loss = bool(cfg["use_query_gmo_dice_loss"])
+    if (
+        self.query_gmo_hard_pair_enabled
+        and self.query_gmo_hard_pair_mode == "loss_topk"
+        and not self.use_query_gmo_dice_loss
+    ):
+        raise ValueError("loss_topk hard mining requires use_query_gmo_dice_loss=True")
     self.use_query_inst_center_match_loss = bool(cfg["use_query_inst_center_match_loss"])
     self.query_matched_loss_history_only = bool(cfg["query_matched_loss_history_only"])
     self.use_query_dt_loss = bool(cfg["use_query_dt_loss"])
@@ -471,6 +572,7 @@ def apply_model_cfg(self, cfg):
                 f"query_transformer_num_layers: got {len(self.query_transformer_kv_resolutions)} "
                 f"vs {self.query_transformer_num_layers}"
             )
+    self.query_transformer_learnable_kv_downsample = bool(cfg["query_transformer_learnable_kv_downsample"])
     self.query_id_reinject_scale = float(cfg["query_id_reinject_scale"])
     self.query_ca_kv_identity_init = bool(cfg["query_ca_kv_identity_init"])
     self.query_ca_attn_tau = float(cfg["query_ca_attn_tau"])

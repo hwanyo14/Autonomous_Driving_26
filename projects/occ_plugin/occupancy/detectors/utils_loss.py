@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -631,6 +633,18 @@ class EfficientOCFLossMixin:
             return None
         return sizes.contiguous()
 
+    @staticmethod
+    def _normalize_gt_instance_dims(dims):
+        if isinstance(dims, (list, tuple)):
+            dims = dims[0] if len(dims) >= 1 else None
+        if not torch.is_tensor(dims):
+            return None
+        if dims.dim() == 3 and dims.shape[0] == 1:
+            dims = dims[0]
+        if dims.dim() != 2 or int(dims.shape[-1]) != 2:
+            return None
+        return dims.contiguous()
+
     def _gather_matched_gt_sizes(self, inst_match_result, gt_instance_ids, gt_instance_sizes, device):
         """
         Return (matched_query_idx_k [K], gt_size_k3 [K,3]) for matched pairs whose GT
@@ -754,14 +768,10 @@ class EfficientOCFLossMixin:
         ):
             return None
         ids_raw = self._normalize_gt_instance_ids(gt_instance_ids)
-        dims_raw = gt_instance_dims
-        if isinstance(dims_raw, (list, tuple)):
-            dims_raw = dims_raw[0] if len(dims_raw) >= 1 else None
-        if torch.is_tensor(dims_raw) and dims_raw.dim() == 3 and dims_raw.shape[0] == 1:
-            dims_raw = dims_raw[0]
+        dims_raw = self._normalize_gt_instance_dims(gt_instance_dims)
         if (
-            (ids_raw is None) or (not torch.is_tensor(dims_raw)) or dims_raw.dim() != 2
-            or int(dims_raw.shape[-1]) != 2 or int(ids_raw.shape[0]) != int(dims_raw.shape[0])
+            (ids_raw is None) or (dims_raw is None)
+            or int(ids_raw.shape[0]) != int(dims_raw.shape[0])
         ):
             return None
         device = pred_dims_tq2.device
@@ -808,7 +818,16 @@ class EfficientOCFLossMixin:
     ):
         if (not torch.is_tensor(centers_world_tq3)) or centers_world_tq3.dim() != 3:
             return None
-        z = centers_world_tq3.sum() * 0.0
+        if (
+            bool(getattr(self, "query_shape_only_finetune", False))
+            and torch.is_tensor(mixture_centers_world_tqg3)
+        ):
+            # Some distributed ranks can have no valid elongated GT pair. Keep a
+            # zero-valued path to the only trainable offset head so DDP backward
+            # remains collective-safe on those ranks.
+            z = mixture_centers_world_tqg3.sum() * 0.0
+        else:
+            z = centers_world_tq3.sum() * 0.0
         zero_dbg = {
             "dbg_query_matched_center_pair_count": z,
             "dbg_query_matched_center_valid_frame_count": z,
@@ -2983,7 +3002,9 @@ class EfficientOCFLossMixin:
         tp = (p * t).sum()
         fp = (p * (1.0 - t)).sum()
         fn = ((1.0 - p) * t).sum()
-        denom = tp + (float(alpha) * fp) + (float(beta) * fn)
+        alpha_t = torch.as_tensor(alpha, device=p.device, dtype=p.dtype)
+        beta_t = torch.as_tensor(beta, device=p.device, dtype=p.dtype)
+        denom = tp + (alpha_t * fp) + (beta_t * fn)
         score = (tp + float(eps)) / (denom + float(eps))
         return 1.0 - score.clamp(0.0, 1.0)
 
@@ -3002,6 +3023,21 @@ class EfficientOCFLossMixin:
         dice_loss_weight: float = 1.0,
         tversky_alpha: float = 0.7,
         tversky_beta: float = 0.3,
+        tversky_size_enabled: bool = False,
+        tversky_size_start_m: float = 6.0,
+        tversky_size_end_m: float = 10.0,
+        tversky_size_alpha_end: float = 0.4,
+        gt_instance_ids=None,
+        gt_instance_sizes=None,
+        gt_instance_dims=None,
+        hard_pair_enabled: bool = False,
+        hard_pair_mode: str = "geometry",
+        hard_topk_ratio: float = 0.3,
+        hard_easy_weight: float = 0.0,
+        hard_min_pairs: int = 1,
+        hard_large_min_m: float = 6.0,
+        hard_far_min_m: float = 30.0,
+        hard_present_frame_idx: int = 0,
         mixture_centers_world_tqg3: torch.Tensor = None,
         mixture_sigmas_world_tqg3: torch.Tensor = None,
         mixture_yaw_tqg: torch.Tensor = None,
@@ -3012,6 +3048,12 @@ class EfficientOCFLossMixin:
         focal_bbox_weight: float = 0.0,
         dice_inst3d_weight: float = 1.0,
         dice_bbox_weight: float = 0.0,
+        compute_shape: bool = False,
+        shape_loss_weight: float = 0.0,
+        shape_loss_type: str = "covariance",
+        shape_min_bev_voxels: int = 4,
+        shape_min_gt_axis_ratio: float = 1.0,
+        shape_pred_weight_mode: str = "equal",
         eps: float = 1e-6,
     ) -> dict:
         # GT 혼합 (focal/dice 각각 독립 가중):
@@ -3021,6 +3063,11 @@ class EfficientOCFLossMixin:
         # dice+bbox 조합의 의도: tversky FP항(α)이 'box 밖' 확장을 강벌, box 안 확장은 허용.
         z = centers_world_tq3.sum() * 0.0
         loss_type = str(loss_type).lower()
+        hard_pair_mode = str(hard_pair_mode).lower()
+        if hard_pair_mode not in ("geometry", "loss_topk"):
+            raise ValueError(f"Unsupported hard_pair_mode={hard_pair_mode!r}")
+        if bool(hard_pair_enabled) and hard_pair_mode == "loss_topk" and not bool(compute_dice):
+            raise ValueError("loss_topk hard mining requires compute_dice=True")
         loss_key = "loss_gmo_focal" if loss_type in ("balanced_focal", "focal") else "loss_gmo_bce"
         bbox_gt_ok = torch.is_tensor(gt_bbox_aabb_txyz) and gt_bbox_aabb_txyz.dim() == 4
         use_bbox_gt = bbox_gt_ok and float(focal_bbox_weight) > 0.0
@@ -3034,6 +3081,37 @@ class EfficientOCFLossMixin:
             "dbg_gmo_dice_pair_count": z,
             "dbg_gmo_dice_alpha": z.new_tensor(float(tversky_alpha)),
             "dbg_gmo_dice_beta": z.new_tensor(float(tversky_beta)),
+            "dbg_gmo_dice_alpha_mean": z.new_tensor(float(tversky_alpha)),
+            "dbg_gmo_dice_beta_mean": z.new_tensor(float(tversky_beta)),
+            "dbg_gmo_dice_size_large_pair_count": z,
+            "loss_gmo_shape": z,
+            "dbg_gmo_shape_raw": z,
+            "dbg_gmo_shape_valid_pair_count": z,
+            "dbg_gmo_shape_angle_error_deg": z,
+            "dbg_gmo_shape_pred_axis_ratio": z,
+            "dbg_gmo_shape_gt_axis_ratio": z,
+            "dbg_gmo_hard_enabled": z.new_tensor(float(bool(hard_pair_enabled))),
+            "dbg_gmo_hard_mode_loss_topk": z.new_tensor(
+                float(bool(hard_pair_enabled) and hard_pair_mode == "loss_topk")
+            ),
+            "dbg_gmo_hard_all_pair_count": z,
+            "dbg_gmo_hard_pair_count": z,
+            "dbg_gmo_hard_easy_pair_count": z,
+            "dbg_gmo_hard_score_valid_count": z,
+            "dbg_gmo_hard_score_cutoff": z,
+            "dbg_gmo_hard_large_count": z,
+            "dbg_gmo_hard_far_count": z,
+            "dbg_gmo_hard_large_far_count": z,
+            "dbg_gmo_hard_large_valid_count": z,
+            "dbg_gmo_hard_far_valid_count": z,
+            "dbg_gmo_hard_pair_ratio": z,
+            "dbg_gmo_hard_zero_batch": z.new_tensor(float(bool(hard_pair_enabled))),
+            "dbg_gmo_hard_length_mean_m": z,
+            "dbg_gmo_hard_distance_mean_m": z,
+            "dbg_gmo_hard_focal_raw": z,
+            "dbg_gmo_hard_dice_raw": z,
+            "dbg_gmo_easy_focal_raw": z,
+            "dbg_gmo_easy_dice_raw": z,
         }
         if use_bbox_gt:
             out["dbg_gmo_focal_inst3d"] = z
@@ -3086,14 +3164,112 @@ class EfficientOCFLossMixin:
             return out
         pair_gt_ids = gt_ids.index_select(0, mi)
 
+        pair_tversky_alpha_k = centers_world_tq3.new_full(
+            (int(mq.numel()),), float(tversky_alpha), dtype=torch.float32)
+        pair_tversky_beta_k = centers_world_tq3.new_full(
+            (int(mq.numel()),), float(tversky_beta), dtype=torch.float32)
+        if bool(tversky_size_enabled):
+            ids_raw = self._normalize_gt_instance_ids(gt_instance_ids)
+            sizes_raw = gt_instance_sizes
+            if isinstance(sizes_raw, (list, tuple)):
+                sizes_raw = sizes_raw[0] if len(sizes_raw) >= 1 else None
+            if torch.is_tensor(sizes_raw) and sizes_raw.dim() == 3 and int(sizes_raw.shape[0]) == 1:
+                sizes_raw = sizes_raw[0]
+            if (
+                torch.is_tensor(ids_raw) and torch.is_tensor(sizes_raw)
+                and sizes_raw.dim() == 2 and int(sizes_raw.shape[-1]) >= 2
+                and int(ids_raw.numel()) == int(sizes_raw.shape[0])
+            ):
+                ids_raw = ids_raw.to(device=pair_gt_ids.device, dtype=torch.long)
+                sizes_raw = sizes_raw.to(device=pair_gt_ids.device, dtype=torch.float32)
+                eq_kn = pair_gt_ids.view(-1, 1) == ids_raw.view(1, -1)
+                has_size_k = eq_kn.any(dim=1)
+                if bool(has_size_k.any().item()):
+                    size_col_k = eq_kn[has_size_k].to(torch.float32).argmax(dim=1)
+                    length_k = sizes_raw.index_select(0, size_col_k)[:, :2].max(dim=-1).values
+                    ratio_k = (
+                        (length_k - float(tversky_size_start_m))
+                        / (float(tversky_size_end_m) - float(tversky_size_start_m))
+                    ).clamp(0.0, 1.0).detach()
+                    pair_tversky_alpha_k[has_size_k] = (
+                        float(tversky_alpha)
+                        + (float(tversky_size_alpha_end) - float(tversky_alpha)) * ratio_k
+                    )
+                    pair_tversky_beta_k[has_size_k] = (
+                        float(tversky_beta)
+                        + ((1.0 - float(tversky_size_alpha_end)) - float(tversky_beta)) * ratio_k
+                    )
+                    out["dbg_gmo_dice_size_large_pair_count"] = (ratio_k > 0).sum().to(torch.float32)
+        out["dbg_gmo_dice_alpha_mean"] = pair_tversky_alpha_k.mean().detach()
+        out["dbg_gmo_dice_beta_mean"] = pair_tversky_beta_k.mean().detach()
+
         gt_occ_txyz = gt_instance_occ3d_txyz_pred[:T].to(device=centers_world_tq3.device, dtype=torch.long)
         if torch.is_tensor(gt_valid_tn) and gt_valid_tn.dim() == 2 and int(gt_valid_tn.shape[0]) >= T:
             gt_valid_sel_tk = gt_valid_tn[:T].to(device=centers_world_tq3.device, dtype=torch.bool).index_select(1, mi)
         else:
             gt_valid_sel_tk = torch.ones((T, int(mq.numel())), device=centers_world_tq3.device, dtype=torch.bool)
 
-        pair_losses = []
-        dice_pair_losses = []
+        # Optional FT gate: Hungarian assignment stays unchanged. geometry mode
+        # uses large OR far metadata; loss_topk defers selection until every
+        # pair's raw Dice has been computed.
+        pair_count = int(mq.numel())
+        hard_mask_k = torch.ones(pair_count, device=centers_world_tq3.device, dtype=torch.bool)
+        large_mask_k = torch.zeros_like(hard_mask_k)
+        far_mask_k = torch.zeros_like(hard_mask_k)
+        large_valid_k = torch.zeros_like(hard_mask_k)
+        far_valid_k = torch.zeros_like(hard_mask_k)
+        pair_length_k = centers_world_tq3.new_zeros(pair_count, dtype=torch.float32)
+        pair_distance_k = centers_world_tq3.new_zeros(pair_count, dtype=torch.float32)
+        if bool(hard_pair_enabled):
+            hard_mask_k.zero_()
+            ids_raw = self._normalize_gt_instance_ids(gt_instance_ids)
+            dims_raw = self._normalize_gt_instance_dims(gt_instance_dims)
+            if (
+                ids_raw is not None and dims_raw is not None
+                and int(ids_raw.shape[0]) == int(dims_raw.shape[0])
+            ):
+                ids_raw = ids_raw.to(device=pair_gt_ids.device, dtype=torch.long)
+                dims_raw = dims_raw.to(device=pair_gt_ids.device, dtype=torch.float32)
+                eq_kn = pair_gt_ids.view(-1, 1) == ids_raw.view(1, -1)
+                large_valid_k = eq_kn.any(dim=1)
+                if bool(large_valid_k.any().item()):
+                    dim_col_k = eq_kn[large_valid_k].to(torch.float32).argmax(dim=1)
+                    pair_length_k[large_valid_k] = dims_raw.index_select(
+                        0, dim_col_k
+                    ).max(dim=-1).values
+                    large_mask_k = large_valid_k & (
+                        pair_length_k >= float(hard_large_min_m)
+                    )
+
+            gt_centers_tn3 = inst_match_result.get("gt_centers_tn3", None)
+            if (
+                torch.is_tensor(gt_centers_tn3) and gt_centers_tn3.dim() == 3
+                and int(gt_centers_tn3.shape[1]) == int(gt_ids.numel())
+            ):
+                present_idx = max(
+                    0,
+                    min(int(hard_present_frame_idx), int(gt_centers_tn3.shape[0]) - 1),
+                )
+                pair_centers_k3 = gt_centers_tn3[present_idx].to(
+                    device=centers_world_tq3.device, dtype=torch.float32
+                ).index_select(0, mi)
+                pair_distance_k = torch.linalg.vector_norm(pair_centers_k3[:, :2], dim=-1)
+                if (
+                    torch.is_tensor(gt_valid_tn) and gt_valid_tn.dim() == 2
+                    and int(gt_valid_tn.shape[0]) > present_idx
+                    and int(gt_valid_tn.shape[1]) == int(gt_ids.numel())
+                ):
+                    far_valid_k = gt_valid_tn[present_idx].to(
+                        device=centers_world_tq3.device, dtype=torch.bool
+                    ).index_select(0, mi)
+                else:
+                    far_valid_k.fill_(True)
+                far_mask_k = far_valid_k & (pair_distance_k >= float(hard_far_min_m))
+            if hard_pair_mode == "geometry":
+                hard_mask_k = large_mask_k | far_mask_k
+
+        focal_loss_by_pair = [None] * pair_count
+        dice_loss_by_pair = [None] * pair_count
         use_mixture = (
             torch.is_tensor(mixture_centers_world_tqg3)
             and torch.is_tensor(mixture_sigmas_world_tqg3)
@@ -3119,6 +3295,128 @@ class EfficientOCFLossMixin:
             )
             if pred_tk1zyx is None:
                 return out
+
+            # 학습 전용 형상 감독: 48개 Gaussian 중심과 동일 matched asset-union GT의
+            # trace-normalized XY covariance를 비교한다. Opacity는 offset 대신 weight로
+            # loss를 우회하지 못하도록 의도적으로 사용하지 않는다.
+            if bool(compute_shape) and float(shape_loss_weight) > 0.0:
+                gt_bev_tkyx = gt_tk1zyx[:, :, 0].amax(dim=2).to(torch.float32)
+                gt_count_tk = gt_bev_tkyx.sum(dim=(-2, -1))
+                y_size, x_size = gt_bev_tkyx.shape[-2:]
+                yy, xx = torch.meshgrid(
+                    torch.arange(y_size, device=gt_bev_tkyx.device, dtype=torch.float32),
+                    torch.arange(x_size, device=gt_bev_tkyx.device, dtype=torch.float32),
+                    indexing="ij",
+                )
+                xy_yx2 = torch.stack((xx, yy), dim=-1)
+                gt_mean_tk2 = torch.einsum("tkyx,yxc->tkc", gt_bev_tkyx, xy_yx2)
+                gt_mean_tk2 = gt_mean_tk2 / gt_count_tk.clamp_min(1.0).unsqueeze(-1)
+                gt_delta_tkyx2 = xy_yx2.view(1, 1, y_size, x_size, 2) - gt_mean_tk2[:, :, None, None]
+                gt_cov_tk22 = torch.einsum(
+                    "tkyx,tkyxc,tkyxd->tkcd",
+                    gt_bev_tkyx,
+                    gt_delta_tkyx2,
+                    gt_delta_tkyx2,
+                ) / gt_count_tk.clamp_min(1.0)[..., None, None]
+
+                shape_loss_type = str(shape_loss_type).lower()
+                if shape_loss_type == "render_direction":
+                    # Differentiable final-render supervision: collapse soft 3D occupancy
+                    # into XY mass. This includes offset, sigma and opacity effects; the
+                    # probe config freezes everything except the offset output head.
+                    pred_bev_tkyx = pred_tk1zyx[:, :, 0].sum(dim=2).to(torch.float32)
+                    pred_count_tk = pred_bev_tkyx.sum(dim=(-2, -1))
+                    pred_mean_tk2 = torch.einsum("tkyx,yxc->tkc", pred_bev_tkyx, xy_yx2)
+                    pred_mean_tk2 = pred_mean_tk2 / pred_count_tk.clamp_min(float(eps)).unsqueeze(-1)
+                    pred_delta_tkyx2 = (
+                        xy_yx2.view(1, 1, y_size, x_size, 2) - pred_mean_tk2[:, :, None, None]
+                    )
+                    pred_cov_tk22 = torch.einsum(
+                        "tkyx,tkyxc,tkyxd->tkcd",
+                        pred_bev_tkyx,
+                        pred_delta_tkyx2,
+                        pred_delta_tkyx2,
+                    ) / pred_count_tk.clamp_min(float(eps))[..., None, None]
+                else:
+                    pred_xy_tkg2 = mixture_centers_world_tqg3[:T].index_select(1, mq)[..., :2]
+                    shape_pred_weight_mode = str(shape_pred_weight_mode).lower()
+                    if shape_pred_weight_mode == "detached_opacity":
+                        pred_weight_tkg = mixture_weights_tqg[:T].index_select(1, mq).detach().to(torch.float32)
+                        pred_weight_tkg = pred_weight_tkg / pred_weight_tkg.sum(
+                            dim=2, keepdim=True
+                        ).clamp_min(float(eps))
+                    elif shape_pred_weight_mode == "equal":
+                        pred_weight_tkg = pred_xy_tkg2.new_full(
+                            pred_xy_tkg2.shape[:-1], 1.0 / float(max(1, pred_xy_tkg2.shape[2]))
+                        )
+                    else:
+                        raise ValueError(
+                            f"Unsupported shape_pred_weight_mode={shape_pred_weight_mode!r}"
+                        )
+                    pred_mean_tk12 = (
+                        pred_weight_tkg[..., None] * pred_xy_tkg2
+                    ).sum(dim=2, keepdim=True)
+                    pred_delta_tkg2 = pred_xy_tkg2 - pred_mean_tk12
+                    pred_cov_tk22 = torch.einsum(
+                        "tkg,tkgc,tkgd->tkcd",
+                        pred_weight_tkg,
+                        pred_delta_tkg2,
+                        pred_delta_tkg2,
+                    )
+
+                def _normalize_cov(cov):
+                    trace = cov.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+                    return cov / trace.clamp_min(float(eps))[..., None, None]
+
+                pred_cov_norm = _normalize_cov(pred_cov_tk22)
+                gt_cov_norm = _normalize_cov(gt_cov_tk22)
+                pred_eval_all = torch.linalg.eigvalsh(pred_cov_norm)
+                gt_eval_all = torch.linalg.eigvalsh(gt_cov_norm)
+                pred_axis_ratio_tk = pred_eval_all[..., -1] / pred_eval_all[..., 0].clamp_min(float(eps))
+                gt_axis_ratio_tk = gt_eval_all[..., -1] / gt_eval_all[..., 0].clamp_min(float(eps))
+                if shape_loss_type == "covariance":
+                    shape_raw_tk = 0.5 * (pred_cov_norm - gt_cov_norm).square().sum(dim=(-2, -1))
+                elif shape_loss_type in ("direction", "render_direction"):
+                    pred_dir_tk2 = torch.stack(
+                        (pred_cov_norm[..., 0, 0] - pred_cov_norm[..., 1, 1],
+                         2.0 * pred_cov_norm[..., 0, 1]), dim=-1)
+                    gt_dir_tk2 = torch.stack(
+                        (gt_cov_norm[..., 0, 0] - gt_cov_norm[..., 1, 1],
+                         2.0 * gt_cov_norm[..., 0, 1]), dim=-1)
+                    # Direction only: remove anisotropy magnitude. The 0.1 floor bounds
+                    # gradients near an isotropic prediction without making collapse useful.
+                    pred_dir_unit = pred_dir_tk2 / pred_dir_tk2.norm(
+                        dim=-1, keepdim=True).clamp_min(0.1)
+                    gt_dir_unit = gt_dir_tk2 / gt_dir_tk2.norm(
+                        dim=-1, keepdim=True).clamp_min(float(eps))
+                    shape_raw_tk = (0.5 * (
+                        1.0 - (pred_dir_unit * gt_dir_unit).sum(dim=-1)
+                    )).clamp(0.0, 1.0)
+                else:
+                    raise ValueError(f"Unsupported shape_loss_type={shape_loss_type!r}")
+                shape_valid_tk = (
+                    gt_valid_sel_tk
+                    & (gt_count_tk >= int(shape_min_bev_voxels))
+                    & (gt_axis_ratio_tk >= float(shape_min_gt_axis_ratio))
+                )
+                if bool(shape_valid_tk.any().item()):
+                    shape_raw = shape_raw_tk[shape_valid_tk].mean()
+                    out["dbg_gmo_shape_raw"] = shape_raw.detach()
+                    out["loss_gmo_shape"] = shape_raw * float(shape_loss_weight)
+                    out["dbg_gmo_shape_valid_pair_count"] = shape_valid_tk.sum().to(torch.float32)
+
+                    with torch.no_grad():
+                        pred_eval, pred_vec = torch.linalg.eigh(pred_cov_norm[shape_valid_tk])
+                        gt_eval, gt_vec = torch.linalg.eigh(gt_cov_norm[shape_valid_tk])
+                        axis_dot = (pred_vec[..., :, -1] * gt_vec[..., :, -1]).sum(dim=-1).abs()
+                        angle_deg = torch.rad2deg(torch.acos(axis_dot.clamp(0.0, 1.0)))
+                        out["dbg_gmo_shape_angle_error_deg"] = angle_deg.mean()
+                        out["dbg_gmo_shape_pred_axis_ratio"] = (
+                            pred_eval[..., -1] / pred_eval[..., 0].clamp_min(float(eps))
+                        ).mean()
+                        out["dbg_gmo_shape_gt_axis_ratio"] = (
+                            gt_eval[..., -1] / gt_eval[..., 0].clamp_min(float(eps))
+                        ).mean()
             gt_bbox_tk1zyx = None
             if use_bbox_gt or use_bbox_dice:
                 # pred voxelize는 위에서 1회 완료 — GT lowres만 bbox 소스로 재빌드.
@@ -3171,7 +3469,7 @@ class EfficientOCFLossMixin:
                     elif pair_loss_bbox is not None:
                         pair_loss = pair_loss_bbox
                 if pair_loss is not None:
-                    pair_losses.append(pair_loss)
+                    focal_loss_by_pair[k] = pair_loss
                 if compute_dice:
                     dice_3d = bool(getattr(self, "query_gmo_dice_3d", False))
                     if dice_3d:
@@ -3187,8 +3485,8 @@ class EfficientOCFLossMixin:
                         pred_occ=p_bev,
                         gt_occ=t_bev,
                         valid_mask=valid_bev,
-                        alpha=float(tversky_alpha),
-                        beta=float(tversky_beta),
+                        alpha=pair_tversky_alpha_k[k],
+                        beta=pair_tversky_beta_k[k],
                         eps=float(eps),
                     )
                     if use_bbox_dice and (gt_bbox_tk1zyx is not None):
@@ -3205,8 +3503,8 @@ class EfficientOCFLossMixin:
                             pred_occ=p_bev,
                             gt_occ=tb_bev,
                             valid_mask=valid_bev_bbox,
-                            alpha=float(tversky_alpha),
-                            beta=float(tversky_beta),
+                            alpha=pair_tversky_alpha_k[k],
+                            beta=pair_tversky_beta_k[k],
                             eps=float(eps),
                         )
                         if (dice_loss is not None) and (dice_loss_bbox is not None):
@@ -3219,7 +3517,7 @@ class EfficientOCFLossMixin:
                         elif dice_loss_bbox is not None:
                             dice_loss = dice_loss_bbox
                     if dice_loss is not None:
-                        dice_pair_losses.append(dice_loss)
+                        dice_loss_by_pair[k] = dice_loss
         else:
             dbg_focal_inst3d_vals = []
             dbg_focal_bbox_vals = []
@@ -3285,7 +3583,7 @@ class EfficientOCFLossMixin:
                     elif pair_loss_bbox is not None:
                         pair_loss = pair_loss_bbox
                 if pair_loss is not None:
-                    pair_losses.append(pair_loss)
+                    focal_loss_by_pair[k] = pair_loss
                 if compute_dice:
                     dice_3d = bool(getattr(self, "query_gmo_dice_3d", False))
                     if dice_3d:
@@ -3300,8 +3598,8 @@ class EfficientOCFLossMixin:
                         pred_occ=p_bev,
                         gt_occ=t_bev,
                         valid_mask=valid_bev,
-                        alpha=float(tversky_alpha),
-                        beta=float(tversky_beta),
+                        alpha=pair_tversky_alpha_k[k],
+                        beta=pair_tversky_beta_k[k],
                         eps=float(eps),
                     )
                     if use_bbox_dice and (gt_bbox_k is not None):
@@ -3315,8 +3613,8 @@ class EfficientOCFLossMixin:
                             pred_occ=p_bev[:t_cnt],
                             gt_occ=tb_bev,
                             valid_mask=valid_bev_bbox,
-                            alpha=float(tversky_alpha),
-                            beta=float(tversky_beta),
+                            alpha=pair_tversky_alpha_k[k],
+                            beta=pair_tversky_beta_k[k],
                             eps=float(eps),
                         )
                         if (dice_loss is not None) and (dice_loss_bbox is not None):
@@ -3329,17 +3627,105 @@ class EfficientOCFLossMixin:
                         elif dice_loss_bbox is not None:
                             dice_loss = dice_loss_bbox
                     if dice_loss is not None:
-                        dice_pair_losses.append(dice_loss)
+                        dice_loss_by_pair[k] = dice_loss
 
-        if len(pair_losses) <= 0 and len(dice_pair_losses) <= 0:
+        score_valid_idx = [
+            k for k, pair_dice in enumerate(dice_loss_by_pair)
+            if torch.is_tensor(pair_dice)
+        ]
+        out["dbg_gmo_hard_score_valid_count"] = z.new_tensor(float(len(score_valid_idx)))
+        if bool(hard_pair_enabled) and hard_pair_mode == "loss_topk":
+            hard_mask_k.zero_()
+            if len(score_valid_idx) > 0:
+                score_k = torch.stack(
+                    [dice_loss_by_pair[k].detach().to(torch.float32) for k in score_valid_idx]
+                )
+                topk_count = min(
+                    len(score_valid_idx),
+                    max(
+                        int(hard_min_pairs),
+                        int(math.ceil(float(hard_topk_ratio) * len(score_valid_idx))),
+                    ),
+                )
+                selected_local = torch.topk(
+                    score_k, k=topk_count, largest=True, sorted=False
+                ).indices
+                score_valid_idx_t = torch.as_tensor(
+                    score_valid_idx, device=hard_mask_k.device, dtype=torch.long
+                )
+                selected_pair_idx = score_valid_idx_t.index_select(0, selected_local)
+                hard_mask_k[selected_pair_idx] = True
+                out["dbg_gmo_hard_score_cutoff"] = score_k.index_select(
+                    0, selected_local
+                ).min()
+
+        hard_count = hard_mask_k.sum().to(torch.float32)
+        out["dbg_gmo_hard_all_pair_count"] = hard_count.new_tensor(float(pair_count))
+        out["dbg_gmo_hard_pair_count"] = hard_count
+        out["dbg_gmo_hard_easy_pair_count"] = hard_count.new_tensor(float(pair_count)) - hard_count
+        out["dbg_gmo_hard_large_count"] = (hard_mask_k & large_mask_k).sum().to(torch.float32)
+        out["dbg_gmo_hard_far_count"] = (hard_mask_k & far_mask_k).sum().to(torch.float32)
+        out["dbg_gmo_hard_large_far_count"] = (
+            hard_mask_k & large_mask_k & far_mask_k
+        ).sum().to(torch.float32)
+        out["dbg_gmo_hard_large_valid_count"] = large_valid_k.sum().to(torch.float32)
+        out["dbg_gmo_hard_far_valid_count"] = far_valid_k.sum().to(torch.float32)
+        out["dbg_gmo_hard_pair_ratio"] = hard_count / float(max(1, pair_count))
+        out["dbg_gmo_hard_zero_batch"] = (hard_count <= 0).to(torch.float32)
+        hard_length_valid_k = hard_mask_k & large_valid_k
+        hard_distance_valid_k = hard_mask_k & far_valid_k
+        if bool(hard_length_valid_k.any().item()):
+            out["dbg_gmo_hard_length_mean_m"] = pair_length_k[hard_length_valid_k].mean()
+        if bool(hard_distance_valid_k.any().item()):
+            out["dbg_gmo_hard_distance_mean_m"] = pair_distance_k[hard_distance_valid_k].mean()
+
+        easy_weight = float(hard_easy_weight) if bool(hard_pair_enabled) else 0.0
+
+        def _partition_and_reduce(loss_by_pair):
+            weighted_losses = []
+            total_weight = 0.0
+            hard_values = []
+            easy_values = []
+            for k, pair_loss in enumerate(loss_by_pair):
+                if not torch.is_tensor(pair_loss):
+                    continue
+                is_hard = bool(hard_mask_k[k].item())
+                if is_hard:
+                    hard_values.append(pair_loss.detach())
+                    weight = 1.0
+                else:
+                    easy_values.append(pair_loss.detach())
+                    weight = easy_weight
+                if weight > 0.0:
+                    weighted_losses.append(pair_loss * weight)
+                    total_weight += weight
+            reduced = None
+            if len(weighted_losses) > 0:
+                reduced = torch.stack(weighted_losses, dim=0).sum() / max(total_weight, float(eps))
+            return reduced, hard_values, easy_values, len(weighted_losses)
+
+        pair_loss, hard_focal_vals, easy_focal_vals, focal_train_count = (
+            _partition_and_reduce(focal_loss_by_pair)
+        )
+        dice_pair_loss, hard_dice_vals, easy_dice_vals, dice_train_count = (
+            _partition_and_reduce(dice_loss_by_pair)
+        )
+        if len(hard_focal_vals) > 0:
+            out["dbg_gmo_hard_focal_raw"] = torch.stack(hard_focal_vals).mean()
+        if len(hard_dice_vals) > 0:
+            out["dbg_gmo_hard_dice_raw"] = torch.stack(hard_dice_vals).mean()
+        if len(easy_focal_vals) > 0:
+            out["dbg_gmo_easy_focal_raw"] = torch.stack(easy_focal_vals).mean()
+        if len(easy_dice_vals) > 0:
+            out["dbg_gmo_easy_dice_raw"] = torch.stack(easy_dice_vals).mean()
+        if pair_loss is None and dice_pair_loss is None:
             return out
 
         low_x, low_y, low_z = self.query_matched_gmo_bce_occ_size
-        if len(pair_losses) > 0:
-            pair_loss = torch.stack(pair_losses, dim=0).mean()
+        if pair_loss is not None:
             out[loss_key] = pair_loss * float(loss_weight)
-        if compute_dice and len(dice_pair_losses) > 0:
-            out["loss_gmo_dice"] = torch.stack(dice_pair_losses, dim=0).mean() * float(dice_loss_weight)
+        if compute_dice and dice_pair_loss is not None:
+            out["loss_gmo_dice"] = dice_pair_loss * float(dice_loss_weight)
         if loss_key == "loss_gmo_focal":
             out["dbg_gmo_bce_alias"] = out[loss_key].detach()
         if use_bbox_gt:
@@ -3352,11 +3738,11 @@ class EfficientOCFLossMixin:
                 out["dbg_gmo_dice_inst3d"] = torch.stack(dbg_dice_inst3d_vals, dim=0).mean()
                 out["dbg_gmo_dice_bbox"] = torch.stack(dbg_dice_bbox_vals, dim=0).mean()
             out["dbg_gmo_dice_bbox_pair_count"] = centers_world_tq3.new_tensor(float(len(dbg_dice_bbox_vals)))
-        out["dbg_gmo_bce_pair_count"] = centers_world_tq3.new_tensor(float(len(pair_losses)))
+        out["dbg_gmo_bce_pair_count"] = centers_world_tq3.new_tensor(float(focal_train_count))
         out["dbg_gmo_bce_lowres_x"] = centers_world_tq3.new_tensor(float(low_x))
         out["dbg_gmo_bce_lowres_y"] = centers_world_tq3.new_tensor(float(low_y))
         out["dbg_gmo_bce_lowres_z"] = centers_world_tq3.new_tensor(float(low_z))
-        out["dbg_gmo_dice_pair_count"] = centers_world_tq3.new_tensor(float(len(dice_pair_losses)))
+        out["dbg_gmo_dice_pair_count"] = centers_world_tq3.new_tensor(float(dice_train_count))
         return out
 
     def _build_query_objectness_targets(
@@ -3544,6 +3930,119 @@ class EfficientOCFLossMixin:
             targets[:, mq] = 1.0
         return targets, valid_mask
 
+    def _compute_query_scene_asset_bce_loss(
+        self,
+        *,
+        mixture_centers_world_tqg3: torch.Tensor,
+        mixture_sigmas_world_tqg3: torch.Tensor,
+        mixture_yaw_tqg: torch.Tensor,
+        mixture_weights_tqg: torch.Tensor,
+        query_cls_logits_qc: torch.Tensor,
+        gt_instance_occ3d_txyz: torch.Tensor,
+        present_frame_idx: int,
+        future_frame_count: int,
+        loss_weight: float,
+        pos_weight: float = 1.0,
+        neg_weight: float = 1.0,
+        eps: float = 1e-6,
+    ) -> dict:
+        """Foreground-normalized BCE on one all-query scene per eval frame."""
+        z = mixture_centers_world_tqg3.sum() * 0.0
+        out = {
+            "loss_query_scene_asset_bce": z,
+            "dbg_query_scene_asset_bce_raw": z,
+            "dbg_query_scene_asset_bce_pos_raw": z,
+            "dbg_query_scene_asset_bce_neg_raw": z,
+            "dbg_query_scene_asset_frame_count": z,
+            "dbg_query_scene_asset_pred_mass": z,
+            "dbg_query_scene_asset_gt_mass": z,
+            "dbg_query_scene_asset_pred_gt_mass_ratio": z,
+            "dbg_query_scene_asset_conf_mean": z,
+        }
+        expected_frames = 1 + int(future_frame_count)
+        frame_start = int(present_frame_idx)
+        frame_end = frame_start + expected_frames
+        valid = (
+            mixture_centers_world_tqg3.dim() == 4
+            and tuple(mixture_sigmas_world_tqg3.shape) == tuple(mixture_centers_world_tqg3.shape)
+            and tuple(mixture_yaw_tqg.shape) == tuple(mixture_centers_world_tqg3.shape[:3])
+            and tuple(mixture_weights_tqg.shape) == tuple(mixture_centers_world_tqg3.shape[:3])
+            and query_cls_logits_qc.dim() == 2
+            and int(query_cls_logits_qc.shape[0]) == int(mixture_centers_world_tqg3.shape[1])
+            and int(query_cls_logits_qc.shape[1]) > int(self.query_bg_class)
+            and gt_instance_occ3d_txyz.dim() == 4
+            and frame_start >= 0
+            and frame_end <= int(mixture_centers_world_tqg3.shape[0])
+            and frame_end <= int(gt_instance_occ3d_txyz.shape[0])
+        )
+        if not valid:
+            raise ValueError(
+                "scene asset BCE requires aligned [present + future] mixture/GT tensors; "
+                f"mixture={tuple(mixture_centers_world_tqg3.shape)}, "
+                f"gt={tuple(gt_instance_occ3d_txyz.shape)}, "
+                f"present={frame_start}, frames={expected_frames}"
+            )
+
+        centers = mixture_centers_world_tqg3[frame_start:frame_end]
+        sigmas = mixture_sigmas_world_tqg3[frame_start:frame_end]
+        yaws = mixture_yaw_tqg[frame_start:frame_end]
+        weights = mixture_weights_tqg[frame_start:frame_end]
+        cls_prob_qc = torch.softmax(query_cls_logits_qc.to(torch.float32), dim=-1)
+        confidence_q = (1.0 - cls_prob_qc[:, int(self.query_bg_class)]).clamp(0.0, 1.0)
+        confidence_tq = confidence_q.unsqueeze(0).expand(expected_frames, -1)
+
+        pred_t1zyx = self.matched_gmo_voxelizer.forward_gaussian_mixture_scene(
+            mixture_centers_world_tqg3=centers,
+            mixture_sigmas_world_tqg3=sigmas,
+            mixture_weights_tqg=weights,
+            mixture_yaw_tqg=yaws,
+            pair_weights_tq=confidence_tq,
+            differentiable=True,
+        ).to(torch.float32)
+        gt_t1zyx = (
+            gt_instance_occ3d_txyz[frame_start:frame_end] > 0
+        ).permute(0, 3, 2, 1).unsqueeze(1).to(device=pred_t1zyx.device, dtype=torch.float32)
+        if tuple(gt_t1zyx.shape[-3:]) != tuple(pred_t1zyx.shape[-3:]):
+            gt_t1zyx = F.adaptive_max_pool3d(
+                gt_t1zyx, output_size=tuple(int(v) for v in pred_t1zyx.shape[-3:])
+            )
+
+        pred_safe = pred_t1zyx.clamp(min=float(eps), max=1.0 - float(eps))
+        pos_sum_t = (
+            -gt_t1zyx * torch.log(pred_safe)
+        ).flatten(1).sum(dim=1)
+        neg_sum_t = (
+            -(1.0 - gt_t1zyx) * torch.log1p(-pred_safe)
+        ).flatten(1).sum(dim=1)
+        fg_count_t = gt_t1zyx.flatten(1).sum(dim=1)
+        fg_norm_t = fg_count_t.clamp_min(1.0)
+        pos_raw_t = pos_sum_t / fg_norm_t
+        neg_raw_t = neg_sum_t / fg_norm_t
+        empty_raw_t = float(neg_weight) * neg_sum_t / float(gt_t1zyx[0].numel())
+        frame_loss_t = torch.where(
+            fg_count_t > 0.0,
+            float(pos_weight) * pos_raw_t + float(neg_weight) * neg_raw_t,
+            empty_raw_t,
+        )
+        raw_loss = frame_loss_t.mean()
+
+        pred_mass_t = pred_t1zyx.flatten(1).sum(dim=1)
+        gt_mass_t = fg_count_t
+        out.update({
+            "loss_query_scene_asset_bce": raw_loss * float(loss_weight),
+            "dbg_query_scene_asset_bce_raw": raw_loss.detach(),
+            "dbg_query_scene_asset_bce_pos_raw": pos_raw_t.mean().detach(),
+            "dbg_query_scene_asset_bce_neg_raw": neg_raw_t.mean().detach(),
+            "dbg_query_scene_asset_frame_count": z.new_tensor(float(expected_frames)),
+            "dbg_query_scene_asset_pred_mass": pred_mass_t.mean().detach(),
+            "dbg_query_scene_asset_gt_mass": gt_mass_t.mean().detach(),
+            "dbg_query_scene_asset_pred_gt_mass_ratio": (
+                pred_mass_t / gt_mass_t.clamp_min(1.0)
+            ).mean().detach(),
+            "dbg_query_scene_asset_conf_mean": confidence_q.mean().detach(),
+        })
+        return out
+
     def _aggregate_training_losses(
         self,
         *,
@@ -3558,6 +4057,7 @@ class EfficientOCFLossMixin:
         query_traj_loss,
         query_traj_refine_loss,
         query_attn_cam_score_pack,
+        query_scene_asset_bce_loss,
         # Query predictions
         centers_world,
         centers_world_match_tq3,
@@ -3612,6 +4112,10 @@ class EfficientOCFLossMixin:
         else:
             losses["loss_gmo_focal"] = z
             losses["loss_gmo_dice"] = z
+        if isinstance(query_scene_asset_bce_loss, dict):
+            losses.update(query_scene_asset_bce_loss)
+        else:
+            losses["loss_query_scene_asset_bce"] = z
 
         losses.update(
             self.query_head.compute_multi_gaussian_sigma_reg_loss(
@@ -4177,6 +4681,14 @@ class EfficientOCFLossMixin:
             )
             losses.update(gt2p_instance_labeled_loss)
 
+        # Diagnostic probe: keep matching/rendering intact, but prevent every loss
+        # except rendered shape direction from contributing a gradient.
+        if bool(getattr(self, "query_shape_only_finetune", False)):
+            losses = {
+                k: v for k, v in losses.items()
+                if k == "loss_gmo_shape" or k.startswith("dbg_gmo_shape_")
+            }
+
         # ---- Normalize losses / strip stray dbg entries / namespace ----
         if self.loss_norm:
             for loss_key in losses.keys():
@@ -4202,6 +4714,9 @@ class EfficientOCFLossMixin:
             and (not k.startswith("dbg_query_depth_"))  # depth-head perf (acc/err/entropy)
             and (not k.startswith("dbg_gmo_focal_"))  # focal GT 혼합 모니터 (inst3d/bbox/pair_count)
             and (not k.startswith("dbg_gmo_dice_"))   # dice GT 혼합 모니터 (+기존 pair_count/alpha/beta)
+            and (not k.startswith("dbg_gmo_hard_"))
+            and (not k.startswith("dbg_gmo_easy_"))
+            and (not k.startswith("dbg_query_scene_asset_"))
         ]:
             del losses[k]
         self._namespace_dbg_logs(losses)

@@ -14,10 +14,12 @@
 ├── run.sh  # 학습용 진입 스크립트; config 확인 후 tools/dist_train.sh 호출
 ├── run_eval.sh  # 평가용 진입 스크립트; config/checkpoint 확인 후 tools/dist_test.sh 호출
 ├── train_total.sh  # 8GPU 학습 원클릭 래퍼; CUDA_VISIBLE_DEVICES 지정 후 dist_train.sh 호출
+├── train_ft.sh  # 8GPU asset-union focal/Dice 3epoch fine-tuning 실행기
 ├── eval_total.sh  # 단일 eval 원클릭 래퍼; CONFIG/checkpoint/GPU 값만 수정 후 dist_test.sh 호출
 ├── eval_oracle.sh  # Oracle(GT 치팅) eval 래퍼; EOCF_EVAL_ORACLE_MATCH=1로 query↔GT center Hungarian 선택 → 스코어링 병목 진단
 ├── eval_sweep_thr.sh  # (FG_THR,OCC_THR) 조합 순차 스윕 래퍼; 부분 eval(EOCF_EVAL_MAX_SAMPLES=512)로 짧게 비교, 타 eval 종료 대기 후 시작
-├── data_vis/  # GT 파이프라인 검증 BEV 시각화 PNG (fig1~7=기존 캐시 검증, fign1~3=새 파이프라인 샘플; NOTES 2026-07-10 검증 섹션 참조)
+├── data_vis/  # GT 파이프라인 검증 BEV 시각화 PNG
+│   └── visibility_filter_compare/  # 최초등장 visibility=1 필터 전/후/제거분 D(nusocc)·E(AABB) 7프레임 비교
 ├── data/  # 외부 데이터와 전처리 캐시를 가리키는 심볼릭 링크 모음
 │   ├── efficientocf -> /home/user/jhh/Projects/EfficientOCF/data/efficientocf  # OCF instance/flow 전처리 캐시
 │   ├── efficientocf_bboxcls -> /home/user/jhh/Projects/EOCF_qg_distil_dev/data/efficientocf_bboxcls  # bbox/class 기반 segmentation 캐시
@@ -43,6 +45,13 @@
 │   │   │       ├── seg_cosine_200e.py  # segmentation용 cosine 200epoch 템플릿
 │   │   │       └── seg_cosine_50e.py  # segmentation용 cosine 50epoch 템플릿
 │   │   ├── baselines/  # 2026-07-13 기준 전부 새 GT(efficientocf_gt_f3) 배선 — 구버전 config 8개(full/subset/subset_scale*/subset_attn_cover{,_size,_aabb}) 삭제됨 (CHANGELOG 2026-07-13)
+│   │   │   ├── subset_attn_cover_pyr_aabb_dice3d_new_asset_all_cov_dir.py  # asset-all + offset covariance 장축 direction-only loss 실험
+│   │   │   ├── subset_attn_cover_pyr_aabb_dice3d_new_asset_all_cov_dir_ft.py  # 지정 epoch15 load_from + offset head-only rendered 장축 3epoch 미세조정
+│   │   │   ├── subset_attn_cover_pyr_aabb_dice3d_new_asset_all_ft.py  # full epoch15에서 asset-union focal/Dice만 적용하는 3epoch 미세조정
+│   │   │   ├── subset_attn_cover_pyr_aabb_dice3d_new_asset_all_ft_bce.py  # full epoch15 기반, 현재+미래4 all-query Asset scene BCE 3epoch 미세조정
+│   │   │   ├── subset_attn_cover_pyr_aabb_dice3d_new_asset_all_ft_hard.py  # full epoch15에서 큰(≥6m)·먼(≥30m) matched pair만 asset focal/Dice로 학습하는 3epoch FT
+│   │   │   ├── subset_attn_cover_pyr_aabb_dice3d_new_asset_all_ft_hard_dice.py  # full epoch15에서 raw Dice 상위 30% matched pair만 asset focal/Dice로 학습하는 3epoch FT
+│   │   │   ├── subset_attn_cover_pyr_aabb_dice3d_new_filter.py  # f3 D/E에서 과거3 최초등장 visibility=1 instance를 로드 직후 7프레임 전체 제거하는 정렬 필터 실험
 │   │   │   ├── subset_attn.py  # subset(4000) + camera-attn 충돌 fix. GT는 gt_bbox_aabb(E) 기반 (NOTES/CHANGELOG 2026-07-02, 2026-07-13)
 │   │   │   ├── subset_attn_cover_aabb_dice.py  # subset_attn + σ-matching + dice(tversky) GT 혼합(0.1 inst3d+0.9 AABB, 2D z-collapse) (CHANGELOG 2026-07-07, 2026-07-13)
 │   │   │   ├── subset_attn_cover_pyr_aabb_dice3d.py  # 위 + dice 3D(query_gmo_dice_3d=True) + query cross-attn coarse-to-fine KV 피라미드(3-layer) (CHANGELOG 2026-07-10, 2026-07-13)
@@ -158,7 +167,7 @@
     ├── dist_train.sh  # torch.distributed.run 기반 분산 학습 실행기
     ├── test.py  # config/checkpoint 로드 후 custom test API를 호출하는 평가 엔트리포인트
     ├── train.py  # config 로드, plugin import, runner 구성 후 custom train API를 호출하는 학습 엔트리포인트
-    ├── dbg_probe/  # 체크포인트 오프라인 진단 프로브 모음 (spread/feature/attn/BEV 크기 분석 + BEV 비교 플롯); 사용법은 내부 README.md
+    ├── dbg_probe/  # 체크포인트 오프라인 진단 프로브 모음 (spread/feature/attn/BEV 크기·GMO 장축 분석/paired 시각화); 사용법은 내부 README.md
     ├── gen_data/
     │   ├── gen_bbox_gt_v2.py  # bbox GT 재생성기 (AABB+rotated OBB, [x,y,z,cls,inst], 생성소멸·사람 필터 상속). --split train/--aabb_only/--include_ped_ids(cache-parity id)로 v3 train 캐시도 생성
     │   ├── gen_depth_gt.py  # nuScenes lidar를 카메라로 투영해 depth GT bin 파일 생성

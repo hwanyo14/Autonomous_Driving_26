@@ -605,6 +605,7 @@ class SoftVoxelizerOneAdd(nn.Module):
         mixture_weights_tqg: torch.Tensor,
         mixture_yaw_tqg: torch.Tensor,
         pair_weights_tq: torch.Tensor = None,
+        differentiable: bool = False,
     ) -> torch.Tensor:
         """Accumulate a per-query rotated Gaussian MIXTURE into ONE scene volume.
 
@@ -620,6 +621,8 @@ class SoftVoxelizerOneAdd(nn.Module):
             mixture_weights_tqg:        [T,Q,G]
             mixture_yaw_tqg:            [T,Q,G] (z-axis yaw, radians)
             pair_weights_tq:            optional [T,Q] scalar per query (e.g. score)
+            differentiable: when True, accumulate sparse query patches with
+                scatter-reduce instead of eval-only in-place slice updates.
         Returns:
             occ_t1zyx: [T,1,D,H,W]
         """
@@ -668,6 +671,8 @@ class SoftVoxelizerOneAdd(nn.Module):
         union = self.gaussian_combine_mode == "union"
 
         scene = centers.new_zeros((T, self.D, self.H, self.W))
+        sparse_indices_t = [[] for _ in range(T)] if differentiable else None
+        sparse_values_t = [[] for _ in range(T)] if differentiable else None
         for t in range(T):
             for q in range(Q):
                 cxg, cyg, czg = cx[t, q], cy[t, q], cz[t, q]          # [G]
@@ -706,8 +711,35 @@ class SoftVoxelizerOneAdd(nn.Module):
                     p = (-torch.expm1(-wg.sum(dim=0))).clamp(0.0, 1.0)               # [nx,ny,nz]
                 if pair_w is not None:
                     p = p * pair_w[t, q].clamp(min=0.0)
-                sl = scene[t, z0:z1 + 1, y0:y1 + 1, x0:x1 + 1]
-                scene[t, z0:z1 + 1, y0:y1 + 1, x0:x1 + 1] = torch.maximum(sl, p.permute(2, 1, 0))
+                if differentiable:
+                    lin = (
+                        zz.to(torch.long) * (self.H * self.W)
+                        + yy.to(torch.long) * self.W
+                        + xx.to(torch.long)
+                    ).reshape(-1)
+                    sparse_indices_t[t].append(lin)
+                    sparse_values_t[t].append(p.reshape(-1))
+                else:
+                    sl = scene[t, z0:z1 + 1, y0:y1 + 1, x0:x1 + 1]
+                    scene[t, z0:z1 + 1, y0:y1 + 1, x0:x1 + 1] = torch.maximum(
+                        sl, p.permute(2, 1, 0)
+                    )
+
+        if differentiable:
+            voxel_count = int(self.D * self.H * self.W)
+            scene_frames = []
+            for t in range(T):
+                scene_flat = centers.new_zeros((voxel_count,))
+                if sparse_values_t[t]:
+                    scene_flat = scene_flat.scatter_reduce(
+                        0,
+                        torch.cat(sparse_indices_t[t], dim=0),
+                        torch.cat(sparse_values_t[t], dim=0),
+                        reduce="amax",
+                        include_self=True,
+                    )
+                scene_frames.append(scene_flat.reshape(self.D, self.H, self.W))
+            scene = torch.stack(scene_frames, dim=0)
 
         return scene.unsqueeze(1).to(out_dtype)
 

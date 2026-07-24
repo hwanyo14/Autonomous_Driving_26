@@ -131,6 +131,7 @@ class EfficientOCF(
             num_heads=4,
             num_layers=self.query_transformer_num_layers,
             kv_resolutions=self.query_transformer_kv_resolutions,
+            learnable_kv_downsample=self.query_transformer_learnable_kv_downsample,
             num_cams=6,
             embed_dim=self.query_embed_dim,
             max_time=self.time_receptive_field,
@@ -264,6 +265,12 @@ class EfficientOCF(
 
         self.mean_weight= nn.Parameter(torch.ones(1) * 0.1, requires_grad=True)
         self.max_weight= nn.Parameter(torch.ones(1) * 1.0, requires_grad=True)
+
+        if bool(self.query_offset_only_finetune):
+            for param in self.parameters():
+                param.requires_grad_(False)
+            for param in self.query_head.gaussian_offset_head.parameters():
+                param.requires_grad_(True)
 
     def init_weights(self):
         super().init_weights()
@@ -1793,13 +1800,18 @@ class EfficientOCF(
             return dict(hist_for_iou=cm,
                         hist_for_iou_bbox=np.zeros((2, 2), dtype=np.int64),
                         hist_for_iou_bbox_rot=np.zeros((2, 2), dtype=np.int64),
+                        hist_for_iou_asset=np.zeros((2, 2), dtype=np.int64),
                         height_l1=torch.tensor(0.0),
                         iou_3d=float("nan"), iou_3d_bbox=float("nan"),
                         iou_3d_bbox_rot=float("nan"),
+                        iou_3d_asset=float("nan"),
+                        iou_3d_asset_comps=dict(tp=0.0, fp=0.0, fn=0.0),
                         recall_3d=float("nan"),
                         recall_3d_comps=dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0),
                         recall_3d_rot=float("nan"),
-                        recall_3d_rot_comps=dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0))
+                        recall_3d_rot_comps=dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0),
+                        recall_3d_asset=float("nan"),
+                        recall_3d_asset_comps=dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0))
         empty = _pack(np.zeros((2, 2), dtype=np.int64))
 
         # eval 시각화(EOCF_EVAL_VIS=1)일 때만 attn/cam-gaussian용 디버그 산출물도 함께 반환.
@@ -2014,16 +2026,22 @@ class EfficientOCF(
         iou_3d, recall_3d = float("nan"), float("nan")
         iou_3d_bbox = float("nan")
         iou_3d_bbox_rot = float("nan")
+        iou_3d_asset = float("nan")
+        iou_3d_asset_comps = dict(tp=0.0, fp=0.0, fn=0.0)
         recall_3d_rot = float("nan")
+        recall_3d_asset = float("nan")
         r3d_comps = dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0)
         r3d_rot_comps = dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0)
+        r3d_asset_comps = dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0)
         cm_bbox = np.zeros((2, 2), dtype=np.int64)
         cm_bbox_rot = np.zeros((2, 2), dtype=np.int64)
+        cm_asset = np.zeros((2, 2), dtype=np.int64)
         # bbox GT v2(annotation 재생성: 생성소멸·사람 필터 + rotated OBB) 우선 사용.
         # 없으면 기존 bboxcls 캐시 fallback (rot 메트릭은 v2 전용이라 NaN 유지).
         gt_bbox_rot_src = None
         bbox_bev_vis = None
         _bbox_v2 = self._eval_load_bbox_gt_v2(img_metas)
+        gt_asset_src = self._eval_load_asset_gt(img_metas)
         if isinstance(_bbox_v2, dict):
             gt_bbox_src = _bbox_v2["aabb"]
             gt_bbox_rot_src = _bbox_v2["rot"]
@@ -2042,6 +2060,8 @@ class EfficientOCF(
             gt_bbox_src = gt_bbox_src.to(device=pred_occ3d.device)
         if torch.is_tensor(gt_bbox_rot_src):
             gt_bbox_rot_src = gt_bbox_rot_src.to(device=pred_occ3d.device)
+        if torch.is_tensor(gt_asset_src):
+            gt_asset_src = gt_asset_src.to(device=pred_occ3d.device)
         # 3D nusocc GT = 학습 감독과 동일한 inst3d(dense_inst). raw gt_occ는 box 밖 잔여(평균 +29%)
         # 와 생성소멸 미필터로 모델이 배우지 않는 voxel을 구조적 FN으로 깔아 사용 중단 (NOTES 2026-07-06).
         # inst3d에는 255(ignore)가 없어 valid 마스크도 불필요.
@@ -2095,6 +2115,17 @@ class EfficientOCF(
                             if t_rot > 0 and tuple(rot_bev_t.shape[1:]) == tuple(pred_bev_t.shape[1:]):
                                 cm_bbox_rot = self._binary_occ_cm(
                                     pred_bev_t[:t_rot], rot_bev_t[:t_rot])
+                    asset3d_t = None
+                    if torch.is_tensor(gt_asset_src) and gt_asset_src.dim() == 4:
+                        asset3d_src_t = self._eval_mode_slice(gt_asset_src)
+                        asset3d_t = self._apply_3d_align_sequence(
+                            asset3d_src_t, transpose, fh, fw, fz)
+                        if torch.is_tensor(asset3d_t):
+                            asset_bev_t = asset3d_t.any(dim=1).contiguous()
+                            t_asset = min(int(pred_bev_t.shape[0]), int(asset_bev_t.shape[0]))
+                            if t_asset > 0 and tuple(asset_bev_t.shape[1:]) == tuple(pred_bev_t.shape[1:]):
+                                cm_asset = self._binary_occ_cm(
+                                    pred_bev_t[:t_asset], asset_bev_t[:t_asset])
                     t_eval = min(int(pred_txyz.shape[0]), int(gt3d_t.shape[0]))
                     if t_eval > 0:
                         pred_zyx_t = pred_txyz[:t_eval].permute(0, 3, 2, 1).contiguous()
@@ -2119,6 +2150,13 @@ class EfficientOCF(
                                 # AABB→rot OBB로 교체. rot⊂aabb라 관용이 좁아져 방향까지 맞아야 함.
                                 _, recall_3d_rot, r3d_rot_comps = self._iou_recall_3d(
                                     pred_zyx_t, gt3d_t, bbox3d=rot3d_t[:t_eval], valid3d=valid_arg)
+                            if torch.is_tensor(asset3d_t) and int(asset3d_t.shape[0]) >= t_eval:
+                                asset_arg = asset3d_t[:t_eval]
+                                iou_3d_asset, _, iou_3d_asset_comps = self._iou_recall_3d(
+                                    pred_zyx_t, asset_arg)
+                                # 기존 inst3d는 필수 GT, asset-union은 추가 예측 허용 영역.
+                                _, recall_3d_asset, r3d_asset_comps = self._iou_recall_3d(
+                                    pred_zyx_t, gt3d_t, bbox3d=asset_arg, valid3d=valid_arg)
 
         # ---- eval-time query visualization (opt-in via EOCF_EVAL_VIS) ----
         # metric 계산 뒤로 이동: 4행 비교(eval 실제 pred_bev_t vs aligned AABB GT)를
@@ -2137,12 +2175,16 @@ class EfficientOCF(
             ))
 
         return dict(hist_for_iou=cm_nusocc, hist_for_iou_bbox=cm_bbox,
-                    hist_for_iou_bbox_rot=cm_bbox_rot,
+                    hist_for_iou_bbox_rot=cm_bbox_rot, hist_for_iou_asset=cm_asset,
                     height_l1=torch.tensor(0.0),
                     iou_3d=iou_3d, iou_3d_bbox=iou_3d_bbox,
-                    iou_3d_bbox_rot=iou_3d_bbox_rot, recall_3d=recall_3d,
+                    iou_3d_bbox_rot=iou_3d_bbox_rot, iou_3d_asset=iou_3d_asset,
+                    iou_3d_asset_comps=iou_3d_asset_comps,
+                    recall_3d=recall_3d,
                     recall_3d_comps=r3d_comps,
-                    recall_3d_rot=recall_3d_rot, recall_3d_rot_comps=r3d_rot_comps)
+                    recall_3d_rot=recall_3d_rot, recall_3d_rot_comps=r3d_rot_comps,
+                    recall_3d_asset=recall_3d_asset,
+                    recall_3d_asset_comps=r3d_asset_comps)
 
     @staticmethod
     def _binary_occ_cm(pred_bin, gt_bin):
@@ -2357,6 +2399,23 @@ class EfficientOCF(
             return tok + "_" + lid
         return None
 
+    @staticmethod
+    def _eval_visibility_drop_ids_from_metas(img_metas):
+        import numpy as np
+
+        m = getattr(img_metas, "data", img_metas)
+        while isinstance(m, (list, tuple)) and len(m) > 0:
+            m = getattr(m[0], "data", m[0])
+        if not isinstance(m, dict):
+            return np.zeros((0,), dtype=np.int64)
+        value = getattr(m.get("gt_visibility_drop_ids", None), "data",
+                        m.get("gt_visibility_drop_ids", None))
+        if value is None:
+            return np.zeros((0,), dtype=np.int64)
+        if torch.is_tensor(value):
+            value = value.detach().cpu().numpy()
+        return np.asarray(value, dtype=np.int64).reshape(-1)
+
     def _eval_load_bbox_gt_v2(self, img_metas):
         """eval 전용 bbox GT lazy-load. 기본 소스는 새 GT 파이프라인 산출물
         (tools/gen_data/gen_new_gt_pipeline.py, ./data/efficientocf_gt_f3/GMO) — 폴더 구조/키
@@ -2370,8 +2429,10 @@ class EfficientOCF(
         key = self._eval_sample_key_from_metas(img_metas)
         if key is None:
             return None
+        drop_ids = self._eval_visibility_drop_ids_from_metas(img_metas)
+        cache_key = (key, tuple(int(v) for v in drop_ids.tolist()))
         cache = getattr(self, "_eval_bbox_v2_cache", None)
-        if isinstance(cache, tuple) and cache[0] == key:
+        if isinstance(cache, tuple) and cache[0] == cache_key:
             return cache[1]
         root = os.environ.get("EOCF_BBOX_GT_V2_DIR", "./data/efficientocf_gt_f3/GMO")
         x_dim = int(self.voxelizer.W)
@@ -2399,11 +2460,60 @@ class EfficientOCF(
                     & (a[:, 1] >= 0) & (a[:, 1] < y_dim)
                     & (a[:, 2] >= 0) & (a[:, 2] < z_dim)
                 )
+                if drop_ids.size > 0:
+                    keep &= ~np.isin(a[:, 4], drop_ids)
                 a = a[keep]
                 dense[t, a[:, 0], a[:, 1], a[:, 2]] = torch.from_numpy(a[:, 3]).to(torch.uint8)
             out[name] = dense
-        self._eval_bbox_v2_cache = (key, out)
+        self._eval_bbox_v2_cache = (cache_key, out)
         return out
+
+    def _eval_load_asset_gt(self, img_metas):
+        """Eval-only asset-union GT loader. Returns bool [T,X,Y,Z] or None."""
+        import os
+        import numpy as np
+
+        key = self._eval_sample_key_from_metas(img_metas)
+        if key is None:
+            return None
+        drop_ids = self._eval_visibility_drop_ids_from_metas(img_metas)
+        cache_key = (key, tuple(int(v) for v in drop_ids.tolist()))
+        cache = getattr(self, "_eval_asset_gt_cache", None)
+        if isinstance(cache, tuple) and cache[0] == cache_key:
+            return cache[1]
+        root = os.environ.get(
+            "EOCF_ASSET_GT_DIR",
+            "./data/nuscenes_gmo_full_hybrid_solid_data_v1/val/segmentation_instance3d",
+        )
+        path = os.path.join(root, key + ".npz")
+        if not os.path.exists(path):
+            self._eval_asset_gt_cache = (cache_key, None)
+            return None
+        with np.load(path, allow_pickle=True) as z:
+            frames = list(z["segmentation_instance_saved_list2"])
+        dense = torch.zeros(
+            (len(frames), int(self.voxelizer.W), int(self.voxelizer.H), int(self.voxelizer.D)),
+            dtype=torch.bool,
+        )
+        for t, rows in enumerate(frames):
+            a = np.asarray(rows)
+            if a.dtype == object:
+                a = np.vstack(a) if a.size else np.zeros((0, 5), np.int64)
+            a = np.asarray(a, dtype=np.int64)
+            if a.size == 0 or a.ndim != 2 or a.shape[1] < 5:
+                continue
+            keep = (
+                (a[:, 0] >= 0) & (a[:, 0] < dense.shape[1])
+                & (a[:, 1] >= 0) & (a[:, 1] < dense.shape[2])
+                & (a[:, 2] >= 0) & (a[:, 2] < dense.shape[3])
+                & (a[:, 3] != 7)
+            )
+            if drop_ids.size > 0:
+                keep &= ~np.isin(a[:, 4], drop_ids)
+            a = a[keep]
+            dense[t, a[:, 0], a[:, 1], a[:, 2]] = True
+        self._eval_asset_gt_cache = (cache_key, dense)
+        return dense
 
     def _eval_bbox_cls_occ_txyz(self, segmentation_cls_instance3d=None):
         if segmentation_cls_instance3d is None:
@@ -3138,6 +3248,7 @@ class EfficientOCF(
         center_match_loss = None
         query_traj_loss = None
         query_traj_refine_loss = None
+        query_scene_asset_bce_loss = None
         inst_match_result = None
         base_centers_world_vis_full_tq3 = None
         base_mixture_centers_world_vis_full_tqg3 = None
@@ -3616,6 +3727,21 @@ class EfficientOCF(
                 dice_loss_weight=float(self.query_gmo_dice_loss_weight),
                 tversky_alpha=float(self.query_gmo_tversky_alpha),
                 tversky_beta=float(self.query_gmo_tversky_beta),
+                tversky_size_enabled=bool(self.query_gmo_tversky_size_enabled),
+                tversky_size_start_m=float(self.query_gmo_tversky_size_start_m),
+                tversky_size_end_m=float(self.query_gmo_tversky_size_end_m),
+                tversky_size_alpha_end=float(self.query_gmo_tversky_size_alpha_end),
+                gt_instance_ids=gt_instance_ids,
+                gt_instance_sizes=gt_instance_sizes,
+                gt_instance_dims=gt_instance_dims,
+                hard_pair_enabled=bool(self.query_gmo_hard_pair_enabled),
+                hard_pair_mode=str(self.query_gmo_hard_pair_mode),
+                hard_topk_ratio=float(self.query_gmo_hard_topk_ratio),
+                hard_easy_weight=float(self.query_gmo_hard_easy_weight),
+                hard_min_pairs=int(self.query_gmo_hard_min_pairs),
+                hard_large_min_m=float(self.query_gmo_hard_large_min_m),
+                hard_far_min_m=float(self.query_gmo_hard_far_min_m),
+                hard_present_frame_idx=int(traj_loss_present_local_idx),
                 pair_chunk_size=int(self.query_multi_gaussian_pair_chunk),
                 gt_bbox_aabb_txyz=(
                     _hist_slice(match_gt_bbox_aabb_txyz)
@@ -3625,6 +3751,58 @@ class EfficientOCF(
                 focal_bbox_weight=float(getattr(self, "query_gmo_focal_bbox_weight", 0.0)),
                 dice_inst3d_weight=float(getattr(self, "query_gmo_dice_inst3d_weight", 1.0)),
                 dice_bbox_weight=float(getattr(self, "query_gmo_dice_bbox_weight", 0.0)),
+                compute_shape=bool(getattr(self, "use_query_gmo_shape_loss", False)),
+                shape_loss_weight=float(getattr(self, "query_gmo_shape_loss_weight", 0.0)),
+                shape_loss_type=str(getattr(self, "query_gmo_shape_loss_type", "covariance")),
+                shape_min_bev_voxels=int(getattr(self, "query_gmo_shape_min_bev_voxels", 4)),
+                shape_min_gt_axis_ratio=float(
+                    getattr(self, "query_gmo_shape_min_gt_axis_ratio", 1.0)
+                ),
+                shape_pred_weight_mode=str(
+                    getattr(self, "query_gmo_shape_pred_weight_mode", "equal")
+                ),
+            )
+
+        if bool(getattr(self, "use_query_scene_asset_bce_loss", False)):
+            scene_uses_full_timeline = bool(
+                traj_loss_has_present_anchor
+                and torch.is_tensor(mixture_centers_world_loss_full_tqg3)
+                and torch.is_tensor(gt_instance_occ3d_txyz_query_vis)
+            )
+            scene_centers_tqg3 = (
+                mixture_centers_world_loss_full_tqg3
+                if scene_uses_full_timeline else mixture_centers_world_loss_aligned_tqg3
+            )
+            scene_sigmas_tqg3 = (
+                mixture_sigmas_world_loss_full_tqg3
+                if scene_uses_full_timeline else mixture_sigmas_world_loss_aligned_tqg3
+            )
+            scene_yaw_tqg = (
+                mixture_yaw_loss_full_tqg
+                if scene_uses_full_timeline else mixture_yaw_loss_aligned_tqg
+            )
+            scene_weights_tqg = (
+                mixture_weights_loss_full_tqg
+                if scene_uses_full_timeline else mixture_weights_loss_aligned_tqg
+            )
+            scene_gt_txyz = (
+                gt_instance_occ3d_txyz_query_vis
+                if scene_uses_full_timeline else gt_instance_occ3d_txyz_query
+            )
+            scene_present_idx = int(_query_present_local_idx) if scene_uses_full_timeline else 0
+            query_scene_asset_bce_loss = self._compute_query_scene_asset_bce_loss(
+                mixture_centers_world_tqg3=scene_centers_tqg3,
+                mixture_sigmas_world_tqg3=scene_sigmas_tqg3,
+                mixture_yaw_tqg=scene_yaw_tqg,
+                mixture_weights_tqg=scene_weights_tqg,
+                query_cls_logits_qc=query_cls_logits_qc,
+                gt_instance_occ3d_txyz=scene_gt_txyz,
+                present_frame_idx=scene_present_idx,
+                future_frame_count=int(self.n_future_frames),
+                loss_weight=float(self.query_scene_asset_bce_loss_weight),
+                pos_weight=float(self.query_scene_asset_bce_pos_weight),
+                neg_weight=float(self.query_scene_asset_bce_neg_weight),
+                eps=float(self.query_scene_asset_bce_eps),
             )
 
         if torch.is_tensor(query_cls_scores_tqc) and query_cls_scores_tqc.numel() > 0:
@@ -3778,7 +3956,7 @@ class EfficientOCF(
             query_match_inputs=query_match_inputs,
             inst_match_result=inst_match_result,
             gt_segmentation_instance3d_txyz_fine=gt_instance_occ3d_txyz_query_vis,
-            gt_segmentation_instance3d_txyz_bbox=gt_segmentation_instance3d_txyz_query_vis,
+            gt_segmentation_instance3d_txyz_bbox=gt_bbox_aabb_txyz_query_vis,
             gt_source_start_global=0,
             future_egomotion=future_egomotion,
             img_metas=img_metas,
@@ -3796,6 +3974,7 @@ class EfficientOCF(
             query_traj_loss=query_traj_loss,
             query_traj_refine_loss=query_traj_refine_loss,
             query_attn_cam_score_pack=query_attn_cam_score_pack,
+            query_scene_asset_bce_loss=query_scene_asset_bce_loss,
             centers_world=centers_world,
             centers_world_match_tq3=centers_world_match_tq3,
             centers_world_dt_gt2p_tq3=centers_world_dt_gt2p_tq3,
