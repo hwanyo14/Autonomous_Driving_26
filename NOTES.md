@@ -1,5 +1,17 @@
 # NOTES
 
+## 2026-07-28 KST — trajectory xy-refine은 기본적으로 eval에 적용되지 않는다
+
+- refine head(`query_traj_xy_refine_*`)는 학습 loss 경로에서만 궤적을 보정해 왔다. 따라서
+  체크포인트에 refine 가중치가 있어도 `EOCF_EVAL_TRAJ_REFINE=1`을 주지 않으면 eval/oracle
+  결과는 refine 없는 궤적이다. refine 관련 실험 결과를 해석할 때 이 스위치 값을 먼저 확인할 것.
+- 학습 중에도 `query_traj_xy_refine_loss_weight > 0.0`일 때만 refine이 돈다. warmup 스케줄상
+  epoch 1~4는 weight 0.0이라 그 구간은 refine head가 아예 학습되지 않는다.
+- eval 분기는 `not self.training` 게이트가 필수다. `extract_feat_query`는 train/test 공용이라
+  게이트를 빼면 forward_train의 refine과 이중 적용된다.
+- run 간 비교 시 이 env가 서로 다르면 궤적 지표를 비교할 수 없다 — q200/q400/q900 ablation은
+  세 run 모두 동일 값으로 평가할 것.
+
 ## 2026-07-23 KST — f3 visibility 필터 ID/시간 규칙
 
 - `subset_attn_cover_pyr_aabb_dice3d_new_filter.py`의 제거 조건은 **7프레임 중 임의의

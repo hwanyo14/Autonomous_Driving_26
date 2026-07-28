@@ -1,5 +1,41 @@
 # Changelog
 
+## 2026-07-28 — trajectory xy-refine 추론 적용 스위치 (EOCF_EVAL_TRAJ_REFINE)
+
+- 기존에 `refine_trajectory_absolute_xy`(query_head.py:1620) 호출부는 `forward_train`
+  (efficientocf.py:3550) 하나뿐이라 refine head가 **학습에서만** 적용되고 eval/oracle은 보정 전
+  base 궤적을 썼다(train/eval mismatch, 체크포인트의 refine 가중치는 추론에서 미사용).
+- `extract_feat_query`에서 traj 출력을 꺼낸 직후(efficientocf.py:1173~) opt-in 분기를 추가했다.
+  `EOCF_EVAL_TRAJ_REFINE=1` + `query_traj_xy_refine_enabled=True` + `not self.training`일 때만
+  `traj_offsets_fq2`를 refined offset으로 교체한다. 교체 지점이
+  `_build_query_trajectory_geometry_from_present`와 반환 tuple보다 앞이라 metric·viz·oracle이
+  전부 같은 refined 궤적을 쓴다. 입력 텐서는 train 호출부와 동일(query_feat/cls/centers/present_idx).
+- `not self.training` 게이트는 이중 적용 방지용이다 — 학습 경로는 forward_train이 자체적으로
+  refine을 걸고 center/vis 좌표까지 교체하므로 여기서 또 걸면 안 된다.
+- `eval_total.sh`에 `EOCF_EVAL_TRAJ_REFINE=0`(기본 off = 기존 동작)을 추가했다.
+- 기본값을 off로 둔 이유: on으로 하면 진행 중인 query 수 ablation(200/400/900)의 eval 조건이
+  바뀐다. 비교하려면 세 run 모두 같은 값으로 평가할 것.
+
+## 2026-07-27 — query 수 ablation config (q400 / q900)
+
+- `subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_q{400,900}.py`는 main run
+  (`..._asset_all_filter.py`, query 200)의 복사본이었다. 각각 `query_num_queries=400/900`으로
+  변경했다. 모델 쪽은 `transformer.py`의 `self.query` Parameter와 `query_id_embed`가 이 값으로
+  생성되고 matcher/loss는 전부 Q에 대해 동적이라 코드 수정은 필요 없다. 단 query 수가 바뀌면
+  체크포인트 shape이 달라져 200-query 가중치로는 load/resume 불가(두 config 모두 load_from/
+  resume_from None).
+- `query_cls_loss_class_weights`의 background weight를 1/Q로 스케일: 0.05 → 0.025(q400),
+  0.0111(q900). 근거는 `utils_loss.py:537` `F.cross_entropy(..., weight, reduction='mean')`이
+  가중 평균(Σ w_y·l / Σ w_y)이라는 점. GT 인스턴스 수 M은 그대로인데 unmatched(bg) query만
+  Q에 비례해 늘어나므로 bg weight를 고정하면 (a) bg/fg 손실 질량비와 (b) 정규화 분모(= fg
+  인스턴스당 gradient 크기)가 동시에 변한다. w_bg·(Q−M)을 200-query run과 같게 맞추면 cls loss
+  자체가 Q에 대해 거의 불변이 되어 ablation의 단일 변수가 "query 수"로 유지된다.
+- 두 config의 `visualization_cfg`/debug 출력 경로 4개가 main run work_dir을 그대로 가리키고
+  있어 `..._asset_all_filter_q400/`, `..._asset_all_filter_q900/`로 분리했다.
+- 참고(미변경): `fg_score_topk`는 config에 없어 기본값 50이 적용된다 — query를 늘려도 eval은
+  상위 50개만 사용하므로 세 run 공통 상한이다. query 수 증가 비용은 cross-attn attn weight
+  `[T,Q,S]`(S = 6×56×100 = 33,600)에 선형이고, gaussian voxelizer는 matched pair 기준이라 무관.
+
 ## 2026-07-23 19:58 KST — asset-all 학습 config visibility 필터 적용
 
 - `subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter.py`의 train/test dataset과
