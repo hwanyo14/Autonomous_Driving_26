@@ -1170,6 +1170,28 @@ class EfficientOCF(
         traj_mode_logits_qk = query_head_outputs.get("traj_mode_logits_qk", None)
         traj_mode_idx_q = query_head_outputs.get("traj_mode_idx_q", None)
 
+        # trajectory xy-refine을 추론에도 적용 (opt-in EOCF_EVAL_TRAJ_REFINE=1).
+        # 기본 0 = 기존 동작(refine은 forward_train에서만 적용, eval은 base offset).
+        # 학습 경로는 forward_train이 자체적으로 refine을 걸므로 not self.training으로 배제 —
+        # 여기서 같이 적용하면 이중 적용됨. 입력은 train(efficientocf.py 3550 호출)과 동일한
+        # query_feat/cls/centers/present_idx이며, 여기서 traj_offsets_fq2를 교체하면 아래
+        # _build_query_trajectory_geometry_from_present와 반환 tuple 전체가 refined 궤적을 쓴다.
+        if (
+            (not self.training)
+            and os.environ.get("EOCF_EVAL_TRAJ_REFINE", "0") == "1"
+            and bool(getattr(self, "query_traj_xy_refine_enabled", False))
+            and torch.is_tensor(traj_offsets_fq2)
+        ):
+            _, eval_refined_traj_offsets_fq2, _ = self.query_head.refine_trajectory_absolute_xy(
+                query_feat_tqd=query_future_feat_tqd,
+                query_cls_scores_qc=query_cls_scores_qc,
+                centers_world_tq3=centers_world,
+                pred_traj_offsets_fq2=traj_offsets_fq2,
+                present_local_idx=int(query_present_local_idx),
+            )
+            if torch.is_tensor(eval_refined_traj_offsets_fq2):
+                traj_offsets_fq2 = eval_refined_traj_offsets_fq2
+
         present_centers_world_tq3 = centers_world.narrow(0, query_present_local_idx, 1).contiguous()
         present_sigmas_world_tq3 = (
             gaussian_sigmas_world.narrow(0, query_present_local_idx, 1).contiguous()

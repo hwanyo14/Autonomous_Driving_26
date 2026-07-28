@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-07-28 — trajectory xy-refine 추론 적용 스위치 (EOCF_EVAL_TRAJ_REFINE)
+
+- 기존에 `refine_trajectory_absolute_xy`(query_head.py:1620) 호출부는 `forward_train`
+  (efficientocf.py:3550) 하나뿐이라 refine head가 **학습에서만** 적용되고 eval/oracle은 보정 전
+  base 궤적을 썼다(train/eval mismatch, 체크포인트의 refine 가중치는 추론에서 미사용).
+- `extract_feat_query`에서 traj 출력을 꺼낸 직후(efficientocf.py:1173~) opt-in 분기를 추가했다.
+  `EOCF_EVAL_TRAJ_REFINE=1` + `query_traj_xy_refine_enabled=True` + `not self.training`일 때만
+  `traj_offsets_fq2`를 refined offset으로 교체한다. 교체 지점이
+  `_build_query_trajectory_geometry_from_present`와 반환 tuple보다 앞이라 metric·viz·oracle이
+  전부 같은 refined 궤적을 쓴다. `not self.training` 게이트는 forward_train과의 이중 적용 방지용.
+- `eval_total.sh` / `eval_oracle.sh` 양쪽에 `EOCF_EVAL_TRAJ_REFINE=1`을 추가했다. 두 스크립트는
+  항상 같은 값이어야 한다 — 다르면 oracle vs baseline 비교에 궤적 보정 유무가 섞인다.
+- 자매 레포 `Autonomous_Driving_26_filter_ablation_query`에도 동일 변경 적용(삽입부 diff 없음).
+
 ## 2026-07-23 19:58 KST — asset-all 학습 config visibility 필터 적용
 
 - `subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter.py`의 train/test dataset과

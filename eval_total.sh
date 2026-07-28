@@ -2,18 +2,20 @@
 set -euo pipefail
 
 # ----- 대상 config / checkpoint / GPU -----
-CONFIG=./projects/configs/baselines/subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter.py
-CHECKPOINT=./work_dirs/subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter/latest.pth
+CONFIG=./projects/configs/baselines/full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter.py
+CHECKPOINT=./work_dirs/full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter/latest.pth
 GPUS=8
 export PORT=50632
 
 # ----- 평가 동작 -----
 export EOCF_EVAL_MODE=1            # 기준 프레임: 0=present(현재 1) / 1=future(미래 n_future). metric·viz 공통
-export EOCF_EVAL_OCC_THR=0.9    # occ 점유 threshold. config eval_occ_threshold override
-export EOCF_EVAL_FG_THR=0.75     # foreground(query) score threshold
+export EOCF_EVAL_OCC_THR=0.95    # occ 점유 threshold. config eval_occ_threshold override
+export EOCF_EVAL_FG_THR=0.8     # foreground(query) score threshold
 export EOCF_EVAL_NMS_RADIUS=0      # distance NMS 반경(m). 0=off (스윕 승자 A 조합) / 주석처리=config 3.0m
-# export EOCF_EVAL_WEIGHT_MODE=ones # 렌더 가중치 1.0 고정(fg/occ 독립화 실험용). 기본=score
+export EOCF_EVAL_WEIGHT_MODE=ones # 렌더 가중치 1.0 고정(fg/occ 독립화 실험용). 기본=score
 export EOCF_EVAL_MAX_SAMPLES=512 # 부분 eval: N샘플 후 조기 종료 (fixed_val이라 run간 비교 가능)
+export EOCF_EVAL_TRAJ_REFINE=1     # trajectory xy-refine head를 추론에도 적용. 0=off(기존 동작, 학습 전용) / 1=on
+                                   # config의 query_traj_xy_refine_enabled=True일 때만 의미 있음. oracle에도 동일 적용됨
 
 # ----- 시각화 (2D query_debug_vis + 3D mixture3d) -----
 export EOCF_EVAL_VIS=1             # 1=켜기 / 0=끄기

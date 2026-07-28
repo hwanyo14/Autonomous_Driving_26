@@ -16,6 +16,9 @@ export PORT=50091
 export EOCF_EVAL_MODE=1            # 0=present / 1=future. baseline과 동일하게 future.
 export EOCF_EVAL_OCC_THR=0.95      # baseline과 동일 occ threshold.
 export EOCF_EVAL_MAX_SAMPLES=512
+export EOCF_EVAL_TRAJ_REFINE=1     # trajectory xy-refine head를 추론에도 적용. 0=off(학습 전용) / 1=on
+                                   # baseline(eval_total.sh)과 반드시 같은 값으로 둘 것 — 다르면 oracle vs baseline
+                                   # 비교가 "선택 방식" 차이가 아니라 궤적 보정 유무 차이까지 섞인다.
 
 
 # ----- Oracle 선택 (이 스크립트의 핵심) -----
