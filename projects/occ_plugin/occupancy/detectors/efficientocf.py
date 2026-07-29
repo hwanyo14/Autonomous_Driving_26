@@ -2,6 +2,7 @@
 # Spatiotemporal Decoupling for Efficient Vision-Based Occupancy Forecasting
 # https://github.com/BIT-XJY/EfficientOCF
 
+import os
 import torch
 import torch.nn as nn
 
@@ -2061,7 +2062,7 @@ class EfficientOCF(
         # bbox GT v2(annotation 재생성: 생성소멸·사람 필터 + rotated OBB) 우선 사용.
         # 없으면 기존 bboxcls 캐시 fallback (rot 메트릭은 v2 전용이라 NaN 유지).
         gt_bbox_rot_src = None
-        bbox_bev_vis = None
+        asset_bev_vis = None
         _bbox_v2 = self._eval_load_bbox_gt_v2(img_metas)
         gt_asset_src = self._eval_load_asset_gt(img_metas)
         if isinstance(_bbox_v2, dict):
@@ -2121,7 +2122,6 @@ class EfficientOCF(
                             bbox3d_src_t, transpose, fh, fw, fz)
                         if torch.is_tensor(bbox3d_t):
                             bbox_bev_t = bbox3d_t.any(dim=1).contiguous()
-                            bbox_bev_vis = bbox_bev_t   # eval 비교 시각화(4행)용
                             t_bbox = min(int(pred_bev_t.shape[0]), int(bbox_bev_t.shape[0]))
                             if t_bbox > 0 and tuple(bbox_bev_t.shape[1:]) == tuple(pred_bev_t.shape[1:]):
                                 cm_bbox = self._binary_occ_cm(
@@ -2144,6 +2144,7 @@ class EfficientOCF(
                             asset3d_src_t, transpose, fh, fw, fz)
                         if torch.is_tensor(asset3d_t):
                             asset_bev_t = asset3d_t.any(dim=1).contiguous()
+                            asset_bev_vis = asset_bev_t   # eval 비교 시각화(4행)용
                             t_asset = min(int(pred_bev_t.shape[0]), int(asset_bev_t.shape[0]))
                             if t_asset > 0 and tuple(asset_bev_t.shape[1:]) == tuple(pred_bev_t.shape[1:]):
                                 cm_asset = self._binary_occ_cm(
@@ -2181,7 +2182,7 @@ class EfficientOCF(
                                     pred_zyx_t, gt3d_t, bbox3d=asset_arg, valid3d=valid_arg)
 
         # ---- eval-time query visualization (opt-in via EOCF_EVAL_VIS) ----
-        # metric 계산 뒤로 이동: 4행 비교(eval 실제 pred_bev_t vs aligned AABB GT)를
+        # metric 계산 뒤로 이동: 4행 비교(eval 실제 pred_bev_t vs aligned asset-union GT)를
         # 채점에 쓴 텐서 그대로 넘기기 위함 — threshold/정렬/기준프레임 정의상 동일.
         self._maybe_save_eval_query_vis(
             pred_occ_prob=_pred_occ_vis, gt_inst=gt_inst, centers_world=centers_world,
@@ -2192,8 +2193,8 @@ class EfficientOCF(
             eval_mode=eval_mode, centers_future_tq3=centers_eval_tq3,
             pred_occ_future=pred_occ_eval, mix_future=mix_future,
             eval_cmp_pack=(
-                dict(pred_bev_t=pred_bev_t.detach(), gt_bev_t=bbox_bev_vis.detach())
-                if torch.is_tensor(bbox_bev_vis) else None
+                dict(pred_bev_t=pred_bev_t.detach(), gt_bev_t=asset_bev_vis.detach())
+                if torch.is_tensor(asset_bev_vis) else None
             ))
 
         return dict(hist_for_iou=cm_nusocc, hist_for_iou_bbox=cm_bbox,

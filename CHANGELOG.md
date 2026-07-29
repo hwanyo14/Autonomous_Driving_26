@@ -1845,3 +1845,22 @@ py_compile 통과. 시각화 전용이라 학습/평가 수치 영향 없음.
   `epoch_2_lss_only.pth`에서 resume하도록 연결했다.
 - checkpoint의 epoch/iteration, optimizer 및 LR scheduler 진행 상태를 복구하여
   warmup을 재실행하지 않고 epoch 3 학습을 이어간다.
+
+### 2026-07-29 09:50 KST — eval NameError 수정
+
+- `efficientocf.py` `extract_feat_query`에서 `EOCF_EVAL_TRAJ_REFINE` 환경변수를 읽을 때 `NameError: name 'os' is not defined`로 eval이 죽던 문제를 수정했다.
+- 모듈 상단에 `import os`를 추가했다 (기존에는 일부 함수 내부에서만 local import 되어 있었음).
+
+### 2026-07-29 10:20 KST — eval query_debug_vis 4행 GT를 AABB→asset-union으로 교체
+
+- `efficientocf.py simple_test`의 `eval_cmp_pack`이 넘기던 `gt_bev_t`를 `bbox_bev_vis`(AABB BEV)에서 `asset_bev_vis`(asset-union BEV, `hist_for_iou_asset`/`iou_3d_asset` 채점에 쓰는 텐서 그대로)로 변경했다. align/eval_mode 슬라이스는 동일 경로.
+- 더 이상 쓰이지 않는 `bbox_bev_vis` 변수를 제거했다.
+- `query_head.py`의 4행 라벨을 `pred occ vs bbox_aabb` → `pred occ vs asset`로 수정했다.
+- asset GT의 pedestrian(cls 7)은 `_eval_load_asset_gt`에서 이미 로드 시 제외되고 있어 별도 필터 추가는 없음.
+
+### 2026-07-29 11:05 KST — ep20 연장 학습용 config 분리
+
+- `projects/configs/baselines/full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_ep20.py` 추가 (기존 filter config 복사본).
+- `max_epochs` 15 → 20. cosine은 `epoch/max_epochs`로 매 epoch 새로 계산되므로 ep15에서 resume하면 ep16 진행률 15/20=0.75 → LR 3.6e-6 → 4.4e-5로 warm restart (원래 ep12 수준). base LR 3e-4는 ckpt optimizer의 `initial_lr`로 보존됨.
+- work_dir은 config 파일명 기준 자동 분리(`work_dirs/..._ep20/`). debug vis 4개 경로도 동일 폴더로 변경해 기존 run 산출물과 섞이지 않게 함.
+- 학습은 `--resume work_dirs/full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter/epoch_15_lss_only.pth`로 구 work_dir의 ckpt에서 이어받고, 저장만 새 폴더로 간다.

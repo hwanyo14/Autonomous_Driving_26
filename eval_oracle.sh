@@ -7,15 +7,15 @@ set -euo pipefail
 # "스코어링이 병목인지" 진단한다. (oracle ≫ baseline → 스코어링 문제 / 비슷 → shape·매칭 문제)
 
 # ----- 대상 config / checkpoint / GPU -----
-CONFIG=./projects/configs/baselines/full_attn_cover_pyr_aabb_dice3d_new.py
-CHECKPOINT=/home/hwanhee/Autonomous_Driving_26_new_data/work_dirs/full_attn_cover_pyr_aabb_dice3d_new/epoch_15_lss_only.pth
+CONFIG=./projects/configs/baselines/full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter.py
+CHECKPOINT=./work_dirs/full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter/epoch_15_lss_only.pth
 GPUS=8
 export PORT=50091
 
 # ----- 평가 동작 (baseline과 동일하게 맞춰 공정 비교) -----
 export EOCF_EVAL_MODE=1            # 0=present / 1=future. baseline과 동일하게 future.
-export EOCF_EVAL_OCC_THR=0.95      # baseline과 동일 occ threshold.
-export EOCF_EVAL_MAX_SAMPLES=512
+export EOCF_EVAL_OCC_THR=0.75      # baseline과 동일 occ threshold.
+export EOCF_EVAL_MAX_SAMPLES=768
 export EOCF_EVAL_TRAJ_REFINE=1     # trajectory xy-refine head를 추론에도 적용. 0=off(학습 전용) / 1=on
                                    # baseline(eval_total.sh)과 반드시 같은 값으로 둘 것 — 다르면 oracle vs baseline
                                    # 비교가 "선택 방식" 차이가 아니라 궤적 보정 유무 차이까지 섞인다.

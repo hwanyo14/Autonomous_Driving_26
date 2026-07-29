@@ -427,7 +427,7 @@ grid_config = {
     'dbound': [2.0, 58.0, 0.5],
 }
 
-bev_feat_dim = 96
+bev_feat_dim = 128
 numC_Trans = bev_feat_dim
 
 gn_cfg = dict(type='GN', num_groups=16, requires_grad=True)

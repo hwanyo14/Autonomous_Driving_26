@@ -3926,7 +3926,7 @@ class QueryHead(nn.Module):
             draw.text((x0 + 2, y2 + 2), f"hi(class)={stats_hi[t]}", fill=(255, 255, 255))
             draw.text(
                 (x0 + 2, y3 + 2),
-                (f"pred occ vs bbox_aabb  IoU={eval_cmp_iou_t[t]:.3f}"
+                (f"pred occ vs asset  IoU={eval_cmp_iou_t[t]:.3f}"
                  if t < len(eval_cmp_iou_t) else f"matched={stats_matched[t]}"),
                 fill=(255, 255, 255))
             if not skip_traj_rows:
