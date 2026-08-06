@@ -1,5 +1,30 @@
 # NOTES
 
+## 2026-07-28 KST — 입력 해상도를 바꿀 때 반드시 같이 봐야 하는 것들
+
+- **kv_resolutions 불일치는 크래시가 아니라 조용한 성능/메모리 손실이다.** `transformer.py:236`의
+  ValueError 가드는 `if self.learnable_kv_downsample and ...` 조건 안에 있는데
+  `query_transformer_learnable_kv_downsample` 기본값이 False(`efficientocf_config.py:217`)라
+  현재 baseline config들에선 **가드가 꺼져 있다**. `input_size`만 바꾸고 kv를 안 고치면
+  `_build_layer_kv_tokens`가 `adaptive_avg_pool2d`로 조용히 보간한다. 실측: context 16x44인데
+  kv를 `((14,25),(28,50),(56,100))`로 두면 KV token이 4224→33600으로 부풀고 학습은 그대로 돈다.
+  → 해상도 변경 시 `input_size/16 == kv_resolutions[-1]`을 **손으로 확인할 것.**
+- **σ-matching은 해상도에 종속적인 loss다.** σ를 attn map 해상도에서 2차 모멘트로 계산하므로
+  (`utils_loss.py` `_compute_query_attn_bbox_loss` 내부) 해상도를 내리면 GT cam mask 면적이
+  제곱으로 줄어든다(56x100→16x44 = 12.25배). 이때 `min_mask_px=4`를 유지하면 대부분 게이트에
+  걸려 loss가 사실상 안 걸리고, 1로 낮추면 1~2px 마스크의 σ가 `sig_floor=0.25`로 clamp돼
+  "폭을 0.25px로 좁혀라"는 **가짜 타깃**이 생겨 attn이 점으로 붕괴할 수 있다. 저해상도에선
+  weight를 0으로 명시적으로 끄는 게 맞다. `min_mask_px`는 해상도별로 재캘리브레이션 대상.
+- **`input_size` 변경은 단일변수가 아니다.** `crop_h=(0.0,0.0)`이 bottom-align이라 종횡비가
+  바뀌면 FoV(상단 잘림 비율)가 같이 바뀐다. 896x1600은 상단 4줄, 256x704는 상단 140줄(35%).
+  FoV 자체는 안전하지만(버려지는 광선이 z-max 복셀 천장 밖) 해상도 실험 결과를 볼 때
+  "해상도 + FoV + σ-matching" 세 축이 동시에 움직였음을 감안해야 한다.
+- **이 레포 고유의 저해상도 비용**: 표준 BEVDet엔 없는 camera-attn 감독이 있어서, attn map 해상도가
+  곧 GT cam mask 해상도다. 16x44에서는 작은 객체 마스크가 아예 비어버릴 수 있어
+  `query_attn_bbox_*`와 `inside_log` 매칭 cost 품질이 전반 하락한다. BEV IoU만 보고
+  "저해상도도 쓸 만하다"고 결론내면 안 된다.
+- 상세: `RES704_ABLATION.md`, CHANGELOG 2026-07-28 동일 항목.
+
 ## 2026-07-28 KST — trajectory xy-refine은 기본적으로 eval에 적용되지 않는다
 
 - refine head(`query_traj_xy_refine_*`)는 학습 loss 경로에서만 궤적을 보정해 왔다. 따라서

@@ -1,5 +1,52 @@
 # Changelog
 
+## 2026-07-28 (2) — res704 전처리 시각화 + 문서 보강 (코드 변경 없음)
+
+- `data_vis/res704_preprocess/` 신설. `make_res704_vis.py`가 `loading_bevdet.py`의
+  `sample_augmentation`(190-215) / `img_transform_core`(138-146) 로직을 그대로 복제해
+  val 샘플 1개(token `1232e4600cb4400db443ae7e6a710c1c`, 근거리 덤프트럭 포함)로 PNG 4장 생성.
+  01=원본 위 crop 영역, 02=6-cam 실제 입력, 03=base vs res704 동일 ROI 비교, 04=train jitter 범위.
+- **검증**: BEVDet 공식 Occ3D config(`bevdet-occ-r50-4d-stereo-24e.py`)의 `data_config`가
+  input_size (256,704) / src_size (900,1600) / resize (-0.06,0.11) / crop_h (0.0,0.0) /
+  resize_test 0.00 으로 이 config와 **완전 일치**. (flip만 True→False, 이 레포는 forecasting
+  때문에 `sample_augmentation`에서 flip 강제 None.)
+- **RES704_ABLATION.md에 누락 2건 추가** (§4, §6):
+  1. `data_config['resize']` jitter가 **가산(additive)** 이라 상대 증강 강도가 base 대비 2.3배.
+     base(fW/W=1.0) 상대 [-6.0%,+11.0%] vs res704(fW/W=0.44) 상대 [-13.6%,+25.0%].
+     → base와 res704는 augmentation 강도도 다르다. §6 "단일변수 아님" 목록의 4번째 축.
+  2. §4의 "상단 35% drop"은 test/nominal 값. train에서는 jitter에 따라 25.1%~48.3%로 변동.
+  + jitter<0(약 35% 샘플)일 때 `crop_w` 창이 이미지보다 넓어 우측 최대 96px 검정 패딩.
+    절대폭은 base와 동일하나 비율은 6%→13.6%. 단, base는 여기에 더해 `crop_h=-50`(음수)로
+    상단에도 검정 패딩이 생겼고 res704는 crop_h가 항상 양수라 이 문제가 없음.
+
+## 2026-07-28 — 입력 해상도 ablation config 작성 (896x1600 → 256x704)
+
+- `projects/configs/baselines/full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_res704.py`를
+  베이스(`..._filter.py`, 파생 시점 byte-identical)에서 config만 수정해 만들었다. **플러그인/모델
+  코드 변경 없음.** 상세 근거·검증 내역은 `RES704_ABLATION.md`.
+- 변경 4곳: (1) `data_config['input_size']` `(896,1600)`→`(256,704)`,
+  (2) `query_transformer_kv_resolutions` `((14,25),(28,50),(56,100))`→`((4,11),(8,22),(16,44))`,
+  (3) `query_attn_sigma_match_loss_weight` `0.25`→`0.0`,
+  (4) `visualization_cfg` work_dirs 3개에 `_res704` suffix(베이스 run과 출력 충돌 방지).
+  model_cfg 나머지·GT 경로·loss weight·optimizer·lr·traj warmup은 전부 동일.
+- resize 배율, LSS frustum, depth GT downsample, transformer pos embed(sin-cos 동적 생성)는
+  전부 `input_size`에서 파생돼 수정 불필요함을 코드에서 확인했다. 플러그인 전체 grep 결과
+  하드코딩된 `896`/`1600`/`56,100` 없음.
+- ⚠️ **kv_resolutions는 안 고쳐도 크래시하지 않는다.** `transformer.py:236`의 ValueError 가드는
+  `learnable_kv_downsample`이 True일 때만 걸리는데 기본값이 False(`efficientocf_config.py:217`)다.
+  옛 값을 두면 `adaptive_avg_pool2d`가 16x44 feature를 56x100으로 업샘플해 KV token이
+  4224→33600으로 부풀며 조용히 학습된다(실측). NOTES 동일 날짜 항목 참조.
+- σ-matching은 attn map 해상도가 56x100→16x44로 내려가 GT cam mask 면적이 12.25배 줄어들면서
+  `min_mask_px=4` 게이트와 `sig_floor=0.25px` clamp 양쪽 다 성립하지 않아 **의도적으로 껐다**.
+  이 run은 베이스의 `_cover` 실험축이 빠진 상태이므로 성능 차이를 전부 해상도 탓으로 돌리면 안 된다.
+- FoV는 `crop_h=(0.0,0.0)` bottom-align이라 상단 35%(원본 318줄)가 잘린다. 버려지는 +7.8°~+21.2°
+  광선은 24m 이후 z-max(3.0) 복셀 천장을 벗어나 어떤 voxel에도 기여하지 않아 LSS 볼륨 기하와
+  정합적이다. BEVDet/Occ3D 계열이 512x1408·640x1600에서도 같은 비율을 자르는 것과 동일한 설계.
+- 검증(`eo` 환경): config 파싱, `input_size/16 == kv[-1]`, SECONDFPN 4브랜치 전부 16x44 정수 수렴,
+  kv 피라미드 3단계 전부 exact avg_pool, `TransformerModule._build_layer_kv_tokens` 실호출 시
+  token shape `[(3,264,96),(3,1056,96),(3,4224,96)]` 기대값 일치까지 확인. **학습 1 iteration
+  end-to-end는 미실행** — 첫 run에서 로그와 GPU 메모리 확인 필요.
+
 ## 2026-07-28 — trajectory xy-refine 추론 적용 스위치 (EOCF_EVAL_TRAJ_REFINE)
 
 - 기존에 `refine_trajectory_absolute_xy`(query_head.py:1620) 호출부는 `forward_train`

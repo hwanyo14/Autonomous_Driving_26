@@ -10,6 +10,7 @@
 ├── CHANGELOG.md  # 코드 수정/구현 기록
 ├── DATA_PREPROCESSING.md  # GT 캐시(efficientocf_gt/_f3) 전처리 절차 — 실행 파일·명령·순서·검증 기록 (재현용, 2026-07-13 확정)
 ├── NOTES.md  # 구현 중 주의사항·경고·후속 작업 메모
+├── RES704_ABLATION.md  # 입력 해상도 896x1600→256x704 ablation 근거·검증·주의사항 (2026-07-28)
 ├── GUIDE.pdf  # 실험/사용 가이드 문서
 ├── run.sh  # 학습용 진입 스크립트; config 확인 후 tools/dist_train.sh 호출
 ├── run_eval.sh  # 평가용 진입 스크립트; config/checkpoint 확인 후 tools/dist_test.sh 호출
@@ -19,7 +20,13 @@
 ├── eval_oracle.sh  # Oracle(GT 치팅) eval 래퍼; EOCF_EVAL_ORACLE_MATCH=1로 query↔GT center Hungarian 선택 → 스코어링 병목 진단
 ├── eval_sweep_thr.sh  # (FG_THR,OCC_THR) 조합 순차 스윕 래퍼; 부분 eval(EOCF_EVAL_MAX_SAMPLES=512)로 짧게 비교, 타 eval 종료 대기 후 시작
 ├── data_vis/  # GT 파이프라인 검증 BEV 시각화 PNG
-│   └── visibility_filter_compare/  # 최초등장 visibility=1 필터 전/후/제거분 D(nusocc)·E(AABB) 7프레임 비교
+│   ├── visibility_filter_compare/  # 최초등장 visibility=1 필터 전/후/제거분 D(nusocc)·E(AABB) 7프레임 비교
+│   └── res704_preprocess/  # res704 입력 전처리(resize+crop) 시각화 — RES704_ABLATION.md §4 근거
+│       ├── make_res704_vis.py  # loading_bevdet.py sample_augmentation/img_transform_core 복제 생성기
+│       ├── 01_fov_crop_CAM_FRONT.png  # 원본 900x1600 위에 살아남는 영역 / 버려지는 상단 318px
+│       ├── 02_sixcam_res704.png  # 6-cam 256x704 최종 입력 (네트워크가 실제로 보는 것)
+│       ├── 03_base_vs_res704.png  # base 896x1600 vs res704 동일 실세계 ROI 픽셀 밀도 비교
+│       └── 04_train_jitter.png  # train resize jitter min/nom/max → top-drop 25.1/35.4/48.3%
 ├── data/  # 외부 데이터와 전처리 캐시를 가리키는 심볼릭 링크 모음
 │   ├── efficientocf -> /home/user/jhh/Projects/EfficientOCF/data/efficientocf  # OCF instance/flow 전처리 캐시
 │   ├── efficientocf_bboxcls -> /home/user/jhh/Projects/EOCF_qg_distil_dev/data/efficientocf_bboxcls  # bbox/class 기반 segmentation 캐시
@@ -45,6 +52,7 @@
 │   │   │       ├── seg_cosine_200e.py  # segmentation용 cosine 200epoch 템플릿
 │   │   │       └── seg_cosine_50e.py  # segmentation용 cosine 50epoch 템플릿
 │   │   ├── baselines/  # 2026-07-13 기준 전부 새 GT(efficientocf_gt_f3) 배선 — 구버전 config 8개(full/subset/subset_scale*/subset_attn_cover{,_size,_aabb}) 삭제됨 (CHANGELOG 2026-07-13)
+│   │   │   ├── full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_res704.py  # [해상도 ablation] 위 filter config에서 input_size만 896x1600→256x704 (+kv 피라미드 (4,11)/(8,22)/(16,44), σ-matching off). 근거·주의사항은 RES704_ABLATION.md
 │   │   │   ├── subset_attn_cover_pyr_aabb_dice3d_new_asset_all_cov_dir.py  # asset-all + offset covariance 장축 direction-only loss 실험
 │   │   │   ├── subset_attn_cover_pyr_aabb_dice3d_new_asset_all_cov_dir_ft.py  # 지정 epoch15 load_from + offset head-only rendered 장축 3epoch 미세조정
 │   │   │   ├── subset_attn_cover_pyr_aabb_dice3d_new_asset_all_ft.py  # full epoch15에서 asset-union focal/Dice만 적용하는 3epoch 미세조정
