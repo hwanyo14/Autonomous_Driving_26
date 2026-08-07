@@ -52,6 +52,7 @@
 │   │   │   ├── subset_attn_cover_pyr_aabb_dice3d_new_asset_all_ft_hard.py  # full epoch15에서 큰(≥6m)·먼(≥30m) matched pair만 asset focal/Dice로 학습하는 3epoch FT
 │   │   │   ├── subset_attn_cover_pyr_aabb_dice3d_new_asset_all_ft_hard_dice.py  # full epoch15에서 raw Dice 상위 30% matched pair만 asset focal/Dice로 학습하는 3epoch FT
 │   │   │   ├── subset_attn_cover_pyr_aabb_dice3d_new_filter.py  # f3 D/E에서 과거3 최초등장 visibility=1 instance를 로드 직후 7프레임 전체 제거하는 정렬 필터 실험
+│   │   │   ├── subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_q100.py  # query 수 ablation: query_num_queries=100 + bg cls weight 0.1 (CHANGELOG 2026-07-28)
 │   │   │   ├── subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_q400.py  # query 수 ablation: main(200) 대비 query_num_queries=400 + bg cls weight 1/Q 스케일(0.025) (CHANGELOG 2026-07-27)
 │   │   │   ├── subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_q900.py  # query 수 ablation: query_num_queries=900 + bg cls weight 0.0111 (CHANGELOG 2026-07-27)
 │   │   │   ├── subset_attn.py  # subset(4000) + camera-attn 충돌 fix. GT는 gt_bbox_aabb(E) 기반 (NOTES/CHANGELOG 2026-07-02, 2026-07-13)

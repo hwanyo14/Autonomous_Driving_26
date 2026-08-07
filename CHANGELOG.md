@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-07-28 — query 수 ablation에 q100 추가
+
+- `..._asset_all_filter_q100.py`(q400 복사본)를 `query_num_queries=100`,
+  `query_cls_loss_class_weights=[0.1, 1.0]`로 수정하고 vis 경로 4개를 `..._q100/`으로 분리했다.
+- bg weight는 q400/q900과 동일한 1/Q 규칙: 0.05 × (200/100) = 0.1. 이로써 ablation 격자는
+  100 / 200(main) / 400 / 900, bg weight는 0.1 / 0.05 / 0.025 / 0.0111이 된다.
+- 주의: Q=100은 GT 인스턴스 수 M에 대한 여유가 가장 작다. 혼잡 프레임에서 M이 100에 근접하면
+  Hungarian 매칭이 포화되어 "query 수 부족"이 아니라 "매칭 불가"가 되므로,
+  `dbg/query_cls_matched_count`의 최대값이 100에 닿는지 확인할 것.
+
 ## 2026-07-28 — trajectory xy-refine 추론 적용 스위치 (EOCF_EVAL_TRAJ_REFINE)
 
 - 기존에 `refine_trajectory_absolute_xy`(query_head.py:1620) 호출부는 `forward_train`
