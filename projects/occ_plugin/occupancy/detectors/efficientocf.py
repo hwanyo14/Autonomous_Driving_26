@@ -1110,7 +1110,7 @@ class EfficientOCF(
             query_tokens_tqd,
             return_query_feats=True,
             detach_query_for_center=self.query_center_loss_detach_query_feat,
-            compute_direct_center=False,
+            compute_direct_center=not self.query_center_from_lifting,
         )
         query_cls_logits_qc = query_head_outputs["query_cls_logits_qc"]
         query_cls_scores_qc = query_head_outputs["query_cls_scores_qc"]
@@ -1126,29 +1126,32 @@ class EfficientOCF(
         if bool(getattr(self, "query_size_note_enabled", False)) and torch.is_tensor(query_attn_weights):
             size_note_attn_sigma_tq2 = self._compute_query_attn_sigma_note(query_attn_weights)
 
+        # query_center_from_lifting=False(ablation)면 아래 블록 전체를 건너뛴다.
+        # centers_world는 query_head.forward의 compute_direct_center 분기에서 이미
+        # CenterHead(MLP)로 채워져 나온 상태 — lifting 결과로 덮어쓰지 않는다.
         self._last_query_attn_soft_lift_pack = None
-        if (
-            torch.is_tensor(query_attn_weights)
-            and torch.is_tensor(query_depth_probs_tqd)
-            and isinstance(query_match_inputs, dict)
-            and torch.is_tensor(future_egomotion)
-        ):
-            query_attn_soft_lift_pack = self._build_query_attn_soft_lift_pack(
-                query_attn_weights_tqnhw=query_attn_weights,
-                query_depth_probs_tqd=query_depth_probs_tqd,
-                query_match_inputs=query_match_inputs,
-                future_egomotion=future_egomotion,
+        if self.query_center_from_lifting:
+            if (
+                torch.is_tensor(query_attn_weights)
+                and torch.is_tensor(query_depth_probs_tqd)
+                and isinstance(query_match_inputs, dict)
+                and torch.is_tensor(future_egomotion)
+            ):
+                query_attn_soft_lift_pack = self._build_query_attn_soft_lift_pack(
+                    query_attn_weights_tqnhw=query_attn_weights,
+                    query_depth_probs_tqd=query_depth_probs_tqd,
+                    query_match_inputs=query_match_inputs,
+                    future_egomotion=future_egomotion,
+                )
+                if isinstance(query_attn_soft_lift_pack, dict):
+                    self._last_query_attn_soft_lift_pack = query_attn_soft_lift_pack
+            lifted_centers_world = self._last_query_attn_soft_lift_pack.get("lifted_center_world_tq3", None)
+            query_head_outputs = self.query_head.apply_lifted_centers_to_outputs(
+                query_head_outputs,
+                lifted_centers_world,
+                detach_query_for_center=self.query_center_loss_detach_query_feat,
+                size_note_attn_sigma_tq2=size_note_attn_sigma_tq2,
             )
-            if isinstance(query_attn_soft_lift_pack, dict):
-                self._last_query_attn_soft_lift_pack = query_attn_soft_lift_pack
-        lifted_centers_world = self._last_query_attn_soft_lift_pack.get("lifted_center_world_tq3", None)
-        lifted_valid_tq = self._last_query_attn_soft_lift_pack.get("lifted_valid_tq", None)
-        query_head_outputs = self.query_head.apply_lifted_centers_to_outputs(
-            query_head_outputs,
-            lifted_centers_world,
-            detach_query_for_center=self.query_center_loss_detach_query_feat,
-            size_note_attn_sigma_tq2=size_note_attn_sigma_tq2,
-        )
         centers_world = query_head_outputs["centers_world_tq3"]
         center_logits = query_head_outputs["center_logits_tq3"]
         gaussian_sigmas_world = query_head_outputs["query_sigma_world_tq3"]

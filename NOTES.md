@@ -1,5 +1,29 @@
 # NOTES
 
+## 2026-07-31 KST — forward lifting ablation(`query_center_from_lifting=False`) 주의사항
+
+- **from-scratch 필수.** `center_head`는 지금까지 한 번도 학습에 참여한 적이 없다. DDP unused
+  param을 피하려고 `query_head.py:4630`에서 `weight.sum() * 0.0` 더미 참조만 걸어놨던 모듈이라
+  기존 체크포인트의 값은 초기값 그대로다. `load_from`/`resume_from`으로 이어붙이면 안 된다.
+- **초기 수렴이 최대 리스크.** Hungarian matching cost가 center 지배(10.0)인데 카메라 기하
+  앵커가 사라져, 학습 초반 center가 흔들리면 잘못된 GT와 짝지어지고 cls/shape/traj가 전부
+  틀린 타겟을 본다. `dbg` center_match를 1차 판정선으로 볼 것. 발산하면 center match cost를
+  낮추는 warmup을 고려하되, 넣는 순간 단일변수가 깨지므로 먼저 완충 없이 돌려 확인할 것.
+- **center를 실제로 학습시키는 건 shape loss일 가능성이 높다.** 직접 감독인 center match는
+  0.3인데, 가우시안 48개가 `centers_world + offset`으로 배치되므로 focal(1.0)+dice3d(0.5)가
+  center로 역류한다. 결과 해석 시 center 오차를 center loss 탓으로만 돌리지 말 것.
+- **depth head는 살아 있되 죽어 있다.** `query_depth_loss_weight=0.0`이라 gradient는 0이지만
+  `query_head.forward`에서 여전히 호출된다(연산 낭비 소량, DDP 안전). 출력
+  `query_depth_probs_tqd`는 렌더링·매칭·traj 어디에도 들어가지 않는다.
+- **attn softargmax 디버그 시각화는 빈다.** pack이 `None`이라
+  `maybe_save_query_attn_softargmax_vis`가 status 파일만 남기고 조용히 빠진다
+  (`utils_visualization.py:326~`). 크래시가 아니라 정상 동작이다.
+- 이 config는 `query_size_note_enabled`/`query_scale_spread_loss_weight`를 override하지 않아
+  기본값(False/0.0)이다. 그래서 `apply_lifted_centers_to_outputs`를 건너뛰어도 size note와
+  offset spread loss가 조용히 꺼지는 문제가 발생하지 않는다. **둘 중 하나라도 켜는 config에서
+  `query_center_from_lifting=False`를 쓰면 이식이 필요하다** — direct 분기
+  (`query_head.py:2678~`)에는 해당 코드가 없어 아무 경고 없이 비활성된다.
+
 ## 2026-07-28 KST — trajectory xy-refine은 기본적으로 eval에 적용되지 않는다
 
 - refine head(`query_traj_xy_refine_*`)는 학습 loss 경로에서만 궤적을 보정해 왔다. 따라서

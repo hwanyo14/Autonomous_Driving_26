@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-07-31 — forward lifting ablation 스위치 (query_center_from_lifting)
+
+- 3D center 산출 경로를 config로 선택할 수 있게 했다. 기본값은 기존 동작이라 다른 config는 무영향.
+  - `True`(기본): attn map soft-argmax로 (u,v) → mass 최대 카메라 top-1 선택 → depth 분포와
+    함께 unprojection(`_build_query_attn_soft_lift_pack`) → `apply_lifted_centers_to_outputs`가
+    `centers_world`를 덮어쓰고 `_world_to_range_logits`로 logit을 역산 = forward lifting.
+  - `False`: `QueryHead.forward(compute_direct_center=True)` 분기가 켜져 query feature →
+    `CenterHead`(MLP 128→128→3) → sigmoid → pc_range 스케일로 xyz를 직접 회귀한다. 위 lifting
+    호출 4개를 통째로 건너뛴다.
+- `efficientocf_config.py`: `MODEL_CFG_DEFAULTS`에 `query_center_from_lifting=True` 추가,
+  `apply_model_cfg`에서 파싱.
+- `efficientocf.py:1113`: `compute_direct_center=not self.query_center_from_lifting`.
+- `efficientocf.py:1129~`: lifting pack 생성 + `apply_lifted_centers_to_outputs` 블록을
+  `if self.query_center_from_lifting:`으로 감쌌다. 우회 시 `_last_query_attn_soft_lift_pack`이
+  `None`으로 남는데 기존 코드가 이를 무방비로 `.get()` 호출해 AttributeError가 나던 자리다.
+  같은 블록에서 어디서도 쓰이지 않던 `lifted_valid_tq` 지역변수를 제거했다.
+- `full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_feat128_center.py`(신규 ablation config):
+  `query_center_from_lifting=False` + `query_depth_loss_weight=0.0`. depth head는 lifting 전용
+  모듈이라 loss까지 차단했다(forward에는 남아 DDP unused param이 되지 않음, gradient만 0).
+  attention 모듈·attn bbox(0.3)·σ-matching(0.25)·matching cost `inside_log`(0.3)는 전부 유지 —
+  attention은 query feature 생성 본체라 제거 대상이 아니다. 시각화 work_dir을 base run과 겹치지
+  않도록 `.../feat128_center/` 아래로 분리했다.
+- 세 파일 문법 검사 통과. 학습은 아직 돌리지 않았다.
+
 ## 2026-07-28 — trajectory xy-refine 추론 적용 스위치 (EOCF_EVAL_TRAJ_REFINE)
 
 - 기존에 `refine_trajectory_absolute_xy`(query_head.py:1620) 호출부는 `forward_train`
