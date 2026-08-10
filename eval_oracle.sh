@@ -7,15 +7,15 @@ set -euo pipefail
 # "스코어링이 병목인지" 진단한다. (oracle ≫ baseline → 스코어링 문제 / 비슷 → shape·매칭 문제)
 
 # ----- 대상 config / checkpoint / GPU -----
-CONFIG=./projects/configs/baselines/full_attn_cover_pyr_aabb_dice3d_new.py
-CHECKPOINT=/home/hwanhee/Autonomous_Driving_26_new_data/work_dirs/full_attn_cover_pyr_aabb_dice3d_new/epoch_15_lss_only.pth
-GPUS=8
+CONFIG=./projects/configs/baselines/full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter.py
+CHECKPOINT=./work_dirs/full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter/epoch_18_lss_only.pth
+GPUS=1
 export PORT=50091
 
 # ----- 평가 동작 (baseline과 동일하게 맞춰 공정 비교) -----
 export EOCF_EVAL_MODE=1            # 0=present / 1=future. baseline과 동일하게 future.
-export EOCF_EVAL_OCC_THR=0.95      # baseline과 동일 occ threshold.
-export EOCF_EVAL_MAX_SAMPLES=512
+export EOCF_EVAL_OCC_THR=0.75      # baseline과 동일 occ threshold.
+export EOCF_EVAL_MAX_SAMPLES=0
 
 
 # ----- Oracle 선택 (이 스크립트의 핵심) -----

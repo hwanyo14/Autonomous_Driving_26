@@ -1,5 +1,582 @@
 # NOTES
 
+## 2026-08-05 KST — 스윕 스크립트 STOP 플래그가 여러 루프를 한꺼번에 죽인다
+
+`r704_traincal.sh` 에서 STOP 플래그 하나를 **통계 동결 루프와 알파 스윕 루프가 공유**하고 있었다.
+스윕을 멈추려고 플래그를 세웠더니 4,000 표본 동결까지 같이 취소됐고, 다음 폴링(180초) 때
+4,300 이 잡혔다. 누적 accumulator(`_acc: {n, sum, sumsq}`) 구조라 **되감기가 불가능**하다.
+
+→ `traincal_stats/res704_ep18_n4300.json` 은 의도한 4,000 이 아니다. **재수집하지 않기로 함**
+  (feat128 에서 n4000 vs n23900 이 future 소수 4자리까지 동일 → 7% 표본 차는 무의미).
+
+**교훈**: 종료 플래그는 **취소해도 되는 작업**과 **끝까지 가야 하는 작업**을 반드시 분리할 것.
+수집·동결처럼 되돌릴 수 없는 단계는 별도 플래그를 쓰거나 아예 STOP 을 무시하게 만든다.
+
+---
+
+## 2026-08-03 KST — Depth+Speed train-calibrated eval 이식 시 함정 4개
+
+### ① 🔴 calibration JSON의 checkpoint 경로가 **다른 머신 것**이다
+
+`depth_std+past_speed_calibration/normalization_stats.json`의 `checkpoint` 필드는
+`/home/user/jhh/Projects/Autonomous_Driving_26_ikk_fi/epoch_18_lss_only.pth`다. 이 머신 경로가
+아니다. 원본 문서(`CODEX_HANDOFF.md` §2.4)는 "stats checkpoint == eval checkpoint"를 계약으로
+요구하지만, **경로 문자열 비교로 구현하면 repo를 옮길 때마다 튕긴다.** 검증이 필요하면 realpath가
+아니라 md5로 비교할 것.
+
+로컬 `epoch_18_lss_only.pth` md5 = `e6162823d9925a2d407a1399f8cba00c` (292,534,810 B).
+**타 머신 원본과 동일한지는 아직 미검증** — 다르면 z-score가 통째로 틀어진다.
+
+### ② `EOCF_EVAL_MODE=2`는 이 repo에 없다
+
+원본 문서는 `MODE=2`(present 1 + future 4 joint volume)를 쓰지만 이 repo의 MODE는 `0=present /
+1=future` 둘뿐이다. 게다가 `efficientocf.py`의 주석대로 **MODE는 시각화 기준 프레임에만 영향을
+주고 metric은 항상 present/future 둘 다 계산**한다. 따라서 MODE 선택은 metric에 무의미하고,
+원본의 `combined`(joint volume) 지표만 재현 불가다. `3D_avg=(future*4+present)/5`로 대체할 것 —
+단 **joint volume IoU와 가중평균은 다른 값**이다(원본 CSV에서 0.15269 vs 0.15360).
+
+### ③ `past_speed`의 z는 −3에 도달할 수 없다
+
+`past_speed >= 0` → `log1p >= 0` → z 최솟값이 `(0 − 1.53707)/0.69234 = −2.22`다. 완전 정지
+query조차 −2.22가 바닥이다(`depth_std`는 −4.23이라 −3으로 clip됨). 따라서 실효 보정 폭이
+**비대칭**이다 — 최대 boost +2.055 / 최대 penalty −2.250.
+
+결과적으로 원래 score의 실효 컷 범위는 **0.536 ~ 0.988**이고, **score 0.98 이상은 depth/speed가
+아무리 나빠도 걸러지지 않는다**(logit(0.98)−logit(0.9) = 2.40 > penalty 상한 2.25).
+FP를 더 줄이려면 α를 키우거나 clip을 ±3보다 넓혀야 한다.
+
+### ④ depth bin 중심 규칙을 학습과 맞출 것
+
+`depth_std` 계산에 쓰는 bin 중심은 `utils_query_projection.py`의
+`depth_vals_d = (arange(D)+0.5)*bin_size + depth_min`과 **같아야** 한다. edge를 쓰면 mu가 반 bin
+어긋나 train 통계와 validation feature가 다른 척도가 된다. range도 `query_inst_depth_range_mode`
+(`custom` vs `dbound`) 분기를 그대로 따라야 한다.
+
+---
+
+## 2026-08-03 KST — 🔴 **고정 운영점으로 에폭 순위를 매기면 틀린다** + 평가 큐 운용 6원칙
+
+측정 수치는 전부 `RESULTS.md` 로 옮겼다. 여기에는 **다음에 또 밟을 함정**만 남긴다.
+
+### ① 에폭 비교는 반드시 **각자의 최적 운영점**에서 (실제로 뒤집힌 사례)
+
+feat128 ep14 vs ep15 @5119:
+
+| 비교 방식 | 승자 |
+|---|---|
+| 고정점 fg0.9/occ0.75 | ep14 (0.14716 vs 0.14666) |
+| **각자 최적점** | **ep15** (0.15064 vs 0.14716, **+0.00348**) |
+
+ep14 최적은 `fg0.90/occ0.75`, ep15 최적은 `fg0.85/occ0.85` 로 **에폭이 하나 바뀌는 동안 운영점이
+이동했다**. 새 체크포인트를 기존 임계값으로만 재보면 저평가된다.
+→ **에폭 스크리닝에도 최소 2×2 격자(`fg{0.85,0.90}×occ{0.75,0.85}`)를 편다.**
+
+### ② `occ_thr` 은 fg 가 낮을 때만 일한다
+
+fg0.90 에서는 선택된 query 의 cls 가 전부 0.9~1.0 이라 렌더 가중치가 1.0 과 같아져 occ 가 무영향이다
+(dim96·res704 가 이 경우, 편차 ±0.0016). **fg 를 0.85 로 낮춰야 경계선 query 가 들어오고 그때부터
+occ 가 작동한다** (feat128 이 이 경우, occ 0.70→0.85 에서 present +0.0036).
+→ "occ 무영향"이라는 과거 결론(NOTES 2026-07-31)은 **fg0.90 조건에서만 유효**하다.
+
+### ③ 부분 진행 중인 두 런은 **공통 N 에서만** 비교할 것
+
+eval 순서가 deterministic 이라 같은 N = 같은 샘플이다. 진행률이 다른 두 런의 마지막 줄을 비교하면
+엉뚱한 결론이 난다. 실제로 feat128 ep16 의 두 운영점 비교에서 **N=624 에서 −0.0014 이던 부호가
+N=864 에서 뒤집혀** 끝까지 유지됐다 — 초반 구간만 보고 판단하면 정반대로 읽는다.
+(ep15 는 같은 역전이 N=624 에서 일어났다. 최소 N≈1000~2000 은 봐야 부호가 안정된다.)
+
+### ④ 평가 큐 스크립트 6원칙 (전부 실제 사고에서 나옴)
+
+1. **`set -e` 금지** — 실패해도 `_STATUS`/DONE 마커를 남겨야 '죽은 run'과 '진행 중 run'을 구분한다.
+2. **`.out` 은 프로젝트 안에도 복사** — `/tmp` 는 재부팅으로 소실된다(2026-08-02 실제 소실).
+3. **워커는 `python -u tools/test.py` 로만 센다** — 부모(`torch.distributed.run`)까지 세면
+   1 run 이 2로 잡혀 큐가 영구 대기한다.
+4. **`setsid` 로 띄운다** — `nohup ... &` 만으로는 부모 셸 종료 시 프로세스 그룹째 SIGTERM 을 받는다
+   (2026-08-03, 로딩 직후 `signal: 15` 사망).
+5. **큐는 "프로세스 사망"이 아니라 "슬롯 확보"를 기다린다** — 전자로 짜면 슬롯을 놀린다(~2h 낭비 사례).
+6. **TAG 에 모든 변수를 넣는다** — scope 를 빼먹어 `scope=all` 결과가 `scope=future` 로 덮인 적 있다.
+
+### ⑤ 🔴 VIS=1 은 GPU 메모리를 약 2배로 쓴다 — 2개 동시 실행이 재부팅을 유발했다
+
+feat128 + VIS=1 은 run 당 **42.8GB**(VIS off 23.3GB). 2026-08-02 14:01 에 이 조합 2개를 동시
+실행(85.6GB, 87%)하다가 NVRM GSP RPC failure → FULLCHIP_RESET →
+`CUDA error: unspecified launch failure` → **시스템 재부팅**. CPU/RAM 문제가 아니었다.
+→ **대량 런은 전부 VIS=0, 시각화는 최종 승자 1개만 따로.** metric 에는 영향 없다.
+
+---
+
+## 2026-08-03 KST — 입력 해상도를 바꿀 때 **반드시 같이 바꿔야 하는 것 / 몰래 따라오는 것**
+
+`_res704` config 작업(CHANGELOG 2026-08-03)에서 정리한 내용. 다음에 다른 해상도로 갈 때 재사용할 것.
+
+### ① `kv_resolutions`는 선택이 아니라 **강제 종속**이다
+
+img_neck(SECONDFPN, `upsample_strides=[0.25,0.5,1,2]`)이 backbone stride 4/8/16/32를 전부
+**stride-16으로 통합**한다. 따라서 context feature = `input_size/16`이고,
+`transformer.py:236-240`이 이것과 `kv_resolutions[-1]`의 불일치를 `ValueError`로 하드 검증한다.
+
+    (896,1600) → (56,100)      (256,704) → (16,44)
+
+**피라미드 중간 단계는 마지막 값의 약수로 잡을 것.** 정수배면 `avg_pool2d` 정확 경로,
+아니면 `adaptive_avg_pool2d` fallback으로 조용히 넘어가 pooling 성질이 달라진다
+(`transformer.py:247-253`). 16→8→4 / 44→22→11은 정수배 OK.
+
+`learnable_kv_downsample`은 `efficientocf_config.py:217` 기본 **False** — 이 경우 pooling에
+파라미터가 없다. True로 켤 때만 `kv_full_resolution` 의존 파라미터가 생겨 해상도 변경이
+ckpt 호환을 깬다.
+
+### ② ⚠ **crop이 몰래 따라 바뀐다** — 해상도 실험의 숨은 두 번째 변수
+
+`loading_bevdet.py:190-215` `sample_augmentation`은 base resize를 `fW/W = fW/1600`으로 잡고
+`crop_h = int((1-crop_h_jitter)*newH) - fH`로 **상단을 잘라낸다**(bottom crop 고정).
+
+| input_size | base resize | newH | crop_h | 세로 FOV 유지율 |
+|---|---|---|---|---|
+| (896,1600) | 1.0 | 900 | 4 px | 99.6% |
+| (256,704) | 0.44 | 396 | **140 px** | **64.6%** |
+
+즉 704로 내리면 해상도만 주는 게 아니라 **세로 시야 상단 약 35%가 사라진다.** 가까운
+트럭/버스 상단이 이미지 밖으로 나가므로 GMO/attn GT의 경계 clip 비율이 올라간다.
+BEVDet 256×704 표준 레시피 그대로라 버그는 아니지만, **"해상도만 바꾼 단일변수 실험"이라고
+판정문을 쓰면 안 된다.** 순수 해상도 효과만 보고 싶으면 `crop_h` jitter를 조정해 FOV를 맞춰야 한다.
+
+부수: `resize` jitter가 base 아래로 내려가면(`resize<0.44`) `newW<704`가 되어 crop 우측이
+이미지를 벗어나 **검은 패딩**이 생긴다. before(896)에서도 같은 성질이라 새로 생긴 문제는 아니다.
+
+### ③ 해상도에 딸려가는 것 / 안 딸려가는 것
+
+**전부 정확히 같은 비율로 감소** (stride-16 하나에 묶여 있음): 입력 픽셀, backbone 전 stage,
+context 토큰, KV 토큰 총합, LSS frustum ray 수, depth loss 격자. 704는 896 대비 **1/8**.
+
+**안 변함**: `occ_size`, `point_cloud_range`, `grid_config`, `bev_feat_dim`,
+`query_matched_gmo_bce_occ_size`, gaussian/dice/tversky/traj 전부.
+→ **BEV·loss 격자는 그대로이고 그 격자를 채우는 이미지 증거 밀도만 준다.**
+
+**파라미터 shape은 해상도 무관** — FCN backbone/neck + `build_2d_sincos_pos_embed`가 매 forward
+생성하는 sin-cos pos embed(학습 파라미터 아님) + 개수 고정 `query`/`query_id_embed`/`cam_id_embed`.
+따라서 해상도가 달라도 **ckpt shape은 호환**된다(성능 보장과는 별개).
+
+### ④ ⚠ 픽셀 단위 하이퍼파라미터는 자동으로 안 따라온다
+
+`query_attn_sigma_match_min_mask_px=4`는 **896 기준 픽셀값**이다. 704에서는 GT cam 마스크가
+픽셀 기준 ~2.3배 작아지므로 같은 값이 훨씬 공격적인 필터가 된다. `_res704`에서는
+`query_attn_sigma_match_loss_weight=0.0`으로 축 자체를 꺼서 회피했으나(weight 0이면 loss 항
+미생성 → `start_iter`/`min_mask_px` 동반 무효화), **되살릴 때 반드시 재스케일할 것.**
+
+**σ-match를 꺼도 attn 감독이 다 꺼지는 게 아니다**: `use_query_attn_bbox_loss=True`(inside-mass),
+`query_attn_bbox_other_weight=0.3`, 매칭 cost `inside_log`(0.3)는 그대로 살아 있고 이제
+카메라당 (16,44)=704칸 격자에서 계산된다. 원거리 객체가 1칸 미만이 되어 inside-mass/soft-IoU가
+거칠어지는 것이 저해상도 실험의 **주 리스크**(kv 레이어 수보다 이쪽과 LSS 밀도가 먼저 온다).
+
+### ⑤ `visualization_cfg`의 4개 dir 문자열은 **죽은 값이다**
+
+config에 뭘 적든 무시된다. 학습은 `mmdet_train.py:141` → `_configure_visualization_dirs()`가
+`{work_dir}/vis/{timestamp}/{folder}`로 덮어쓰고(`mmdet_train.py:60-86`), eval은
+`efficientocf.py:1333`이 `EOCF_EVAL_VIS_DIR`(기본 `./work_dirs/eval_vis`)를 쓴다.
+**run 격리는 `work_dir`과 `EOCF_EVAL_VIS_DIR`로 하는 것이지 config 경로 rename으로 하는 게 아니다.**
+경로 외 옵션(`gaussian_vis_mode`, `max_frames`, `topk_matched`, `max_queries`, `eval_occ_size`)은 실동작.
+
+## 2026-07-31 KST — [실측] traj_acc 꼬리컷 = **유일하게 성공한 추론 손잡이**. 봉우리는 10~20% 제거
+
+`traj_acc = |c₂−2c₁+c₀|`(과거 3프레임 xy 이차차분 = 가속도 잔차) 상위 꼬리를 fg 선택집합에서
+**제거**한다. `EOCF_EVAL_FG_TRAJ_ACC_MAX=<m>`(기본 0=비활성). 구현/근거는 CHANGELOG 2026-07-31 참조.
+
+**⚠ 재랭킹이 아니라 제거다.** 같은 traj_acc를 점수 가중치로 쓰는 4가지 방식은 전부 실패했고
+(같은 날 아래 항목 참조), **버리는 축으로 쓸 때만 작동한다.** cls_prob은 "객체인가"를 재고
+traj_acc는 "이 중심을 믿을 수 있나"를 재는데, IoU는 복셀 겹침으로 채점되므로 후자가 별도로 유효하다.
+
+### ★ ep18 @5119 확정 곡선 — **봉우리 = 10% 제거(acc_max 4.85m)**
+
+| 제거율 | acc_max(m) | IoU3d_future | baseline 대비 | IoU3d_present |
+|---|---|---|---|---|
+| 0% (baseline) | — | 0.1412 | — | (구코드 로그라 미측정) |
+| 5% | 6.97 | 0.1432 | +0.0020 | 0.1791 |
+| **10%** | **4.85** | **0.1439** | **+0.0027** | **0.1786** |
+| 15% | 3.64 | (측정 예정) | | |
+| 20% | 2.94 | 0.1437 | +0.0025 | 0.1763 |
+| **30%** | **2.09** | **0.1407** | **−0.0005** | 0.1713 |
+
+- **30%는 baseline보다 나쁘다.** 봉우리를 지나면 급격히 무너진다.
+- **⚠ 800샘플 스크리닝은 봉우리 위치를 틀리게 짚었다**: @800에서는 20%(0.1482) > 10%(0.1477)였으나
+  @5119에서는 10%(0.1439) > 20%(0.1437)로 뒤집혔다. 두 경우 모두 차이가 노이즈 수준이라
+  **봉우리 확정은 5119로만 가능하다.** 800은 "이득이 있는 대역"까지만 알려준다.
+- **10%가 단일 운영점으로 최적**: future 최고이면서 present 손실도 최소(5% 대비 −0.0005).
+  20%는 future를 5%p 더 못 얻으면서 present를 0.0023 더 잃는다.
+
+**★ 한계 유용비 예측이 실측으로 검증됐다.** 아래 표에서 20~30% 밴드 유용비 0.481 > 전체 평균 0.474 →
+"그 구간부터 이득 소멸"이라 예측했고, 실측이 정확히 그 지점에서 꺾여 baseline 아래로 떨어졌다.
+→ **앞으로 유사한 필터링 아이디어는 eval(3시간) 전에 덤프로 몇 분 만에 사전 판별 가능하다.**
+
+**ep18 @800 컷 곡선** (스크리닝용. 절대값은 낙관 편향, 봉우리 위치는 신뢰 불가)
+
+| 제거율 | acc_max(m) | IoU3d(asset)_future | 증분 |
+|---|---|---|---|
+| 0% (baseline) | — | 0.1450 | — |
+| 5% | 6.97 | 0.1469 | +0.0019 |
+| 10% | 4.85 | 0.1477 | +0.0008 |
+| **20%** | **2.94** | **0.1482** | +0.0005 |
+| 30% | 2.09 | 미실측(아래 근거로 스킵) | — |
+
+- **ep20에서도 재현**: 0.1429 → 0.1447 (acc6.97, +0.0018). 기전도 동일 —
+  ep18 TP −1.2%/FP −6.1%, ep20 TP −1.0%/FP −6.0%. **FP를 6% 버리고 TP는 1%만 잃는다.**
+
+**한계 유용비 (ep18 N=300 덤프, fg0.9 선택집합 3,704개 / TP 1,756 / precision 0.474)**
+
+| 밴드 | acc 범위(m) | 한계 유용비 |
+|---|---|---|
+| 0~2% | >11.16 | 0.147 |
+| 2~5% | 6.97~11.16 | **0.126** (가장 나쁨) |
+| 5~10% | 4.85~6.97 | 0.335 |
+| 10~15% | 3.64~4.85 | 0.368 |
+| 15~20% | 2.94~3.64 | 0.400 |
+| **20~30%** | 2.09~2.94 | **0.481 > 평균 0.474** |
+| 30~40% | 1.58~2.09 | 0.461 |
+
+- **20%를 넘으면 밴드 유용비가 전체 평균에 도달한다** = 그때부터는 '나쁜 걸 골라 버리는' 게 아니라
+  예산을 무작위로 깎는 것과 같아진다. 예산 감소 자체는 손해이므로(아래) **30% 이상은 볼 필요 없다.**
+- 실측 증분(+0.0019 → +0.0008 → +0.0005)이 이 표와 정확히 같은 방향으로 감쇠한다.
+
+**⚠ "자를수록 좋다"가 아니라 "제대로 고른 걸 자를 때만 좋다".** 같은 세션 실측 대조:
+
+| 방식 | 버린 양 | 결과 |
+|---|---|---|
+| cls threshold 0.90→0.92 | ~19% | 0.1429 → **0.1391 (−0.0038)** |
+| traj_acc 상위 10% 컷 | 10% | 0.1450 → **0.1477 (+0.0027)** |
+
+둘 다 query를 버리는데 방향이 반대다. 이득의 원천은 예산 축소가 아니라 **traj_acc의 선별력**이다.
+
+**⚠ 컷 값은 절대값(m)이고 체크포인트마다 재캘리브레이션해야 한다.** 위 acc_max는 **ep18 N=300**
+덤프의 fg0.9 선택집합 백분위: 2%=11.16 / 5%=6.97 / 10%=4.85 / 15%=3.64 / 20%=2.94 / 30%=2.09.
+ep20에 그대로 적용해도 이득은 났지만 '상위 N%' 라벨은 부정확해진다.
+
+**⚠ offline 판정식이 이 아이디어를 죽일 뻔했다.** 제거 이득 조건을 미보정 임계(~0.123)로 재면
+5% 제거의 유용비 0.134가 "경계선~소폭 손해"로 나온다. 실측은 +0.0019 이득이었다.
+**추가 방향의 0.635 기준과 달리 제거 방향의 임계는 캘리브레이션된 적이 없다** — 판정에 쓰지 말 것.
+
+## 2026-07-31 KST — [실측 N=300] attn soft-argmax vs hard-peak 괴리 = 닫힘. 3D 버전은 거리의 열화판
+
+아이디어: attention map에서 soft-argmax로 중심을 잡는데, **최대峰(hard argmax)과 멀어지면**
+중심을 잘못 잡은 것 아닌가. 거리는 두 가지 — 이미지 평면(2D)과 depth lifting 후(3D).
+계측 구현: `EOCF_QFEAT_ATTN_PEAK=1`(기본 OFF) → `utils_query_projection.py`의
+`_build_query_attn_soft_lift_pack`에서 산출, `_last_query_attn_soft_lift_pack` 경유로 qfeat 덤프에 실림.
+덤프: `eval/qfeat_18ep_N300_attnpeak/qfeat` (ep18, fg0.9/occ0.75/nms0, feature 격자 **56×100**).
+
+**3D 거리는 2D의 독립 인자가 아니다(해석적)**: 두 점이 같은 depth를 쓰고 회전이 노름을 보존하므로
+`||Δ3D|| = depth · √((Δu/fx)² + (Δv/fy)²)` — 즉 **3D = 2D × depth/focal**. 거리 가중된 2D일 뿐이다.
+
+| 인자 | 잔차화 AUC(⊥cls,dist) | ρ(cls) | ρ(dist) | ρ(xy중심오차) | 예산별 재랭킹 |
+|---|---|---|---|---|---|
+| d2d (feat/img, 동일) | 0.5166 | **−0.081** | −0.179 | **+0.096** | ~0 (fg0.95만 +0.011) |
+| d3d | 0.5232 | −0.301 | +0.193 | +0.339 | ~0 (fg0.95만 +0.015) |
+| peak_prob | 0.5073 | +0.115 | +0.175 | −0.030 | **전 예산 음수(−0.04~−0.13)** |
+| (참고) traj_acc | 0.5668 | −0.349 | 0.183 | +0.424 | 음수 |
+| (참고) dist | 0.5322 | −0.480 | 1.0 | **+0.381** | 음수 |
+
+- **계측 자체는 의도대로 작동한다**: `spearman(peak_prob, d2d) = −0.552` — map이 뾰족할수록 괴리가 작다.
+  배선/계산 오류가 아니라 **가설이 안 맞는 것**이다.
+- **⚠ 가설 "괴리 크면 중심이 틀렸다"는 2D에서 성립하지 않는다.** ρ=+0.096이고 4분위가 **비단조**:
+  Q1 1.524m / Q2 1.248m / Q3 1.385m / Q4 2.076m — **괴리가 가장 작은 Q1이 Q2·Q3보다 오히려 나쁘다.**
+  (괴리 0 = attention이 한 칸에 붕괴한 퇴화 케이스로 보임. 양극단이 모두 나쁨 → GBDT가 LR보다
+  약간 더 건지지만 그래도 부족.)
+- **⚠ d3d의 상관(+0.339)은 괴리가 아니라 거리에서 온 것이다.** 거리 단독이 +0.381로 **더 높다**.
+  즉 **d3d = 거리에 노이즈를 더한 열화판**. 3D로 올리는 것은 이득이 아니라 손해다.
+- **왜 실패하는가**: peak 확률 중앙 **0.141** — 5,600칸(56×100) 중 최대칸이 질량의 14%만 갖는다.
+  map이 너무 퍼져 있어 **hard argmax 한 칸이 "진짜 위치"의 신뢰할 만한 대안이 아니다.**
+  전제가 깨진다.
+- 5-fold: `cls+d2d` 1/5, `cls+d3d` 3/5, `cls+peak_prob` 1/5 — 전부 부호 불일치.
+  `cls+신규4+acc`가 5/5(0.4802)지만 **`cls+acc` 단독(0.4818)보다 낮다** → 신규 4개는 순 기여 0.
+- **추가분 유용비 최고 0.251** (d3d, cls≥0.85, q=0.7) ≪ 기준 **0.635** → **닫힘.**
+
+**→ attention 기반 인자는 이걸로 정리. 재시도 금지.** 남은 인자 후보가 있다면 "attention이 퍼져
+있다"는 사실 자체를 우회하는 것이어야 한다(예: map을 쓰지 않는 신호).
+
+## 2026-07-31 KST — [실측 N=300] fg score 신규 인자 3축 탐색: `traj_acc`만 살아남음(단 크기 미미)
+
+기존 덤프 `eval/qfeat_18ep_N300_depth/qfeat`(epoch_18, 60,000 query / GT 3,078) 재분석.
+스크립트: scratchpad `qfeat_probe.py` / `qfeat_newfeat.py` / `qfeat_incremental.py` / `qfeat_cv.py`.
+**파이프라인 검증**: cls_prob AUC **0.9527**(NOTES 대조 0.953), fg0.9 선택 3,704 / precision 0.4741 /
+recall 0.5705 — 선행 분석 수치를 재현하므로 아래 신규 결과도 같은 기준으로 읽을 수 있다.
+GT 프레임 정합은 실측으로 `t=2`(=`present_idx`)에서 최소거리 — 좌표계 정합 확인됨.
+
+**탐색한 미탐색 3축** (선행 분석이 안 본 것만):
+- **A. mixture 48-component 자기일관성** — 가중중심과 query 중심 불일치(`mix_off`), 성분 xy 산포
+  (`mix_spread`), 가중치 엔트로피(`mix_went`)
+- **B. trajectory 3프레임 기하** — 가속도 잔차 `|c₂−2c₁+c₀|`(`traj_acc`), 속도(`traj_vel`)
+- **C. depth 분포 다봉성** — 주봉 ±3bin 밖 질량(`dep_multi`). entropy가 못 가르는 '넓은 단봉 vs 이봉'
+
+**잔차화 AUC** (경계밴드 0.5≤cls<0.98, cls·dist 회귀 제거 후 남는 판별력):
+
+| 인자 | 원본 | ⊥cls | ⊥cls,dist | ρ(dist) |
+|---|---|---|---|---|
+| **traj_acc** | 0.6239 | **0.5669** | **0.5668** | 0.183 |
+| traj_vel | 0.5891 | 0.5377 | 0.5380 | 0.145 |
+| dep_multi | 0.6383 | 0.5230 | 0.5116 | 0.182 |
+| sharp | 0.6374 | 0.5226 | 0.5143 | −0.107 |
+| mix_off / spread / went | 0.53~0.55 | 0.509~0.519 | 0.506~0.518 | 0.18~0.22 |
+
+- **A축(mixture 자기일관성)과 C축(다봉성)은 닫혔다**: cls 제거 후 0.51~0.52로 붕괴 = cls의 재표현일 뿐.
+- ⚠ **이들은 거리 대리변수가 아니다**(ρ(dist) 0.11~0.22). 선행 분석의 'range-bin 정규화 실패'와는
+  **다른 이유로** 실패한 것 — cls_prob과 중복이기 때문. 거리 가설로 오해하지 말 것.
+- **`traj_acc`만 cls·dist를 모두 제거하고도 0.567 유지.** 유일하게 독립 정보가 있다.
+
+**5-fold CV 고정예산 precision** (샘플 단위 분할, budget≈740/fold):
+
+| 구성 | 로지스틱 | GBDT | fold 부호일치 |
+|---|---|---|---|
+| 기준 (cls 원값 랭킹) | 0.4718 ±0.0163 | — | — |
+| **cls + traj_acc** | 0.4794 ±0.0148 | **0.4818 ±0.0161** | **GBDT 5/5** |
+| cls + traj_acc + traj_vel | 0.4788 | 0.4810 | GBDT 5/5 |
+| cls + 전체9 | 0.4761 | 0.4850 | GBDT 4/5 |
+
+- **`traj_acc`는 노이즈가 아니다** — GBDT 기준 5/5 fold 전부 개선, 평균 **+0.0100 (상대 +2.1%)**.
+- ⚠ **단일 holdout(±0.0116 SE)만 봤으면 노이즈로 오판했을 크기다.** 반드시 fold 부호로 볼 것.
+- ⚠ **단순 GD(300 iter) 로지스틱은 미수렴이라 "변수 추가 = 전부 하락"이라는 가짜 결론을 준다.**
+  실제로 1차 시도에서 그렇게 나왔다. lbfgs/GBDT로 재확인할 것.
+
+**⚠ 그래도 추론 손잡이로는 권하지 않는다.** 선행 실험에서 depth sharpness가 offline precision
+**+11%**를 내고도 IoU는 동률(macro −0.5% / micro +1.2%)이었다. `traj_acc`의 **+2.1%**는 그보다
+5배 작으므로 IoU 전이 기대값은 사실상 0이다. 예산 740개 중 7~8개가 교체되는 수준.
+
+**[추가 실측] `traj_acc`를 fg score에 넣는 4가지 방식 — 전부 닫힘. 재시도 금지.**
+스크립트: scratchpad `traj_score.py`.
+
+| 방식 | 결과 |
+|---|---|
+| 단순 곱셈 `cls/(1+acc)^k` (k=0.25/0.5/1.0) | fg 0.80/0.85/0.90/0.95 **전 예산 음수** (−0.0013 ~ −0.0192) |
+| 고정예산 재랭킹 (최적 k=0.1) | 620개 교체 → TP 183 유입 / 182 유출, **순증 1개** (GT 3078 대비 +0.0003) |
+| 학습된 결합 (GBDT) | +0.010 precision (5/5 fold) — 실재하나 IoU 전이엔 부족 |
+| 2차 게이트 (`cls≥0.85 & acc<중앙`) | 추가분 유용비 **0.272**, 최선 조합도 **0.442** ≪ 필요치 **0.635** |
+
+- **기전**: 고정예산 교체 620개의 **유입 유용비 0.295 vs 유출 0.294** — 같은 품질끼리 자리만 바꾼다.
+  `traj_acc`의 잔여 정보가 예산을 움직일 만큼 크지 않다.
+- **2차 게이트 검증**: cls를 0.85로 낮추고 acc 하위 50%만 받으면 recall 0.5705→0.6257이지만
+  추가 625개의 유용비가 0.272라 IoU는 떨어진다. 실측 fg 스윕(fg0.85 = 0.1374~0.1381
+  < fg0.9 = 0.1430)과 정확히 일치 — **판정식과 실측이 서로를 확증한다.**
+- ⚠ 단순 곱셈은 실패하는데 GBDT는 소폭 이득이 난다 = 유용한 형태가 **acc에 대해 단조가 아니다**.
+  그래도 그 이득이 예산 교체를 이길 만큼은 아니므로 결론은 동일하다.
+- **결론: 선행 기록의 "예산을 고정하면 cls_prob를 이기는 스코어 조합이 없다"가 trajectory 축까지
+  확장 확인됐다.** 추론 재랭킹은 완전히 닫힌 문이다.
+
+**→ 실질적 함의는 추론이 아니라 학습이다.** `traj_acc`(궤적 가속도 잔차)가 xy중심오차와
+**ρ=+0.424**로 붙는다는 것은 "**시간적으로 흔들리는 query가 곧 중심이 틀린 query**"라는 뜻이다.
+선행 결론(병목 = 중심 정확도, 추론에서 수정 불가)과 정확히 같은 지점을 가리키며,
+**중심 궤적에 시간 일관성(constant-velocity 잔차) 정규화를 거는 학습 손실**이 근거 있는 다음 수다.
+추론에서 재랭킹으로 뽑아 쓸 정보가 아니라, 애초에 그 흔들림을 없애는 쪽이 맞다.
+
+## 2026-07-31 KST — [실측] fg threshold 봉우리 확정(0.9). occ는 5119에서도 무영향
+
+epoch_20_lss_only, `eval_total.sh` 조건 고정(MODE=future / NMS off / weight=ones), fixed_val.
+2026-07-30 스윕(epoch_18, N=300)이 **fg 0.9 아래쪽만** 봤던 것을 **0.95 위쪽까지 확장**해 봉우리를 가뒀다.
+
+**800샘플 스크리닝** — `IoU3d(asset)_future`
+
+| fg \ occ | 0.7 | 0.75 | 0.8 |
+|---|---|---|---|
+| 0.85 | 0.1365 | 0.1374 | 0.1381 |
+| **0.9** | 0.1426 | 0.1429 | **0.1430** |
+| 0.95 | 스킵 | **0.1124** | 스킵 |
+
+- **fg 곡선은 0.9에서 봉우리, 그리고 비대칭이다.** 0.9→0.85는 −0.005(완만), 0.9→0.95는
+  **−0.031(급락)**. 0.95에서 TP가 1.68e7→0.98e7로 **−42%** 날아간다(FP는 5.36e7→2.07e7로 줄지만
+  판정식 `ΔTP/(ΔTP+ΔFP) > IoU` 기준으로 전혀 보상이 안 됨). **0.9 위로는 올리지 말 것.**
+- 2026-07-30 기록의 fg 0.75(0.1256) / 0.5(0.0853)와 합치면 봉우리 양쪽이 모두 닫혔다.
+  → 남은 탐색 여지는 **0.88~0.92 구간의 0.01 단위뿐**이고, 그 밖은 볼 필요 없다.
+- **occ_thr(0.7/0.75/0.8)은 fg 0.9에서 편차 0.0004, fg 0.85에서 0.0016.** 무영향 재확인.
+  ⚠ occ를 0.01 단위로 쪼개는 건 노이즈만 본다. **미세조정은 fg 축에만 걸 것.**
+
+**5119 전체 검증**: `fg0.9/occ0.8` → **0.1407**. 별도로 돌린 `fg0.9/occ0.75` → **0.1406**(차이 0.0001).
+occ 무영향이 부분표본 아티팩트가 아님이 전체 샘플에서 확정됐다.
+
+**⚠ 코드 버전 등가성(중요)**: 위 0.1406은 `nusocc/bbox_aabb/bbox_rot/Recall3d`가 살아있던
+**커밋 HEAD 코드**의 출력이고, 0.1407은 그 지표들이 제거된 **현재 워킹트리(test.py 리팩터)** 출력이다.
+리팩터는 `iou_3d_asset` → `iou_3d_asset_{present,future}` **분리**일 뿐이며, `MODE=1`에서
+옛 `IoU3d(asset)` ≡ 새 `IoU3d(asset)_future`임이 위 두 수치로 **실측 확인**됐다.
+→ 구버전 로그의 `IoU3d(asset)` 값을 현재 코드 결과와 직접 비교해도 된다.
+
+**⚠ 800샘플 대표성**: ref(`fg0.9/occ0.75`) 800샘플 = 0.1429 vs 5119 = 0.1406. **+0.0023 낙관 편향**이
+있으나 조합 간 *순위*는 보존된다. 스크리닝용으로는 충분하지만, **절대값 기준(예: 0.13 컷)을
+5119 수치에서 가져와 800에 적용할 때는 이 편향을 감안할 것.**
+
+**⚠ 실행 환경**: eval은 conda env `eof`가 필요하다(`mmcv 1.7.2` / `torch 2.7.0+cu128`).
+nohup/스크립트로 띄우면 base env로 떠서 `ModuleNotFoundError: mmcv`로 죽으므로
+`source ~/anaconda3/etc/profile.d/conda.sh && conda activate eof`를 반드시 넣을 것.
+
+**⚠ 동시 실행 상한은 GPU가 아니라 CPU다**: eval은 GPU util 5~7%로 **CPU 바운드**
+(`workers_per_gpu=1`, run당 ~690% CPU = 6.9코어). 24코어 머신에서 2개 동시 → loadavg 21~22로 이미 포화.
+GPU 메모리는 VIS off 17GB / VIS on 34GB per run이라 3개도 들어가지만, **CPU 초과구독 + swap(이미 4.7G/8G)
+때문에 3개는 처리량 이득 없이 OOM 위험만 커진다. 2개가 상한.**
+`EOCF_EVAL_VIS=1`은 48샘플마다의 렌더 외에 **매 샘플** attn/cam-gaussian 디버그 텐서를 계산하므로
+(efficientocf.py의 `return_instance_img_debug` / `return_query_cam_gaussian_vis_debug`)
+스크리닝에서는 순수 오버헤드다 — 끄면 GPU 메모리가 34GB→17GB로 반감된다(metric에는 무영향).
+
+## 2026-07-30 KST — [실측 완결] 추론 손잡이 전수 스윕 = 현재 운영점이 최적. 남은 건 재학습뿐
+
+epoch_18, N=300 고정, NMS off. 모두 같은 fixed_val 300샘플이라 직접 비교 가능.
+
+| run | fg | occ | weight | IoU3d_fut | micro | TP | FP |
+|---|---|---|---|---|---|---|---|
+| **A** | 0.9 | 0.75 | score | **0.1463** | 0.1447 | 6.52e6 | 2.10e7 |
+| E | 0.9 | 0.75 | ones | 0.1458 | 0.1442 | 6.71e6 | 2.24e7 |
+| **F** (=`eval_total.sh`) | 0.9 | 0.8 | ones | 0.1461 | 0.1442 | 6.49e6 | 2.10e7 |
+| G | 0.9 | 0.8 | score | 0.1464 | 0.1444 | 6.26e6 | 1.93e7 |
+| sharp pow2 | — | 0.75 | score | 0.1455 | 0.1465 | 6.06e6 | 1.73e7 |
+| B | 0.75 | 0.75 | score | 0.1256 | 0.1272 | 8.42e6 | 4.22e7 |
+| C | 0.75 | 0.75 | ones | 0.1195 | 0.1206 | 8.98e6 | 5.04e7 |
+| D | 0.5 | 0.5 | ones | 0.0853 | 0.0859 | 1.11e7 | 1.05e8 |
+
+- **fg0.9 근방 4조합이 0.1455~0.1463(편차 0.6%)** — `weight_mode`(ones/score)와 `occ_thr`(0.75/0.8)은
+  fg0.9에서 **무영향**이다. 선택된 query의 cls가 전부 0.9~1.0이라 렌더 가중치가 1.0과 거의 같기 때문.
+  → **`eval_total.sh`의 ones/0.8 설정은 손해가 아니다. 바꿀 이유 없음.**
+- **완화 계열은 전부 단조 손해**: B −14% / C −18% / D −42%. TP는 6.5→11.1e6(+70%) 늘지만
+  FP가 2.1→10.5e7(**+400%**)로 6배 빠르게 늘어난다.
+- **판정식**: IoU는 `ΔTP/(ΔTP+ΔFP) > 현재 IoU`일 때만 오른다(FN이 ΔTP만큼 줄므로).
+  TP/FP 비율(0.31)이 아니라 **IoU 자체(0.1447)** 가 기준선이다. B의 실측 마진 유용비율은 0.0825로
+  예측치 0.074와 12% 오차 내 일치 — **offline 겹침 proxy(3.65배 보정) 프레임워크는 신뢰 가능하다.**
+  ⚠ 이 기준의 실무적 함의: **추가할 query 집합은 "지금 뽑고 있는 것과 비슷하게 좋아야" 한다**
+  (`dmin<2m` 비율 > 0.635). 그래서 "무엇을 더 넣는" 계열은 원리적으로 이기기 어렵다.
+- **σ/offset 균등 팽창(z 팽창) 아이디어도 이로써 폐기**. C/D가 사실상 그 실험이다.
+  "IoU2d/IoU3d 격차로 z에 +43% 여지"는 상한 계산일 뿐 균등 팽창으로는 도달 불가.
+
+### depth sharpness (`EOCF_EVAL_FG_SHARP_POW`) 결론: 원리적으로 닫힘
+- `cls * sharp^2` (예산·실효렌더 모두 A와 정합): macro 0.1455(−0.5%) / micro 0.1465(+1.2%) = **동률**.
+  성분은 TP −7% / FP −18%로 **단순 부피 감소**였다 — "더 잘 골라서" 오른 게 아니다.
+- offline precision +11%가 IoU로 전이되지 않은 이유 2개:
+  ① `weight_mode=score`에서 교체된 query는 cls가 낮아(중앙 0.841) **렌더 부피까지 함께 줄어든다**
+     → 개수를 고정해도 부피가 고정되지 않아 단일변수가 깨진다.
+  ② **`sharp`는 사실상 거리 정보다.** 대역별 sharp 중앙: 0–20m **0.513** / 20–30m 0.325 /
+     30–40m 0.315 / 40m+ 0.338. **30m 밖에는 sharp≥0.5인 query가 0개**(최대 ~0.44).
+     depth bin이 2~58m/64개(0.875m)라 원거리에서 depth 확신도를 얻는 것 자체가 불가능하다.
+     cls가 이미 거리 정보를 갖고 있어 곱해도 새 정보가 없다.
+- **"먼 것 중 날카로운 것만 추가"도 실패**: 30m+ 상위 1% sharp의 `dmin<2m`=0.600 < 0.635(기준).
+  40m+는 0.100. 통과하는 건 20m+ 상위 5%(140개)뿐이고 IoU 기여 +0.4%로 노이즈.
+  이유: 원거리 병목은 **검출 확신도가 아니라 위치 정밀도**(30m+ 중심오차 2.2~2.6m)이고,
+  depth sharpness는 "거기 뭔가 있다"만 알려주고 "정확히 어디"는 못 알려준다.
+
+## 2026-07-30 KST — [실측 N=300] fg score 재설계는 닫힌 문 / 병목은 중심정확도·크기
+
+덤프: `work_dirs/full_.../eval/qfeat_18ep_N300_depth/qfeat` (epoch_18, fg0.9/occ0.75/nms0,
+query 60,000개 = 300샘플 × 200query, GT 인스턴스 3,078개). 분석 스크립트는 scratchpad
+`analyze_qfeat.py` (session-local — 재현 필요하면 이 NOTES의 수치로 대조할 것).
+
+- **선택 recall 0.570 / precision 0.474**. 매칭된 query 1,325개(43%)가 fg0.9에서 탈락하고,
+  선택된 3,698개 중 1,945개는 어떤 GT와도 매칭되지 않는다.
+- **탈락 원인은 거리다(크기 아님)**: `spearman(score, ego거리) = -0.597`,
+  `spearman(score, GT부피) = -0.137`. fg0.9 통과율은 0–20m 0.808 → 20–30m 0.647 →
+  30–40m 0.392 → 40m+ **0.129**.
+- **그러나 score는 miscalibrated가 아니다 — 위치정확도 추정기다.**
+  `spearman(score, xy중심오차) = -0.397`. 탈락 pair는 xy중심오차 중앙 **2.42m**(<2m 비율 0.43),
+  통과 pair는 1.16m(0.73). 렌더 블롭이 2.4×5.0m이므로 탈락 pair는 블롭 절반이 객체 밖이다.
+  → **"억울한 탈락"이 아니라 "실제로 절반 어긋난 것"**. fg_thr을 내리면 TP/FP를 섞어 받는다.
+- **⚠ range-bin 정규화(거리별 threshold)는 크게 손해다**: AP 0.476 → 0.189(평균정규화)/0.268(백분위).
+  score의 거리 의존성 = 위치정확도의 거리 의존성이라, 정규화하면 실제 정보를 지운다. **재시도 금지.**
+- **depth 분포 sharpness의 부호는 직관과 반대다**: normalized entropy가 matched 0.582 <
+  unmatched 0.679 — **날카로운 쪽이 진짜**다. "뭉툭=하드샘플이니 가점" 은 FP를 부스트한다.
+  신호는 있으나(AUC[-entropy] 0.877 단독, cls<0.9 조건부 0.808) cls_prob(0.953)와 겹쳐
+  더해도 AP 0.4762 → 0.4742 (무이득).
+- **큰 블롭은 거의 매칭되지 않지만 이미 걸러져 있다**: 블롭부피 4분위 매칭률
+  0.163/0.029/0.010/**0.005**, 4분위 score 평균 0.037 · fg0.9 통과율 0.001.
+  부피 penalty를 넣어도 동일 예산에서 recall 0.571→0.572 (노이즈).
+- **결론: 예산을 고정하면 cls_prob를 이기는 스코어 조합이 없다.** 추론에서 남은 실질 손잡이는
+  threshold뿐. cls 스윕 곡선(선택 recall/precision): 0.95→0.294/0.554, **0.90→0.571/0.474**,
+  0.80→0.773/0.377, 0.75→0.817/0.353, 0.60→0.896/0.296, 0.50→0.928/0.269.
+- **z 위치는 전 거리대에서 정확하다** (중심 z오차 중앙 0.13~0.19m). 따라서 IoU2d/IoU3d 격차(0.70)는
+  z 배치가 아니라 **z extent(높이)만 짧은 것**이다.
+- 파생 결론: 먼 객체의 진짜 병목은 **중심 정확도**이고 추론에서 고칠 수 없다.
+  `_maybe_dump_eval_query_features`의 `EOCF_EVAL_CAM_SCORE`/`fg_score_cam_attn_weight` 경로도
+  같은 이유로 기대값이 낮다.
+
+**⚠ 덤프 텐서 레이아웃 함정**: `gt_instance_centers_world`는 **`[1, T7, N, 3]`
+(batch, frame, instance, xyz)** 이고 `gt_instance_centers_valid`는 `[T7, N]`이다.
+`[N,T,1,3]`으로 착각하면 `i==0`인 pair만 집계되고 **조용히 통과한다**(에러 없음).
+실제로 이번 분석에서 1차로 이 버그가 났고, 유효 pair가 1,126개 대신 94개로 줄었다.
+`gt_instance_sizes`는 `[N,3] = (w,l,h)`로 인스턴스 직접 인덱싱이 맞다.
+
+## 2026-07-30 KST — `EOCF_EVAL_DUMP_QFEAT` (per-query 덤프) 사용 시 주의사항
+
+- **기본 OFF.** 켜면 `_eval_train_faithful_inst_match()`가 매 샘플 추가로 돌아 eval이 느려진다
+  (oracle 실행과 동일 비용). 또 `extract_feat_query`에 attn용 GT가 함께 넘어간다 —
+  이건 attn **target** 산출용일 뿐 예측을 바꾸지 않지만, 플래그 ON일 때만 켜지는 경로다.
+- **파일명 인덱스**: 이 repo의 test_pipeline `meta_keys`에 `global_idx`가 **없다**.
+  따라서 `_extract_eval_global_idx`는 항상 None을 반환하고, 파일명은
+  `rank*1_000_000 + 샘플순번`으로 떨어진다. fixed_val이라 run 간 순서는 재현되지만,
+  **run 간 파일명을 sample id로 신뢰하려면 `global_idx`를 meta_keys에 추가해야 한다.**
+- **`gt_instance_dims` / `gt_instance_sizes`는 덤프되지 않는다.** test_pipeline의 `Collect3D`
+  keys에 없기 때문(로딩은 `LoadInstanceWithFlow`에서 되지만 Collect에서 떨어진다).
+  GT 크기가 필요하면 config의 test `Collect3D` keys에 두 키를 추가하면 자동으로 덤프에 포함된다.
+- **`score_q == cls_prob_q`인 이유**: 현재 config가 `fg_score_iou_weight=0.0,
+  fg_score_cls_weight=1.0, fg_score_cam_attn_weight=0.0`이고, eval에서는 `inst_match_result={}`,
+  `query_attn_cam_score_pack=None`이라 `iou_q`/`cam_attn_score_q`가 항등 0이다.
+  → 덤프의 `iou_q`/`cam_attn_score_q`는 정보가 없는 0 벡터다(placeholder로만 저장).
+- **`baseline_selected_idx_q`는 oracle override 이전 값**이다. `EOCF_EVAL_ORACLE_MATCH=1`과
+  동시에 켜도 baseline/oracle을 나란히 비교할 수 있다.
+- `EOCF_EVAL_VIS=0`이면 `dist_test.sh`/`tools/test.py`가 `EOCF_EVAL_VIS_DIR`를 자동 설정하지 않아
+  덤프가 `./work_dirs/eval_vis/qfeat`로 떨어진다. **덤프만 쓸 거면 `EOCF_EVAL_VIS_DIR`를 직접 export할 것.**
+
+## 2026-07-30 KST — eval 지표는 asset present/future 4종뿐 (+ 3D TP/FP/FN)
+
+- 출력: `IOU_2d_asset_{present,future}`, `IOU_3d_asset_{present,future}`,
+  `IOU_3d_asset_{present,future}_{TP,FP,FN,micro}`. 그 외(nusocc/bbox_aabb/bbox_rot/Recall3d)는
+  코드에서 삭제됐다 — 이전 로그와 지표 이름이 다르니 비교 스크립트 주의.
+- **`EOCF_EVAL_MODE`는 더 이상 metric을 바꾸지 않는다.** 시각화 기준 프레임에만 영향.
+  present/future 지표는 항상 함께 계산된다.
+- **aabb 로드는 두 갈래가 있다. 혼동 금지**:
+  ① `LoadInstanceWithFlow(load_gt_bbox_aabb=True)` → `gt_instance_centers_world/valid/ids` 파생.
+     **oracle 매칭에 필수라 절대 빼면 안 된다.**
+  ② `_eval_load_bbox_gt_v2` → bbox 지표 전용 lazy 로더. 지표와 함께 사용 중단됨.
+- test_pipeline에는 `LoadOccupancy`가 없다. `gt_occ`/`segmentation`/`segmentation_bev`/`instance_bev`가
+  전부 None이므로, 이 값들을 참조하는 코드를 새로 추가하면 조용히 None을 받는다(가드 필수).
+  train_pipeline에는 그대로 있으니 학습에는 영향 없다.
+
+## 2026-07-30 KST — eval은 미래 4프레임만 채점한다 (present 열은 그림 전용)
+
+- `EOCF_EVAL_MODE=1`(future)에서 metric은 `centers_eval_tq3`(= traj 텐서의 future tail 4프레임)
+  으로만 계산된다. `query_debug_vis`에 present 열이 생겨도 **IoU2d/3d(asset)에는 present가
+  들어가지 않는다.** 그림 열 수와 채점 프레임 수를 동일시하지 말 것.
+- 행별 프레임 소스가 다르다: 1~3행은 `centers_future_tq3`(present+future), 4행은
+  `eval_cmp_pack`(metric에 쓴 pred/GT). 두 텐서의 프레임 수가 다르면 **예외 없이 열이 밀린다**
+  (렌더러가 `t < shape[0]` 가드로 조용히 건너뜀). 프레임 수를 바꿀 땐 반드시 양쪽을 같이 볼 것.
+- present 프레임 GT를 4행에 쓰려면 metric과 **같은 align3d**를 적용해야 한다
+  (`_apply_3d_align_sequence`). metric은 future tail만 정렬하므로 present는 따로 1프레임 정렬한다.
+
+## 2026-07-28 KST — traj xy refine은 추론 적용 모듈이다 (train-only 아님)
+
+- `refine_trajectory_absolute_xy`는 GT를 쓰지 않는다(입력: query feat / cls score / centers /
+  예측 traj offset). 구조도 `corr_head`(보정량)+`gate_head`(신뢰도 게이트)의 residual refinement이고,
+  loss가 refine 출력의 **절대 미래 XY**를 GT에 맞추도록 학습시킨다 → 추론에 적용해야 이득이 실현된다.
+  (GT를 쓰는 `refine_trajectory_with_gt_anchor`는 별도 존재하며 미사용 — 둘을 혼동하지 말 것.)
+- 2026-07-28 이전까지 `simple_test`에 배선이 없어 eval은 refine 이전 값을 썼다. 지금은 항상 적용된다.
+- 레이아웃 함정: `centers_world_traj` / future mixture는 `frame_indices =
+  [present_global_idx + step for step in range(F+1)]`로 만들어져 **T = F+1, index 0 = present**다.
+  full-window `centers_world`(T=7)와 present 인덱스가 다르므로, 교체 helper에는 0을 넘겨야 한다.
+  잘못 넘기면 helper가 조용히 원본을 반환해 **아무 일도 안 일어난다**(예외 없음).
+- 학습 쪽 refine 영향은 제한적이다: `query_matched_loss_history_only=True`라 미래는 GMO loss를
+  안 받고, 매칭 cost도 history 3프레임만 쓴다. 즉 refine은 자기 loss와 공유 feature gradient로만
+  학습에 관여했다 — 그래서 추론에 붙여도 다른 학습 요소와 충돌할 여지는 작다.
+
+## 2026-07-27 KST — eval GT 필터 적용 지점 정리 (사람/visibility)
+
+- 사람(id=7) 제외는 **GT 소스마다 따로 구현**되어 있다. 한 곳만 고치면 지표 간 객체 집합이 어긋난다.
+  - inst3d: config `LoadInstanceWithFlow(exclude_occ_class_ids=(7,))` — train/test 양쪽에 필요
+  - asset: `_eval_load_asset_gt`의 `a[:,3] != 7` (하드코딩, config 무관)
+  - bbox v2: `_eval_load_bbox_gt_v2`의 `a[:,3] == 7` 제거 (2026-07-27 추가. 그 전엔 누락)
+  - nusocc gt_occ: `_eval_nusocc_3d_fg`의 `(gt != 255) & (gt != 7)`
+- visibility `drop_ids`는 세 로더 모두에 이미 적용된다. 다만 조건은 "과거 3프레임 **최초** annotation의
+  visibility==1"뿐 — 다른 visibility(2~4)나 나중에 1로 떨어지는 경우는 제거하지 않는다.
+- `query_debug_vis` 행 구성(eval은 `_skip_traj_rows=True`라 4행):
+  1=gt_cls, 2=all, 3=hi_cls는 `gt_inst`(inst3d), **4=eval 비교 행은 `eval_cmp_pack`의 GT**.
+  4행만 다른 GT를 쓰므로 "1~3행엔 없는 게 4행에만 보인다"면 여기부터 의심할 것.
+
+## 2026-07-27 KST — 이 머신 실행 전제 2가지 (torch 2.7 / occ_dt 부재)
+
+- **torch 2.7.0 + mmcv 1.7.2**: mmcv의 `MMDistributedDataParallel._run_ddp_forward`가 torch에서
+  사라진 `_use_replicated_tensor_module`을 참조한다. `mmdet_train.py`의
+  `_Torch27MMDistributedDataParallel`(scatter/_run_ddp_forward 재정의)을 학습·eval 양쪽에서 써야 한다.
+  이 shim이 빠지면 DDP forward 첫 호출에 AttributeError로 즉사한다 — 코드 되돌릴 때 특히 주의.
+- **`./data/occ_dt` 없음**: DT 캐시가 이 머신에 없다. `use_query_dt_loss=False`면 `load_occ_dt=False`로
+  두고 Collect3D `keys`에서도 `'occ_dt'`를 빼야 한다(둘 중 하나만 하면 FileNotFoundError 또는 KeyError).
+- GPU는 1장(RTX PRO 6000, 97GB). 스크립트의 `GPUS=8`은 8 rank가 한 GPU에 몰리고 rank마다 NuScenes
+  trainval 테이블을 통째로 로드해 62GB RAM이 먼저 고갈된다.
+
 ## 2026-07-23 KST — f3 visibility 필터 ID/시간 규칙
 
 - `subset_attn_cover_pyr_aabb_dice3d_new_filter.py`의 제거 조건은 **7프레임 중 임의의
@@ -610,3 +1187,41 @@ class를 정확히 안 따지고 "instance에 유효 voxel이 있냐"만 봐도 
   새 프로세스를 시작해야 한다.
 - `projects/configs/baselines/EfficientOCF_V1.1_1gpu.py`는 이 저장소에 없으므로 신규 기본값은
   `efficientocf_config.py`에만 추가하고 대상 config에서 명시적으로 override했다.
+
+## 2026-07-30 — eval fg-score cam attention 항 주의사항
+
+- eval score는 `(w_iou*iou_q + w_cls*cls_prob_q + w_cam*cam_attn_score_q*valid) / (w_iou+w_cls+w_cam*valid)`.
+  `iou_q`는 eval에서 `inst_match_result={}`라 항상 0이며 **GT 기반이므로 절대 켜지 말 것**.
+  `cam_attn_score_q`만 GT-free다(예측 mixture의 카메라 투영 vs. 자기 attention map의 KL).
+- GT 미사용 검증 완료: `build_query_attn_cam_gaussian_targets`(utils_instance_img_debug.py:1487) →
+  `_project_query_gaussians_to_cam_maps`(:1119)는 mixture(예측), 카메라 calib, `future_egomotion`(입력)만 쓴다.
+  `_compute_query_attn_cam_gaussian_score`(utils_loss.py:2325)도 attention과 위 target만 쓴다.
+- `EOCF_EVAL_CAM_SCORE=1`이어도 `EOCF_EVAL_W_CAM`(또는 config `fg_score_cam_attn_weight`)이 0이면
+  score는 변하지 않는다. 현재 config 값은 `fg_score_cam_attn_weight=0.0`이므로 **두 env를 함께 설정해야** 한다.
+- 유효하지 않은 query(투영 실패 등)는 `cam_attn_score_valid_q=False`가 되어 분모에서도 `w_cam`이 빠진다.
+  즉 cam 항이 없는 query와 있는 query가 같은 스케일로 비교된다(0점 패널티가 아님).
+- 비용: `_project_query_gaussians_to_cam_maps`는 chunk=32로 Q*G(=200*48) 성분을 카메라별 루프에서
+  feat map(H*W)에 accumulate하고 카메라마다 `.item()` 동기화를 2회 한다. FLOP은 작지만 kernel launch/sync가
+  많아 샘플당 수십 ms 수준의 오버헤드가 예상된다. `out_map`은 `[T,Q,N,H,W]`(≈27MB @ 1x200x6x56x100)로 상시 할당된다.
+
+## 2026-08-08 — traincal 평가 시 반드시 지킬 것
+
+**@800 은 순위 예측에 쓰면 안 된다.** 후보를 좁히는 용도로만 쓴다.
+지금까지 다섯 번 뒤집혔다: ep19/ep20 · α0.5/0.1 vs α1.0/0.2 · α_s=0 "제거 가능" 오판 ·
+res704 @800 1등이 @5119 7등 · feat128 @800 1등이 @5119 3등.
+@800→@5119 편향이 조합마다 다르다(−0.0026 ~ −0.0050)는 게 원인이다.
+
+**@5119 는 @800 보다 한 칸 높은 α_speed 를 선호한다.** 두 config 에서 같은 방향으로 나왔다
+(feat128 0.2→0.3, res704 0.3→0.4). @800 으로 α_s 를 정하면 **과소평가**하게 된다.
+새 checkpoint 를 튜닝할 때는 @800 봉우리보다 α_s 한 칸 위를 @5119 후보에 반드시 포함할 것.
+
+**@5119 분해능은 약 0.0004** (1/5119). 이보다 작은 avg 차이로 조합 순위를 매기지 말 것.
+res704 상위 5개는 0.00016 안에 몰려 있어 재실행하면 순위가 바뀔 수 있다.
+논문에는 동점 집합 중 가장 단순한 값을 쓴다 (현재 res704 α0.6/0.3, 수치 1등은 α0.7/0.4).
+
+**통계 파일은 checkpoint 마다 다시 뽑아야 한다.** 안 뽑으면 조용히 틀린다.
+`feat128_ep19_v3_n4000.json` 은 GPU 크래시로 **3,800 에서 동결**됐다(마지막 200 구간 변화
+0.06~0.25% 로 수렴 확인, 재수집 불필요). 파일명의 n4000 과 실제 표본수가 다르니 주의.
+
+**해상도 어블레이션 수치는 baseline 인지 traincal 인지 명시할 것.**
+baseline 격차 −4.4% 가 traincal 적용 후 −6.3% 로 벌어진다(traincal 이 feat128 에서 더 잘 먹힘).

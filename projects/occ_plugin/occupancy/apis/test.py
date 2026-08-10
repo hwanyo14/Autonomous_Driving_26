@@ -62,6 +62,25 @@ def _running_eval_msg(n, iou_cm, bbox_cm, bbox_rot_cm, iou3d, iou3d_bbox,
                 _mean(recall3d_asset or []))
 
 
+def _asset_msg(n, cm_p, cm_f, i3_p, i3_f, suffix=""):
+    """asset present/future 요약 한 줄."""
+    from projects.occ_plugin.utils.formating import cm_to_ious
+    def _iou2d(cms):
+        return float(cm_to_ious(sum(cms))[1]) if cms else float("nan")
+    def _m(xs):
+        return float(np.mean(xs)) if xs else float("nan")
+    return ("[eval][{}] IoU3d(asset)_future={:.4f} IoU2d(asset)_future={:.4f} "
+            "IoU3d(asset)_present={:.4f} IoU2d(asset)_present={:.4f}{}").format(
+                n, _m(i3_f), _iou2d(cm_f), _m(i3_p), _iou2d(cm_p), suffix)
+
+
+def _comps_msg(tag, comps_sum):
+    tp, fp, fn = [float(v) for v in np.asarray(comps_sum, dtype=np.float64)[:3]]
+    denom = tp + fp + fn
+    return "[iou3d comps asset {}] TP={:.3e} FP={:.3e} FN={:.3e} | micro IoU3d={:.4f}".format(
+        tag, tp, fp, fn, tp / denom if denom > 0 else float("nan"))
+
+
 def _append_live_eval_log(msg):
     vis_dir = os.environ.get("EOCF_EVAL_VIS_DIR", "")
     if not vis_dir:
@@ -164,235 +183,85 @@ def custom_single_gpu_test(model, data_loader, show=False, out_dir=None, show_sc
     logger = get_root_logger()
     logger.info(parameter_count_table(model))
 
-    iou_metric, iou_bbox_metric, iou_bbox_rot_metric, iou_asset_metric = [], [], [], []
-    iou_3d_metric, iou_3d_bbox_metric, iou_3d_bbox_rot_metric, iou_3d_asset_metric, recall_3d_metric = [], [], [], [], []
-    iou_3d_asset_comps_sum = np.zeros(3, dtype=np.float64)
-    r3d_comps_sum = np.zeros(4, dtype=np.float64)
-    recall_3d_rot_metric = []
-    r3d_rot_comps_sum = np.zeros(4, dtype=np.float64)
-    recall_3d_asset_metric = []
-    r3d_asset_comps_sum = np.zeros(4, dtype=np.float64)
+    cm_p, cm_f, i3_p, i3_f = [], [], [], []
+    comps_p = np.zeros(3, dtype=np.float64)
+    comps_f = np.zeros(3, dtype=np.float64)
 
     for i, data in enumerate(data_loader):
         with torch.no_grad():
             result = model(return_loss=False, rescale=True, **data)
-
-        if 'hist_for_iou' in result.keys():
-            iou_metric.append(result['hist_for_iou'])
-        if 'hist_for_iou_bbox' in result.keys():
-            iou_bbox_metric.append(result['hist_for_iou_bbox'])
-        if 'hist_for_iou_bbox_rot' in result.keys():
-            iou_bbox_rot_metric.append(result['hist_for_iou_bbox_rot'])
-        if 'hist_for_iou_asset' in result.keys():
-            iou_asset_metric.append(result['hist_for_iou_asset'])
-        if 'iou_3d' in result.keys() and not np.isnan(result['iou_3d']):
-            iou_3d_metric.append(result['iou_3d'])
-        if 'iou_3d_bbox' in result.keys() and not np.isnan(result['iou_3d_bbox']):
-            iou_3d_bbox_metric.append(result['iou_3d_bbox'])
-        if 'iou_3d_bbox_rot' in result.keys() and not np.isnan(result['iou_3d_bbox_rot']):
-            iou_3d_bbox_rot_metric.append(result['iou_3d_bbox_rot'])
-        if 'iou_3d_asset' in result.keys() and not np.isnan(result['iou_3d_asset']):
-            iou_3d_asset_metric.append(result['iou_3d_asset'])
-            if isinstance(result.get('iou_3d_asset_comps', None), dict):
-                c = result['iou_3d_asset_comps']
-                iou_3d_asset_comps_sum += np.array(
-                    [c.get('tp', 0.0), c.get('fp', 0.0), c.get('fn', 0.0)])
-        if 'recall_3d' in result.keys() and not np.isnan(result['recall_3d']):
-            recall_3d_metric.append(result['recall_3d'])
-            if isinstance(result.get('recall_3d_comps', None), dict):
-                c = result['recall_3d_comps']
-                r3d_comps_sum += np.array(
-                    [c.get('tp', 0.0), c.get('fp', 0.0), c.get('fn', 0.0), c.get('bbox_fp', 0.0)])
-        if 'recall_3d_rot' in result.keys() and not np.isnan(result['recall_3d_rot']):
-            recall_3d_rot_metric.append(result['recall_3d_rot'])
-            if isinstance(result.get('recall_3d_rot_comps', None), dict):
-                c = result['recall_3d_rot_comps']
-                r3d_rot_comps_sum += np.array(
-                    [c.get('tp', 0.0), c.get('fp', 0.0), c.get('fn', 0.0), c.get('bbox_fp', 0.0)])
-        if 'recall_3d_asset' in result.keys() and not np.isnan(result['recall_3d_asset']):
-            recall_3d_asset_metric.append(result['recall_3d_asset'])
-            if isinstance(result.get('recall_3d_asset_comps', None), dict):
-                c = result['recall_3d_asset_comps']
-                r3d_asset_comps_sum += np.array(
-                    [c.get('tp', 0.0), c.get('fp', 0.0), c.get('fn', 0.0), c.get('bbox_fp', 0.0)])
-
+        cm_p, cm_f, i3_p, i3_f, comps_p, comps_f = _accumulate(
+            result, cm_p, cm_f, i3_p, i3_f, comps_p, comps_f)
         prog_bar.update()
         if (i + 1) % 50 == 0:
-            print("\n" + _running_eval_msg(i + 1, iou_metric, iou_bbox_metric,
-                                           iou_bbox_rot_metric, iou_3d_metric,
-                                           iou_3d_bbox_metric, iou_3d_bbox_rot_metric,
-                                           recall_3d_metric, recall_3d_rot_metric,
-                                           iou_asset_metric, iou_3d_asset_metric,
-                                           recall_3d_asset_metric), flush=True)
+            print("\n" + _asset_msg(i + 1, cm_p, cm_f, i3_p, i3_f), flush=True)
 
-    final_msg = _running_eval_msg(len(dataset), iou_metric, iou_bbox_metric,
-                                  iou_bbox_rot_metric, iou_3d_metric,
-                                  iou_3d_bbox_metric, iou_3d_bbox_rot_metric,
-                                  recall_3d_metric, recall_3d_rot_metric,
-                                  iou_asset_metric, iou_3d_asset_metric,
-                                  recall_3d_asset_metric) + "  [FINAL]"
+    final_msg = _asset_msg(len(dataset), cm_p, cm_f, i3_p, i3_f, "  [FINAL]")
     print("\n" + final_msg, flush=True)
     _append_live_eval_log(final_msg)
-    iou_3d_asset_comps_msg = _iou3d_asset_comps_line(iou_3d_asset_comps_sum)
-    print(iou_3d_asset_comps_msg, flush=True)
-    _append_live_eval_log(iou_3d_asset_comps_msg)
+    for tag, c in (("future", comps_f), ("present", comps_p)):
+        msg = _comps_msg(tag, c)
+        print(msg, flush=True)
+        _append_live_eval_log(msg)
 
-    res = {
-        'hist_for_iou': [sum(iou_metric)] if iou_metric else [],
-        'hist_for_iou_bbox': [sum(iou_bbox_metric)] if iou_bbox_metric else [],
-        'hist_for_iou_bbox_rot': [sum(iou_bbox_rot_metric)] if iou_bbox_rot_metric else [],
-        'hist_for_iou_asset': [sum(iou_asset_metric)] if iou_asset_metric else [],
-        'iou_3d': iou_3d_metric,
-        'iou_3d_bbox': iou_3d_bbox_metric,
-        'iou_3d_bbox_rot': iou_3d_bbox_rot_metric,
-        'iou_3d_asset': iou_3d_asset_metric,
-        'iou_3d_asset_comps': [iou_3d_asset_comps_sum],
-        'recall_3d': recall_3d_metric,
-        'recall_3d_comps': [r3d_comps_sum],
-        'recall_3d_rot': recall_3d_rot_metric,
-        'recall_3d_rot_comps': [r3d_rot_comps_sum],
-        'recall_3d_asset': recall_3d_asset_metric,
-        'recall_3d_asset_comps': [r3d_asset_comps_sum],
+    return {
+        'hist_for_iou_asset_present': [sum(cm_p)] if cm_p else [],
+        'hist_for_iou_asset_future': [sum(cm_f)] if cm_f else [],
+        'iou_3d_asset_present': i3_p,
+        'iou_3d_asset_future': i3_f,
+        'iou_3d_asset_present_comps': [comps_p],
+        'iou_3d_asset_future_comps': [comps_f],
     }
-    return res
+
+
+def _accumulate(result, cm_p, cm_f, i3_p, i3_f, comps_p, comps_f):
+    """result dict에서 asset present/future 지표를 누적."""
+    if 'hist_for_iou_asset_present' in result:
+        cm_p.append(result['hist_for_iou_asset_present'])
+    if 'hist_for_iou_asset_future' in result:
+        cm_f.append(result['hist_for_iou_asset_future'])
+    for key, acc in (('iou_3d_asset_present', i3_p), ('iou_3d_asset_future', i3_f)):
+        if key in result and not np.isnan(result[key]):
+            acc.append(result[key])
+    for key, acc in (('iou_3d_asset_present_comps', comps_p),
+                     ('iou_3d_asset_future_comps', comps_f)):
+        c = result.get(key, None)
+        if isinstance(c, dict):
+            acc += np.array([c.get('tp', 0.0), c.get('fp', 0.0), c.get('fn', 0.0)])
+    return cm_p, cm_f, i3_p, i3_f, comps_p, comps_f
+
 
 def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, show=False, out_dir=None):
-    """Test model with multiple gpus.
-    This method tests model with multiple gpus and collects the results
-    under two different modes: gpu and cpu modes. By setting 'gpu_collect=True'
-    it encodes results to gpu tensors and use gpu communication for results
-    collection. On cpu mode it saves the results on different gpus to 'tmpdir'
-    and collects them by the rank 0 worker.
-    Args:
-        model (nn.Module): Model to be tested.
-        data_loader (nn.Dataloader): Pytorch data loader.
-        tmpdir (str): Path of directory to save the temporary results from
-            different gpus under cpu mode.
-        gpu_collect (bool): Option to use either gpu or cpu to collect results.
-    Returns:
-        list: The prediction results.
-    """
-
+    """Test model with multiple gpus (asset present/future 지표 전용)."""
     model.eval()
-    
-    # init predictions
-    iou_metric = []
-    iou_bbox_metric = []
-    iou_bbox_rot_metric = []
-    iou_asset_metric = []
-    height_l1_metric = []
-    vpq_metric = []
-    iou_3d_metric = []
-    iou_3d_bbox_metric = []
-    iou_3d_bbox_rot_metric = []
-    iou_3d_asset_metric = []
-    iou_3d_asset_comps_sum = np.zeros(3, dtype=np.float64)   # [tp, fp, fn] asset IoU voxel 합
-    recall_3d_metric = []
-    r3d_comps_sum = np.zeros(4, dtype=np.float64)   # [tp, fp, fn, bbox_fp] voxel 합
-    recall_3d_rot_metric = []
-    r3d_rot_comps_sum = np.zeros(4, dtype=np.float64)   # rot OBB 관용 버전
-    recall_3d_asset_metric = []
-    r3d_asset_comps_sum = np.zeros(4, dtype=np.float64)   # asset-union 관용 버전
+    cm_p, cm_f, i3_p, i3_f = [], [], [], []
+    comps_p = np.zeros(3, dtype=np.float64)
+    comps_f = np.zeros(3, dtype=np.float64)
 
     dataset = data_loader.dataset
     rank, world_size = get_dist_info()
     if rank == 0:
         prog_bar = mmcv.ProgressBar(len(dataset))
-    metric_every = int(os.environ.get("EOCF_EVAL_METRIC_EVERY", os.environ.get("EOCF_EVAL_VIS_EVERY", "50")))
-    # 부분 eval(파라미터 튜닝용 짧은 확인): 전 rank 합산 N샘플 처리 후 조기 종료.
-    # fixed_val=True(순서 고정)라 같은 N끼리는 run간 비교 가능. 0=전체.
+    metric_every = int(os.environ.get("EOCF_EVAL_METRIC_EVERY",
+                                      os.environ.get("EOCF_EVAL_VIS_EVERY", "50")))
+    # 부분 eval: 전 rank 합산 N샘플 처리 후 조기 종료. 0=전체.
     max_samples = int(os.environ.get("EOCF_EVAL_MAX_SAMPLES", "0"))
-    
+
     time.sleep(2)  # This line can prevent deadlock problem in some cases.
-    
     logger = get_root_logger()
     logger.info(parameter_count_table(model))
-    
+
     for i, data in enumerate(data_loader):
-
         with torch.no_grad():
-
             result = model(return_loss=False, rescale=True, **data)
-            
-            if 'hist_for_iou' in result.keys():
-                iou_metric.append(result['hist_for_iou'])
-
-            if 'hist_for_iou_bbox' in result.keys():
-                iou_bbox_metric.append(result['hist_for_iou_bbox'])
-
-            if 'hist_for_iou_bbox_rot' in result.keys():
-                iou_bbox_rot_metric.append(result['hist_for_iou_bbox_rot'])
-            if 'hist_for_iou_asset' in result.keys():
-                iou_asset_metric.append(result['hist_for_iou_asset'])
-
-            if 'height_l1' in result.keys():
-                if not torch.isnan(result['height_l1']):
-                    height_l1_metric.append(result['height_l1'])
-            if 'vpq' in result.keys():
-                vpq_metric.append(result['vpq'])
-            
-            if 'iou_3d' in result.keys():
-                if not np.isnan(result['iou_3d']):
-                    iou_3d_metric.append(result['iou_3d'])
-
-            if 'iou_3d_bbox' in result.keys():
-                if not np.isnan(result['iou_3d_bbox']):
-                    iou_3d_bbox_metric.append(result['iou_3d_bbox'])
-
-            if 'iou_3d_bbox_rot' in result.keys():
-                if not np.isnan(result['iou_3d_bbox_rot']):
-                    iou_3d_bbox_rot_metric.append(result['iou_3d_bbox_rot'])
-            if 'iou_3d_asset' in result.keys():
-                if not np.isnan(result['iou_3d_asset']):
-                    iou_3d_asset_metric.append(result['iou_3d_asset'])
-                    if isinstance(result.get('iou_3d_asset_comps', None), dict):
-                        c = result['iou_3d_asset_comps']
-                        iou_3d_asset_comps_sum += np.array(
-                            [c.get('tp', 0.0), c.get('fp', 0.0), c.get('fn', 0.0)])
-
-            if 'recall_3d' in result.keys():
-                if not np.isnan(result['recall_3d']):
-                    recall_3d_metric.append(result['recall_3d'])
-                    if isinstance(result.get('recall_3d_comps', None), dict):
-                        c = result['recall_3d_comps']
-                        r3d_comps_sum += np.array(
-                            [c.get('tp', 0.0), c.get('fp', 0.0), c.get('fn', 0.0), c.get('bbox_fp', 0.0)])
-            if 'recall_3d_rot' in result.keys():
-                if not np.isnan(result['recall_3d_rot']):
-                    recall_3d_rot_metric.append(result['recall_3d_rot'])
-                    if isinstance(result.get('recall_3d_rot_comps', None), dict):
-                        c = result['recall_3d_rot_comps']
-                        r3d_rot_comps_sum += np.array(
-                            [c.get('tp', 0.0), c.get('fp', 0.0), c.get('fn', 0.0), c.get('bbox_fp', 0.0)])
-            if 'recall_3d_asset' in result.keys():
-                if not np.isnan(result['recall_3d_asset']):
-                    recall_3d_asset_metric.append(result['recall_3d_asset'])
-                    if isinstance(result.get('recall_3d_asset_comps', None), dict):
-                        c = result['recall_3d_asset_comps']
-                        r3d_asset_comps_sum += np.array(
-                            [c.get('tp', 0.0), c.get('fp', 0.0), c.get('fn', 0.0), c.get('bbox_fp', 0.0)])
-
-            batch_size = 1
-                
+        cm_p, cm_f, i3_p, i3_f, comps_p, comps_f = _accumulate(
+            result, cm_p, cm_f, i3_p, i3_f, comps_p, comps_f)
         if rank == 0:
-            for _ in range(batch_size * world_size):
+            for _ in range(world_size):
                 prog_bar.update()
         if metric_every > 0 and (i + 1) % metric_every == 0:
-            msg = _distributed_running_eval_msg(
-                (i + 1) * world_size,
-                len(dataset),
-                iou_metric,
-                iou_bbox_metric,
-                iou_bbox_rot_metric,
-                iou_3d_metric,
-                iou_3d_bbox_metric,
-                iou_3d_bbox_rot_metric,
-                recall_3d_metric,
-                recall_3d_rot_metric,
-                iou_asset_metric,
-                iou_3d_asset_metric,
-                recall_3d_asset_metric,
-            )
+            msg = _dist_asset_msg((i + 1) * world_size, len(dataset),
+                                  cm_p, cm_f, i3_p, i3_f)
             if rank == 0:
                 print("\n" + msg, flush=True)
                 _append_live_eval_log(msg)
@@ -402,120 +271,69 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
                       f"(EOCF_EVAL_MAX_SAMPLES={max_samples})", flush=True)
             break
 
-    # 최종 값도 running과 같은 형식으로 출력·live log 기록 — dataset 크기가 metric_every
-    # 배수가 아니면 마지막 running 줄(예: 4992/5119) 이후가 안 찍히므로 여기서 마감한다.
-    # (_distributed_running_eval_msg는 all_reduce collective라 전 rank가 함께 호출)
+    # 최종 요약 — all_reduce collective라 전 rank가 함께 호출(출력만 rank0).
     if metric_every > 0:
         n_done = (i + 1) * world_size if max_samples > 0 else len(dataset)
-        final_msg = _distributed_running_eval_msg(
-            n_done,
-            len(dataset),
-            iou_metric,
-            iou_bbox_metric,
-            iou_bbox_rot_metric,
-            iou_3d_metric,
-            iou_3d_bbox_metric,
-            iou_3d_bbox_rot_metric,
-            recall_3d_metric,
-            recall_3d_rot_metric,
-            iou_asset_metric,
-            iou_3d_asset_metric,
-            recall_3d_asset_metric,
-        ) + "  [FINAL]"
-        # Recall3d 성분 합산 (all_reduce — 전 rank 공동 호출). aabb/rot/asset 각각.
-        device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
-        def _comps_line(tag, comps_sum):
-            comps_t = torch.as_tensor(comps_sum, dtype=torch.float64, device=device)
-            dist.all_reduce(comps_t, op=dist.ReduceOp.SUM)
-            tp, fp, fn, bfp = [float(v) for v in comps_t.cpu().tolist()]
-            denom = tp + fn + fp - bfp
-            return ("[recall3d comps {}] TP={:.3e} FP={:.3e} FN={:.3e} bboxFP={:.3e} "
-                    "| 비관용FP={:.3e} | micro Recall3d={:.4f}").format(
-                        tag, tp, fp, fn, bfp, fp - bfp,
-                        (tp + bfp) / denom if denom > 0 else float("nan"))
-        comps_msg = _comps_line("bbox_aabb", r3d_comps_sum)
-        comps_rot_msg = _comps_line("bbox_rot", r3d_rot_comps_sum)
-        comps_asset_msg = _comps_line("asset", r3d_asset_comps_sum)
-        iou_3d_asset_comps_t = torch.as_tensor(
-            iou_3d_asset_comps_sum, dtype=torch.float64, device=device)
-        dist.all_reduce(iou_3d_asset_comps_t, op=dist.ReduceOp.SUM)
-        iou_3d_asset_comps_msg = _iou3d_asset_comps_line(
-            iou_3d_asset_comps_t.cpu().numpy())
+        final_msg = _dist_asset_msg(n_done, len(dataset), cm_p, cm_f, i3_p, i3_f) + "  [FINAL]"
+        device = (torch.device("cuda", torch.cuda.current_device())
+                  if torch.cuda.is_available() else torch.device("cpu"))
+        comps_msgs = []
+        for tag, c in (("future", comps_f), ("present", comps_p)):
+            t = torch.as_tensor(c, dtype=torch.float64, device=device)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            comps_msgs.append(_comps_msg(tag, t.cpu().numpy()))
         if rank == 0:
             print("\n" + final_msg, flush=True)
             _append_live_eval_log(final_msg)
-            print(comps_msg, flush=True)
-            _append_live_eval_log(comps_msg)
-            print(comps_rot_msg, flush=True)
-            _append_live_eval_log(comps_rot_msg)
-            print(comps_asset_msg, flush=True)
-            _append_live_eval_log(comps_asset_msg)
-            print(iou_3d_asset_comps_msg, flush=True)
-            _append_live_eval_log(iou_3d_asset_comps_msg)
+            for m in comps_msgs:
+                print(m, flush=True)
+                _append_live_eval_log(m)
 
-    # collect lists from multi-GPUs
     res = {}
-
-    if 'hist_for_iou' in result.keys():
-        iou_metric = [sum(iou_metric)]
-        iou_metric = collect_results_cpu(iou_metric, len(dataset), tmpdir)
-        res['hist_for_iou'] = iou_metric
-
-    if 'hist_for_iou_bbox' in result.keys():
-        iou_bbox_metric = [sum(iou_bbox_metric)]
-        iou_bbox_metric = collect_results_cpu(iou_bbox_metric, len(dataset), tmpdir)
-        res['hist_for_iou_bbox'] = iou_bbox_metric
-
-    if 'hist_for_iou_bbox_rot' in result.keys():
-        iou_bbox_rot_metric = [sum(iou_bbox_rot_metric)]
-        iou_bbox_rot_metric = collect_results_cpu(iou_bbox_rot_metric, len(dataset), tmpdir)
-        res['hist_for_iou_bbox_rot'] = iou_bbox_rot_metric
-    if 'hist_for_iou_asset' in result.keys():
-        iou_asset_metric = collect_results_cpu([sum(iou_asset_metric)], len(dataset), tmpdir)
-        res['hist_for_iou_asset'] = iou_asset_metric
-
-    if 'height_l1' in result.keys():
-        height_l1_metric = collect_results_cpu(height_l1_metric, len(dataset), tmpdir)
-        res['height_l1'] = height_l1_metric
-    
-    if 'iou_3d' in result.keys():
-        iou_3d_metric = collect_results_cpu(iou_3d_metric, len(dataset), tmpdir)
-        res['iou_3d'] = iou_3d_metric
-
-    if 'iou_3d_bbox' in result.keys():
-        iou_3d_bbox_metric = collect_results_cpu(iou_3d_bbox_metric, len(dataset), tmpdir)
-        res['iou_3d_bbox'] = iou_3d_bbox_metric
-
-    if 'iou_3d_bbox_rot' in result.keys():
-        iou_3d_bbox_rot_metric = collect_results_cpu(iou_3d_bbox_rot_metric, len(dataset), tmpdir)
-        res['iou_3d_bbox_rot'] = iou_3d_bbox_rot_metric
-    if 'iou_3d_asset' in result.keys():
-        iou_3d_asset_metric = collect_results_cpu(iou_3d_asset_metric, len(dataset), tmpdir)
-        res['iou_3d_asset'] = iou_3d_asset_metric
-        res['iou_3d_asset_comps'] = collect_results_cpu(
-            [iou_3d_asset_comps_sum], len(dataset), tmpdir)
-
-    if 'recall_3d' in result.keys():
-        recall_3d_metric = collect_results_cpu(recall_3d_metric, len(dataset), tmpdir)
-        res['recall_3d'] = recall_3d_metric
-        res['recall_3d_comps'] = collect_results_cpu([r3d_comps_sum], len(dataset), tmpdir)
-
-    if 'recall_3d_rot' in result.keys():
-        recall_3d_rot_metric = collect_results_cpu(recall_3d_rot_metric, len(dataset), tmpdir)
-        res['recall_3d_rot'] = recall_3d_rot_metric
-        res['recall_3d_rot_comps'] = collect_results_cpu([r3d_rot_comps_sum], len(dataset), tmpdir)
-    if 'recall_3d_asset' in result.keys():
-        recall_3d_asset_metric = collect_results_cpu(recall_3d_asset_metric, len(dataset), tmpdir)
-        res['recall_3d_asset'] = recall_3d_asset_metric
-        res['recall_3d_asset_comps'] = collect_results_cpu([r3d_asset_comps_sum], len(dataset), tmpdir)
-
-    if 'vpq' in result.keys():
-        res['vpq_len'] = len(dataset)
-        vpq_metric = [sum(vpq_metric)]
-        vpq_metric = collect_results_cpu(vpq_metric, len(dataset), tmpdir)
-        res['vpq_metric'] = vpq_metric
-
+    if 'hist_for_iou_asset_present' in result.keys():
+        res['hist_for_iou_asset_present'] = collect_results_cpu(
+            [sum(cm_p)] if cm_p else [], len(dataset), tmpdir)
+        res['hist_for_iou_asset_future'] = collect_results_cpu(
+            [sum(cm_f)] if cm_f else [], len(dataset), tmpdir)
+        res['iou_3d_asset_present'] = collect_results_cpu(i3_p, len(dataset), tmpdir)
+        res['iou_3d_asset_future'] = collect_results_cpu(i3_f, len(dataset), tmpdir)
+        res['iou_3d_asset_present_comps'] = collect_results_cpu([comps_p], len(dataset), tmpdir)
+        res['iou_3d_asset_future_comps'] = collect_results_cpu([comps_f], len(dataset), tmpdir)
     return res
+
+
+def _dist_asset_msg(n, dataset_size, cm_p, cm_f, i3_p, i3_f):
+    """전 rank all_reduce 후 asset present/future 요약."""
+    from projects.occ_plugin.utils.formating import cm_to_ious
+    device = (torch.device("cuda", torch.cuda.current_device())
+              if torch.cuda.is_available() else torch.device("cpu"))
+
+    def _cm_t(cms):
+        arr = sum(cms) if cms else np.zeros((2, 2), dtype=np.int64)
+        return torch.as_tensor(arr, dtype=torch.float64, device=device)
+
+    tp_cm = _cm_t(cm_p)
+    tf_cm = _cm_t(cm_f)
+    scalars = torch.tensor(
+        [float(np.sum(i3_p)) if i3_p else 0.0, float(len(i3_p)),
+         float(np.sum(i3_f)) if i3_f else 0.0, float(len(i3_f))],
+        dtype=torch.float64, device=device)
+    dist.all_reduce(tp_cm, op=dist.ReduceOp.SUM)
+    dist.all_reduce(tf_cm, op=dist.ReduceOp.SUM)
+    dist.all_reduce(scalars, op=dist.ReduceOp.SUM)
+
+    def _mean(a, b):
+        return float(scalars[a].item() / scalars[b].item()) if scalars[b].item() > 0 else float("nan")
+
+    n = min(int(n), int(dataset_size))
+    return ("[eval][{}] IoU3d(asset)_future={:.4f} IoU2d(asset)_future={:.4f} "
+            "IoU3d(asset)_present={:.4f} IoU2d(asset)_present={:.4f} (all ranks)").format(
+                n,
+                _mean(2, 3),
+                float(cm_to_ious(tf_cm.cpu().numpy().astype(np.int64))[1]),
+                _mean(0, 1),
+                float(cm_to_ious(tp_cm.cpu().numpy().astype(np.int64))[1]))
+
 
 def collect_results_cpu(result_part, size, tmpdir=None, type='list'):
     rank, world_size = get_dist_info()

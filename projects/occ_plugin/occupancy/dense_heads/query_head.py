@@ -3771,7 +3771,7 @@ class QueryHead(nn.Module):
                 _overlay_pred_bev(hi_ov, pred_bev, gt_bev, hi_color)
                 _overlay_pred_bev(hi_cls_ov, pred_bev, gt_bev, hi_color)
 
-            # eval 비교 행: matched 대신 'eval 실제 pred occ(빨강) vs bbox AABB GT(초록), 겹침 흰색'
+            # eval 비교 행: matched 대신 'eval 실제 pred occ(빨강) vs asset-union GT(초록), 겹침 흰색'
             if (
                 eval_cmp_pred_np is not None and eval_cmp_gt_np is not None
                 and t < int(eval_cmp_pred_np.shape[0]) and t < int(eval_cmp_gt_np.shape[0])
@@ -3926,7 +3926,7 @@ class QueryHead(nn.Module):
             draw.text((x0 + 2, y2 + 2), f"hi(class)={stats_hi[t]}", fill=(255, 255, 255))
             draw.text(
                 (x0 + 2, y3 + 2),
-                (f"pred occ vs bbox_aabb  IoU={eval_cmp_iou_t[t]:.3f}"
+                (f"pred occ vs asset  IoU={eval_cmp_iou_t[t]:.3f}"
                  if t < len(eval_cmp_iou_t) else f"matched={stats_matched[t]}"),
                 fill=(255, 255, 255))
             if not skip_traj_rows:

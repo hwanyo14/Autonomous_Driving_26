@@ -1308,7 +1308,7 @@ class EfficientOCF(
                                    future_egomotion=None, instance_img_debug_bundle=None,
                                    eval_mode="future", centers_future_tq3=None,
                                    pred_occ_future=None, mix_future=None,
-                                   eval_cmp_pack=None):
+                                   eval_cmp_pack=None, future_includes_present=False):
         """Eval-time query debug visualization (opt-in via EOCF_EVAL_VIS=1).
 
         Reuses the SAME renderer as training (``query_head.maybe_save_query_debug_vis``)
@@ -1362,9 +1362,18 @@ class EfficientOCF(
                           f"mix_c {None if _mc is None else tuple(_mc.shape)} "
                           f"{'' if _mc is None else f'x[{_mc[...,0].min():.1f},{_mc[...,0].max():.1f}] nan={int(torch.isnan(_mc).sum())}'}",
                           flush=True)
-                pts = centers_future_tq3.detach()                              # [F,Q,3]
+                pts = centers_future_tq3.detach()                              # [F,Q,3] (+present면 [1+F])
                 pred_vis = pred_occ_future.detach() if torch.is_tensor(pred_occ_future) else None
-                gt_vis = self._eval_future_tail(gt_inst).detach() if torch.is_tensor(gt_inst) else None
+                # future_includes_present면 centers/pred/mixture가 [present, f1..fF] 레이아웃이므로
+                # GT도 present 프레임을 맨 앞에 붙여 열 수를 맞춘다.
+                if torch.is_tensor(gt_inst):
+                    _gt_tail = self._eval_future_tail(gt_inst).detach()
+                    gt_vis = (
+                        torch.cat([gt_inst[pres:pres + 1].detach(), _gt_tail], dim=0)
+                        if bool(future_includes_present) else _gt_tail
+                    )
+                else:
+                    gt_vis = None
                 conf_seq = conf.unsqueeze(0).expand(n_f, -1).contiguous()
                 cls_seq = cls_ids.unsqueeze(0).expand(n_f, -1).contiguous()
                 vis_max_frames = n_f
@@ -1419,11 +1428,19 @@ class EfficientOCF(
                 # future=future bundle+미래 tail gt(미래 2번째 프레임=frame_idx 1).
                 if str(eval_mode).lower() != "present" and isinstance(bundle_2d, dict) \
                         and torch.is_tensor(bundle_2d.get("selected_points_tq3", None)):
+                    # present 열이 앞에 붙은 경우 '미래 2번째'는 frame_idx 1 -> 2로 밀린다.
+                    # gt도 동일 레이아웃(present + future tail)으로 맞춰 넘긴다.
+                    _m3d_tail = self._eval_future_tail(gt_inst).detach()
+                    _m3d_gt = (
+                        torch.cat([gt_inst[pres:pres + 1].detach(), _m3d_tail], dim=0)
+                        if bool(future_includes_present) else _m3d_tail
+                    )
                     self.maybe_save_query_mixture_3d_vis(
                         query_vis_bundle=bundle_2d,
-                        gt_instance_occ3d_txyz=self._eval_future_tail(gt_inst).detach(),
+                        gt_instance_occ3d_txyz=_m3d_gt,
                         img_metas=img_metas, step=step,
-                        occ_threshold=float(prob_threshold), frame_idx=1,
+                        occ_threshold=float(prob_threshold),
+                        frame_idx=(2 if bool(future_includes_present) else 1),
                         is_eval=True,
                     )
                 else:
@@ -1451,6 +1468,618 @@ class EfficientOCF(
                 )
         except Exception as e:
             print(f"[eval_vis] skipped (err={e})", flush=True)
+
+    def _maybe_dump_eval_query_features(self, bundle=None, cls_scores_qc=None,
+                                        centers_world=None, mixture=None, present_idx=0,
+                                        baseline_sel_idx=None, occ_thr=0.5,
+                                        oracle_match_result=None, img_metas=None,
+                                        gt_pack=None, depth_probs_tqd=None):
+        """Eval-time per-query raw tensor dump (opt-in via EOCF_EVAL_DUMP_QFEAT=1).
+
+        offline에서 fg score function을 GPU eval 재실행 없이 재설계/피팅하기 위한 계측용.
+        샘플당 1개 torch 파일(``<EOCF_EVAL_VIS_DIR>/qfeat/sample_<idx>.pt``)을 쓰며,
+        EOCF_EVAL_VIS_EVERY로 솎아내지 않고 모든 샘플을 저장한다.
+        metric에는 전혀 영향이 없고 실패해도 절대 raise하지 않는다.
+        """
+        import os
+        if os.environ.get("EOCF_EVAL_DUMP_QFEAT", "0") != "1":
+            return
+        try:
+            from mmcv.runner import get_dist_info
+            step_local = int(getattr(self, "_eval_qfeat_step", 0))
+            self._eval_qfeat_step = step_local + 1
+            rank, _ = get_dist_info()
+            step = int(rank) * 1000000 + step_local
+            global_idx = self._extract_eval_global_idx(img_metas)
+            if global_idx is not None:
+                step = int(global_idx)
+            out_dir = os.path.join(
+                os.environ.get("EOCF_EVAL_VIS_DIR", "./work_dirs/eval_vis"), "qfeat")
+            os.makedirs(out_dir, exist_ok=True)
+
+            def _cpu(v, dtype=None):
+                # DataContainer/scatter 결과([tensor] 등)를 벗겨 tensor만 남긴다.
+                while isinstance(v, (list, tuple)) and len(v) > 0:
+                    v = v[0]
+                if not torch.is_tensor(v):
+                    return None
+                v = v.detach().cpu()
+                return v if dtype is None else v.to(dtype)
+
+            def _long_flat(v):
+                t = _cpu(v, torch.long)
+                return t.reshape(-1) if t is not None else torch.zeros((0,), dtype=torch.long)
+
+            b = bundle if isinstance(bundle, dict) else {}
+            cls_qc = _cpu(cls_scores_qc, torch.float32)
+            pred_cls_q = _cpu(b.get("pred_cls_q", None), torch.long)
+            cls_prob_q = _cpu(b.get("cls_prob_q", None), torch.float32)
+            score_q = _cpu(b.get("score_q", None), torch.float32)
+            if cls_qc is not None and (pred_cls_q is None or cls_prob_q is None or score_q is None):
+                # bundle이 없을 때만: utils_visualization과 동일한 식으로 재계산
+                # (eval에서는 iou_q/cam_attn_score_q가 항상 0이다).
+                pred_cls_q = torch.argmax(cls_qc, dim=-1).to(torch.long)
+                fg_qc = cls_qc.clone()
+                fg_qc[:, int(self.query_bg_class)] = 0.0
+                cls_prob_q = fg_qc.max(dim=-1).values.clamp(0.0, 1.0)
+                w_iou, w_cls = float(self.fg_score_iou_weight), float(self.fg_score_cls_weight)
+                score_q = (w_cls * cls_prob_q / max(w_iou + w_cls, 1e-6)).clamp(0.0, 1.0)
+
+            mix_c, mix_s, mix_y, mix_w = (mixture if isinstance(mixture, (tuple, list))
+                                          and len(mixture) == 4 else (None, None, None, None))
+            payload = {
+                "cls_scores_qc": cls_qc,
+                "pred_cls_q": pred_cls_q,
+                "cls_prob_q": cls_prob_q,
+                "score_q": score_q,
+                "iou_q": _cpu(b.get("iou_q", None), torch.float32),
+                "cam_attn_score_q": _cpu(b.get("cam_attn_score_q", None), torch.float32),
+                "cam_attn_score_valid_q": _cpu(b.get("cam_attn_score_valid_q", None), torch.bool),
+                "centers_world_tq3": _cpu(centers_world, torch.float32),
+                "mixture_centers_tqg3": _cpu(mix_c, torch.float32),
+                "mixture_sigmas_tqg3": _cpu(mix_s, torch.float32),
+                "mixture_yaw_tqg": _cpu(mix_y, torch.float32),
+                "mixture_weights_tqg": _cpu(mix_w, torch.float32),
+                "present_idx": int(present_idx),
+                "bg_class": int(self.query_bg_class),
+                "fg_thr": float(os.environ.get("EOCF_EVAL_FG_THR", self.fg_score_threshold)),
+                "occ_thr": float(occ_thr),
+                "baseline_selected_idx_q": _long_flat(baseline_sel_idx),
+                "oracle_matched_query_idx": _long_flat(
+                    oracle_match_result.get("matched_query_idx", None)
+                    if isinstance(oracle_match_result, dict) else None),
+                "oracle_matched_inst_idx": _long_flat(
+                    oracle_match_result.get("matched_inst_idx", None)
+                    if isinstance(oracle_match_result, dict) else None),
+                "oracle_gt_ids": _long_flat(
+                    oracle_match_result.get("gt_ids_n", None)
+                    if isinstance(oracle_match_result, dict) else None),
+            }
+            # per-query depth 분포(fg score 재설계용). present 프레임만 fp16 [Q,D] (~25KB).
+            # bin은 uniform이라 offline에서 min/max/num_bins로 중심을 복원할 수 있다.
+            # 학습 타깃과 동일한 range 규칙(_compute_query_inst_depth_targets, 'custom' vs dbound)을 따른다.
+            dp = _cpu(depth_probs_tqd, torch.float16)
+            if dp is not None and dp.dim() == 3 and dp.shape[0] > int(present_idx):
+                payload["depth_probs_qd"] = dp[int(present_idx)].contiguous()
+                if str(getattr(self, "query_inst_depth_range_mode", "dbound")) == "custom":
+                    d_lo, d_hi = self.query_inst_depth_min, self.query_inst_depth_max
+                else:
+                    gc = getattr(getattr(self, "img_view_transformer", None), "grid_config", None)
+                    db = gc.get("dbound", None) if isinstance(gc, dict) else None
+                    d_lo, d_hi = (db[0], db[1]) if isinstance(db, (list, tuple)) and len(db) >= 2 else (None, None)
+                if d_lo is not None and d_hi is not None:
+                    payload["depth_min"], payload["depth_max"] = float(d_lo), float(d_hi)
+            # attn soft-argmax vs hard-peak 괴리 (EOCF_QFEAT_ATTN_PEAK=1일 때만 팩에 존재).
+            # feat_out 인덱스를 건드리지 않고 캐시된 팩에서 그대로 읽는다. shape은 [T_depth, Q].
+            _lp = getattr(self, "_last_query_attn_soft_lift_pack", None)
+            if isinstance(_lp, dict):
+                for _k in ("attn_soft_hard_d2d_feat_tq", "attn_soft_hard_d2d_img_tq",
+                           "attn_soft_hard_d3d_tq", "attn_peak_prob_tq", "attn_feat_hw"):
+                    _t = _cpu(_lp.get(_k, None), torch.float32)
+                    if _t is not None:
+                        payload[_k] = _t
+
+            # GT 부가정보: 이미 scope에 있는 것만(없으면 조용히 skip). 새 인자 플러밍은 하지 않는다.
+            for k, v in (gt_pack.items() if isinstance(gt_pack, dict) else []):
+                t = _cpu(v)
+                if t is not None:
+                    payload[k] = t
+            payload = {k: v for k, v in payload.items() if v is not None}
+            torch.save(payload, os.path.join(out_dir, f"sample_{step:06d}.pt"))
+        except Exception as e:
+            print(f"[eval_qfeat] skipped (err={e})", flush=True)
+
+    def _eval_traj_disp_stats(self, base_tq3, refined_tq3, cls_scores_qc):
+        """현재→미래 이동량 분포 계측 (opt-in: ``EOCF_EVAL_TRAJ_STATS=1``, 기본 OFF).
+
+        base traj(누적 offset)와 refine 후를 **분리**해 재고, fg threshold를 통과한
+        (=실제로 렌더되는) query만 집계한다. 목적은 단 하나 —
+        **GT 미래이동이 정확히 0인 객체가 75%인데 모델은 얼마나 밀고 있는가**.
+        metric에는 영향이 없고 실패해도 raise하지 않는다.
+        """
+        import os
+        try:
+            if not (torch.is_tensor(base_tq3) and torch.is_tensor(refined_tq3)
+                    and torch.is_tensor(cls_scores_qc) and base_tq3.dim() == 3
+                    and base_tq3.shape[0] >= 2):
+                return
+            fg = (1.0 - cls_scores_qc[:, int(self.query_bg_class)]).clamp(0.0, 1.0).detach()
+            thr = float(os.environ.get("EOCF_EVAL_FG_THR", self.fg_score_threshold))
+            keep = fg >= thr
+            if int(keep.sum()) == 0:
+                return
+            # traj 레이아웃은 [present, f1..fF] (index 0 = present)
+            def _disp(t):
+                return (t[1:, keep, :2] - t[:1, keep, :2]).norm(dim=-1).detach().float().cpu()
+
+            acc = getattr(self, "_traj_disp_acc", None)
+            if acc is None:
+                acc = self._traj_disp_acc = {"base": [], "ref": [], "n": 0}
+            acc["base"].append(_disp(base_tq3))
+            acc["ref"].append(_disp(refined_tq3))
+            acc["n"] += 1
+            every = int(os.environ.get("EOCF_EVAL_TRAJ_STATS_EVERY", "50"))
+            if acc["n"] % every:
+                return
+            print(f"\n[traj_stats] n_samples={acc['n']} fg_thr={thr} "
+                  f"(GT 대조: 미래이동 정확히0 = 75%, t=6 평균 2.70m / 중앙 0.00m)", flush=True)
+            for tag in ("base", "ref"):
+                d = torch.cat(acc[tag], dim=1)          # [F, Nq]
+                for k in range(int(d.shape[0])):
+                    v = d[k]
+                    q = torch.quantile(v, torch.tensor([0.10, 0.25, 0.50, 0.75, 0.90]))
+                    print(f"  [{tag:4s}] f{k+1}: p10={q[0]:6.3f} p25={q[1]:6.3f} "
+                          f"p50={q[2]:6.3f} p75={q[3]:6.3f} p90={q[4]:6.3f} "
+                          f"mean={v.mean():6.3f}  (<0.5m 비율 {(v < 0.5).float().mean():.3f})",
+                          flush=True)
+        except Exception as e:
+            print(f"[traj_stats] skipped (err={e})", flush=True)
+
+    def _eval_filter_by_traj_accel(self, sel_idx=None, selected_score=None,
+                                   centers_world_tq3=None, acc_max=0.0,
+                                   fallback=(None, None)):
+        """선택된 query 중 **궤적 가속도 잔차가 큰 꼬리**를 잘라낸다 (opt-in, 추론 전용).
+
+        `traj_acc = |c₂ − 2c₁ + c₀|` (과거 3프레임 xy). 근거(NOTES 07-31 N=300):
+        traj_acc는 cls·거리를 모두 제거하고도 판별력이 남는 유일한 인자(잔차화 AUC 0.567)이고
+        xy중심오차와 ρ=+0.424로 붙는다. **같은 예산에서 cls로 자르는 것보다 TP를 더 많이 남긴다**
+        (예: 3518개 예산에서 TP 1731 vs cls-only 1699).
+        다만 제거분 유용비가 0.134(상위5%)로 제거 이득 임계(~0.123) 경계선이라
+        **offline으로는 판정 불가 → 실측용 스위치**다.
+
+        ⚠ 재랭킹이 아니라 **순수 제거**라 예산이 줄어든다. 예산 감소 자체가 손해라는 실측
+        (fg0.92=0.1391 < fg0.90=0.1429)이 있으므로, 이 컷의 이득은 '같은 예산의 cls 컷보다
+        낫다'가 아니라 '베이스라인보다 낫다'로 판정해야 한다.
+        캘리브레이션(N=300, fg0.9 선택집합 기준): 상위 2%=11.16m / 5%=6.97m / 10%=4.85m / 20%=2.94m.
+        """
+        try:
+            if not (torch.is_tensor(sel_idx) and torch.is_tensor(centers_world_tq3)
+                    and centers_world_tq3.dim() == 3 and int(centers_world_tq3.shape[0]) >= 3
+                    and float(acc_max) > 0.0):
+                return fallback
+            idx = sel_idx.reshape(-1).to(torch.long)
+            if int(idx.numel()) == 0:
+                return fallback
+            c = centers_world_tq3[-3:, :, :2].to(torch.float32)      # 마지막 3프레임 [3,Q,2]
+            acc_q = (c[2] - 2.0 * c[1] + c[0]).norm(dim=-1)          # [Q]
+            if int(acc_q.numel()) <= int(idx.max().item()):
+                return fallback
+            keep_m = acc_q.index_select(0, idx) <= float(acc_max)
+            if not bool(keep_m.any().item()):
+                return fallback
+            new_idx = idx[keep_m]
+            new_score = (selected_score.reshape(-1)[keep_m]
+                         if torch.is_tensor(selected_score)
+                         and int(selected_score.reshape(-1).numel()) == int(idx.numel())
+                         else selected_score)
+            if not getattr(self, "_eval_traj_cut_logged", False):
+                self._eval_traj_cut_logged = True
+                print(f"[eval] traj-accel tail cut ON (acc_max={acc_max}m): "
+                      f"{int(idx.numel())} -> {int(new_idx.numel())} queries "
+                      f"(제거 {int(idx.numel())-int(new_idx.numel())})", flush=True)
+            return new_idx, new_score
+        except Exception as e:
+            print(f"[eval_traj_cut] skipped (err={e})", flush=True)
+            return fallback
+
+    def _eval_select_by_depth_sharpness(self, bundle=None, depth_probs_tqd=None,
+                                        present_idx=0, pow_k=0.0, thr=0.0, floor=0.0,
+                                        fallback=(None, None)):
+        """depth 분포 sharpness로 fg 선택만 재가중 (추론 전용, opt-in).
+
+        `score_sel = cls_prob * (1 - H_norm(depth_probs))^k`, cut = `thr`.
+        근거(NOTES 2026-07-30 N=300): sharpness는 거리 대역 '안에서' cls보다 'TP를 낼 query'를
+        잘 가린다(AUC 0.75~0.90 vs 0.71~0.83). 단 **곱셈**이어야 한다 — 먼 대역에 가점하는
+        형태(`cls + w*far*sharp`)는 먼 대역 양성률이 3.2%라 오히려 크게 손해다.
+
+        **렌더 가중치(`selected_score`)는 원래 cls_prob을 그대로 반환한다** — sharpness를 곱한
+        값을 넘기면 blob 높이가 함께 낮아져 '선택 변경'과 '렌더 변경'이 섞이기 때문(단일변수 유지).
+        oracle override와 동일하게 bundle(viz 선택)은 건드리지 않고, 실패 시 fallback을 반환한다.
+        ⚠ 이 경로는 bundle 내부의 distance-NMS/topk를 우회한다(oracle override와 동일).
+        NMS_RADIUS=0 운영점에서는 차이가 없지만, NMS를 켠 채로 쓰면 그 필터가 빠진다.
+        """
+        import math
+        try:
+            b = bundle if isinstance(bundle, dict) else {}
+            score_q = b.get("score_q", None)
+            dp = depth_probs_tqd
+            while isinstance(dp, (list, tuple)) and len(dp) > 0:
+                dp = dp[0]
+            if not (torch.is_tensor(score_q) and torch.is_tensor(dp) and dp.dim() == 3):
+                return fallback
+            score_q = score_q.reshape(-1)
+            p_idx = int(present_idx)
+            if int(dp.shape[0]) <= p_idx or int(dp.shape[1]) != int(score_q.numel()):
+                return fallback
+            p = dp[p_idx].to(dtype=torch.float32)
+            p = p / p.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            h_norm = -(p * p.clamp_min(1e-9).log()).sum(dim=-1) / math.log(max(int(p.shape[-1]), 2))
+            sharp = (1.0 - h_norm).clamp(0.0, 1.0)
+            score_f = score_q.to(device=sharp.device, dtype=torch.float32)
+            s_sel = score_f * sharp.pow(float(pow_k))
+            # cls 하한(`floor`): weight_mode='score'에서는 blob 최댓값이 cls_prob를 못 넘으므로
+            # cls_prob < occ_thr인 query는 선택돼도 **렌더가 0**이다(NOTES 07-06 'occ가 fg를 흡수').
+            # 하한 없이 쓰면 '선택 개수'는 맞아도 '실효 렌더 개수'가 줄어 예산 비교가 깨진다
+            # (실측: pow=2에서 3703개 중 188개가 렌더 0 → 실효 3515 vs baseline 3704).
+            # 따라서 weight_mode='score'로 비교할 때는 floor=occ_thr로 줄 것.
+            keep_mask = s_sel >= float(thr)
+            if float(floor) > 0.0:
+                keep_mask = keep_mask & (score_f >= float(floor))
+            keep = torch.nonzero(keep_mask, as_tuple=False).reshape(-1)
+            if int(keep.numel()) == 0:
+                return fallback
+            if not getattr(self, "_eval_sharp_sel_logged", False):
+                self._eval_sharp_sel_logged = True
+                print(f"[eval] depth-sharpness selection ON (pow={pow_k}, thr={thr}, floor={floor}): "
+                      f"selected={int(keep.numel())} (baseline_score>=fg_thr not used) "
+                      f"sharp[min/med/max]={float(sharp.min()):.3f}/"
+                      f"{float(sharp.median()):.3f}/{float(sharp.max()):.3f}", flush=True)
+            return keep.to(torch.long), score_q.index_select(0, keep.to(torch.long))
+        except Exception as e:
+            print(f"[eval_sharp_sel] skipped (err={e})", flush=True)
+            return fallback
+
+    def _eval_traincal_depth_speed_features(self, depth_probs_tqd=None,
+                                            centers_world_tq3=None, present_idx=0):
+        """foreground query별 ``depth_std``/``past_speed`` 원값 [Q] 두 개를 만든다.
+
+        - ``depth_std``: present 프레임 depth-bin 분포의 표준편차.
+          bin 중심은 학습/투영과 **동일 규칙**(utils_query_projection의 `depth_vals_d`)을 쓴다.
+          ``mu = sum_d p_d*depth_d``, ``depth_std = sqrt(sum_d p_d*(depth_d-mu)^2)``.
+        - ``past_speed``: 과거 인접 프레임 XY 이동의 **속력 크기 평균**(방향 상쇄 아님).
+          ``speed_i = ||xy_i - xy_(i-1)|| / dt``, dt=0.5s. present까지의 구간만 쓴다.
+
+        둘 다 구하지 못하면 None을 돌려 호출부가 조용히 baseline을 유지하게 한다.
+        """
+        import os
+        dp = depth_probs_tqd
+        while isinstance(dp, (list, tuple)) and len(dp) > 0:
+            dp = dp[0]
+        if not (torch.is_tensor(dp) and dp.dim() == 3 and int(dp.shape[0]) > int(present_idx)):
+            return None, None
+        if not (torch.is_tensor(centers_world_tq3) and centers_world_tq3.dim() == 3):
+            return None, None
+
+        p = dp[int(present_idx)].to(torch.float32)
+        p = p / p.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        d_bins = int(p.shape[-1])
+        if str(getattr(self, "query_inst_depth_range_mode", "dbound")) == "custom":
+            d_lo, d_hi = float(self.query_inst_depth_min), float(self.query_inst_depth_max)
+        else:
+            gc = getattr(getattr(self, "img_view_transformer", None), "grid_config", None)
+            db = gc.get("dbound", None) if isinstance(gc, dict) else None
+            if not (isinstance(db, (list, tuple)) and len(db) >= 2):
+                return None, None
+            d_lo, d_hi = float(db[0]), float(db[1])
+        if not (d_hi > d_lo) or d_bins <= 0:
+            return None, None
+        bin_size = (d_hi - d_lo) / float(d_bins)
+        depth_vals_d = (torch.arange(d_bins, device=p.device, dtype=torch.float32)
+                        + 0.5) * bin_size + d_lo
+        mu = (p * depth_vals_d.view(1, d_bins)).sum(dim=-1)
+        var = (p * (depth_vals_d.view(1, d_bins) - mu.unsqueeze(-1)) ** 2).sum(dim=-1)
+        depth_std_q = var.clamp_min(0.0).sqrt()
+
+        # 과거 구간: index 0..present_idx (time_receptive_field=3 -> 2구간).
+        xy = centers_world_tq3[:int(present_idx) + 1, :, :2].to(
+            device=p.device, dtype=torch.float32)
+        if int(xy.shape[0]) < 2:
+            return depth_std_q, None
+        dt = float(os.environ.get("EOCF_EVAL_TRAINCAL_DT", "0.5") or 0.5)
+        step = (xy[1:] - xy[:-1]).norm(dim=-1) / max(dt, 1e-6)      # [K, Q]
+        valid = torch.isfinite(step)
+        cnt = valid.sum(dim=0).clamp_min(1).to(torch.float32)
+        past_speed_q = torch.where(valid, step, torch.zeros_like(step)).sum(dim=0) / cnt
+        past_speed_q = torch.where(valid.any(dim=0), past_speed_q,
+                                   torch.full_like(past_speed_q, float("nan")))
+        return depth_std_q, past_speed_q
+
+    def _eval_traincal_collect_step(self, bundle=None, depth_probs_tqd=None,
+                                    centers_world_tq3=None, present_idx=0):
+        """traincal 정규화 통계(log1p population mean/std)를 **누적 수집**한다. 추론 전용, opt-in.
+
+        env:
+          ``EOCF_EVAL_TRAINCAL_COLLECT``       출력 JSON 경로 (이 값이 있어야 동작)
+          ``EOCF_EVAL_TRAINCAL_COLLECT_EVERY`` 스냅샷 저장 주기(샘플 수, 기본 500)
+
+        ⚠ **누적합(count/sum/sumsq)을 JSON에 같이 저장**한다. population mean/std 는
+        이 셋만으로 복원되므로, 도중에 끊거나 나중에 이어붙여도 처음부터 다시 돌 필요가 없다.
+        (두 JSON 을 합칠 때도 세 값을 그냥 더하면 된다.)
+
+        스코프는 ``_eval_select_by_traincal_depth_speed`` 와 동일하게
+        **pred_cls != query_bg_class 인 모든 예측 foreground query**다. GT 는 쓰지 않는다.
+        """
+        import os, json, math
+        try:
+            depth_std_q, past_speed_q = self._eval_traincal_depth_speed_features(
+                depth_probs_tqd=depth_probs_tqd, centers_world_tq3=centers_world_tq3,
+                present_idx=present_idx)
+            if not (torch.is_tensor(depth_std_q) and torch.is_tensor(past_speed_q)):
+                return
+            b = bundle if isinstance(bundle, dict) else {}
+            pred_cls_q = b.get("pred_cls_q", None)
+            fg = torch.ones_like(depth_std_q, dtype=torch.bool)
+            if torch.is_tensor(pred_cls_q) and int(pred_cls_q.numel()) == int(depth_std_q.numel()):
+                fg = (pred_cls_q.reshape(-1).to(depth_std_q.device) != int(self.query_bg_class))
+
+            # past_speed 대안 후보(traj_acc / speed_std)도 **같은 패스에서** 누적한다.
+            # 수집이 2시간짜리라 feature 마다 따로 돌면 낭비다 — 한 번에 다 모아두고
+            # eval 에서 EOCF_EVAL_TRAINCAL_FEAT2 로 골라 쓴다.
+            pairs = [("depth_std", depth_std_q), ("past_speed", past_speed_q)]
+            for k, v in self._eval_traincal_motion_features(centers_world_tq3).items():
+                if torch.is_tensor(v) and int(v.numel()) == int(depth_std_q.numel()):
+                    pairs.append((k, v))
+
+            acc = getattr(self, "_eval_traincal_collect_acc", None)
+            if acc is None:
+                acc = {"samples": 0, "_cov": {}}
+                self._eval_traincal_collect_acc = acc
+            for k, _ in pairs:
+                acc.setdefault(k, {"n": 0, "s": 0.0, "s2": 0.0})
+
+            zs = {}
+            for key, raw in pairs:
+                x = torch.log1p(raw.clamp_min(0.0))
+                m = fg & torch.isfinite(x)
+                if not bool(m.any()):
+                    continue
+                v = x[m].to(torch.float64)
+                a = acc[key]
+                a["n"] += int(v.numel())
+                a["s"] += float(v.sum())
+                a["s2"] += float((v * v).sum())
+                zs[key] = (x, m)
+            # depth_std 와의 **상관**을 같이 누적한다(추가 비용 ~0).
+            # 새 feature 가 depth_std 와 강하게 겹치면 항을 추가해도 이득이 없다 —
+            # 스윕을 돌리기 전에 이 숫자로 먼저 거른다.
+            if "depth_std" in zs:
+                xd, md = zs["depth_std"]
+                for key in ("past_speed", "traj_dev", "speed_std"):
+                    if key not in zs:
+                        continue
+                    xo, mo = zs[key]
+                    m = md & mo
+                    if not bool(m.any()):
+                        continue
+                    a = acc["_cov"].setdefault(key, {"n": 0, "sxy": 0.0})
+                    a["n"] += int(m.sum())
+                    a["sxy"] += float((xd[m].to(torch.float64) * xo[m].to(torch.float64)).sum())
+            acc["samples"] += 1
+
+            every = int(os.environ.get("EOCF_EVAL_TRAINCAL_COLLECT_EVERY", "500") or 500)
+            if every > 0 and acc["samples"] % every == 0:
+                self._eval_traincal_collect_dump()
+        except Exception as e:
+            print(f"[eval_traincal_collect] skipped (err={e})", flush=True)
+
+    def _eval_traincal_collect_dump(self):
+        """누적 상태를 ``normalization_stats.json`` 스키마로 저장한다(중간 스냅샷 겸용)."""
+        import os, json
+        acc = getattr(self, "_eval_traincal_collect_acc", None)
+        if not acc:
+            return
+        path = os.environ.get("EOCF_EVAL_TRAINCAL_COLLECT", "").strip()
+        if not path:
+            return
+        feats = {}
+        for key in ("depth_std", "past_speed", "traj_dev", "speed_std"):
+            a = acc.get(key)
+            if not isinstance(a, dict):
+                continue
+            n = int(a["n"])
+            if n <= 1:
+                if key in ("depth_std", "past_speed"):
+                    return                                 # 기존 두 축은 없으면 덤프 자체를 미룬다
+                continue
+            mean = a["s"] / n
+            var = max(a["s2"] / n - mean * mean, 0.0)      # population variance
+            feats[key] = {"mean": mean, "std": var ** 0.5, "count": n,
+                          "transformed_log1p": True, "good_direction": "low",
+                          # 이어붙이기용 원시 누적합 — 이 셋만 있으면 재계산·병합이 가능하다.
+                          "_acc": {"n": n, "sum": a["s"], "sumsq": a["s2"]}}
+        # depth_std 와의 피어슨 상관. 높으면 그 feature 를 추가해도 새 정보가 거의 없다.
+        corr = {}
+        d = feats.get("depth_std")
+        for key, cv in (acc.get("_cov") or {}).items():
+            o = feats.get(key)
+            n = int(cv.get("n", 0))
+            if not (d and o and n > 1 and d["std"] > 0 and o["std"] > 0):
+                continue
+            corr[key] = ((cv["sxy"] / n) - d["mean"] * o["mean"]) / (d["std"] * o["std"])
+        out = {"schema_version": 1, "mode": "post_training_calibration",
+               "checkpoint": os.environ.get("EOCF_EVAL_TRAINCAL_COLLECT_CKPT", "").strip(),
+               "split": "train", "sample_count": int(acc["samples"]),
+               "scope": "all_predicted_foreground_queries", "uses_ground_truth": False,
+               "features": feats, "corr_with_depth_std": corr}
+        tmp = path + ".tmp"
+        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(out, f, indent=2)
+        os.replace(tmp, path)                              # 원자적 교체 — 읽는 쪽이 반쪽 파일을 못 본다
+        print(f"[eval_traincal_collect] snapshot n_sample={acc['samples']} "
+              f"depth(mean={feats['depth_std']['mean']:.6f}, std={feats['depth_std']['std']:.6f}, "
+              f"cnt={feats['depth_std']['count']}) "
+              f"speed(mean={feats['past_speed']['mean']:.6f}, std={feats['past_speed']['std']:.6f}) "
+              f"-> {path}", flush=True)
+
+    def _eval_traincal_load_stats(self):
+        """train 통계(log1p population mean/std)를 해석한다. 결과가 비면 정책 자체가 비활성.
+
+        우선순위는 **env 직접 지정 > JSON**이다. 값이 고정 상수 4개뿐이라 파일 없이 돌리는 쪽이
+        기본이고, JSON은 다른 calibration으로 갈아끼울 때만 쓴다.
+
+            EOCF_EVAL_TRAINCAL_MEAN_DEPTH / _STD_DEPTH / _MEAN_SPEED / _STD_SPEED
+            EOCF_EVAL_TRAINCAL_STATS=<normalization_stats.json>
+        """
+        import os, json
+        env = {}
+        for key, suffix in (("depth_std", "DEPTH"), ("past_speed", "SPEED")):
+            m = os.environ.get(f"EOCF_EVAL_TRAINCAL_MEAN_{suffix}", "").strip()
+            s = os.environ.get(f"EOCF_EVAL_TRAINCAL_STD_{suffix}", "").strip()
+            if m and s:
+                env[key] = {"mean": float(m), "std": float(s)}
+        if len(env) == 2:
+            print(f"[eval_traincal_sel] stats from env: "
+                  f"depth(mean={env['depth_std']['mean']:.6f}, std={env['depth_std']['std']:.6f}) "
+                  f"speed(mean={env['past_speed']['mean']:.6f}, std={env['past_speed']['std']:.6f})",
+                  flush=True)
+            return env
+        path = os.environ.get("EOCF_EVAL_TRAINCAL_STATS", "").strip()
+        if not path:
+            return {}
+        try:
+            with open(path, "r") as f:
+                stats = json.load(f).get("features", {})
+            print(f"[eval_traincal_sel] stats from json: {path}", flush=True)
+            return stats
+        except Exception as e:
+            print(f"[eval_traincal_sel] stats load failed ({e}) -> baseline", flush=True)
+            return {}
+
+    def _eval_traincal_motion_features(self, centers_world_tq3=None):
+        """궤적 **불규칙성** feature [Q] 를 만든다. 추론 전용, GT 미사용.
+
+        ``past_speed`` 의 결함(= "빠르면 감점")을 없앤 대안들이다. 속력 *크기* 가 아니라
+        속력이 *얼마나 튀는가* 를 본다 — 일정하게 빠른 물체는 벌점이 없다.
+
+        - ``traj_dev``  : ``mean_t ‖c_{t+1} − 2c_t + c_{t−1}‖``.
+          2차 차분은 ``(c_{t+1} − c_t) − (c_t − c_{t−1})`` 이므로 **등속(constant-velocity) 모델의 잔차**다.
+          "예측 궤적이 등속 운동에서 얼마나 벗어나는가" — depth_std 가 깊이 분포의 퍼짐을 재듯이
+          이쪽은 궤적의 불규칙성을 잰다. (구 이름 ``traj_acc``, 통계 JSON 은 양쪽 키를 모두 읽는다.)
+          TRAJ_CUT 이 쓰던 것과 **같은 신호**다. 그쪽은 하위를 잘라냈고 여기선 점수를 깎는다.
+          속력 변화와 **방향 변화를 둘 다** 잡는다.
+        - ``speed_std`` : ``std_t ‖c_t − c_{t−1}‖`` (구간 속력들의 표준편차).
+          방향 변화는 못 잡지만 해석이 단순하다.
+
+        ⚠ **전체 프레임**(과거+현재+미래)을 쓴다. 과거만 쓰면 구간이 2개뿐(time_receptive_field=3)이라
+          std/가속도가 사실상 정의되지 않는다. 미래 프레임은 모델 자신의 예측이므로
+          이 feature 는 **자기 일관성**(self-consistency) 측정이 된다 — GT 를 보지 않는다.
+        """
+        c = centers_world_tq3
+        if not (torch.is_tensor(c) and c.dim() == 3 and int(c.shape[0]) >= 3):
+            return {}
+        xy = c[:, :, :2].to(torch.float32)                       # [T, Q, 2]
+        step = xy[1:] - xy[:-1]                                  # [T-1, Q, 2]
+        sp = step.norm(dim=-1)                                   # [T-1, Q] 구간 속력
+        out = {}
+        acc = (step[1:] - step[:-1]).norm(dim=-1)                # [T-2, Q] 2차 차분 = 가속도
+        if int(acc.shape[0]) >= 1:
+            out["traj_dev"] = torch.nan_to_num(acc.mean(dim=0), nan=0.0)
+        if int(sp.shape[0]) >= 2:
+            out["speed_std"] = torch.nan_to_num(sp.std(dim=0, unbiased=False), nan=0.0)
+        return out
+
+    def _eval_select_by_traincal_depth_speed(self, bundle=None, depth_probs_tqd=None,
+                                             centers_world_tq3=None, present_idx=0,
+                                             stats=None, alpha_depth=0.5, alpha_speed=0.25,
+                                             cutoff=0.9, fallback=(None, None)):
+        """train 통계로 z-normalize한 depth/speed로 fg 선택을 **전면 재선택**한다(추론 전용).
+
+        ``s_eff = sigmoid(logit(s) - a_d*z_d - a_s*z_s)``, 컷은 ``s_eff >= cutoff``.
+        z는 train 4,000 sample에서 미리 구한 log1p population mean/std로 고정 정규화하고
+        ``[-3, 3]``으로 clip한다. validation 분포로 재정규화하지 않는다.
+
+        baseline-preserving rescue가 **아니다** — 원래 ``s >= cutoff``였던 query도 보정 후
+        컷 아래로 내려가면 탈락한다(global reselection). 렌더 가중치는 depth-sharpness 경로와
+        같은 이유로 **보정 전 score를 그대로** 반환한다(선택 변경과 렌더 변경을 섞지 않는다).
+        ⚠ 이 경로는 bundle 내부의 distance-NMS/topk를 우회한다(sharpness/oracle override와 동일).
+        """
+        import math, os
+        try:
+            b = bundle if isinstance(bundle, dict) else {}
+            score_q = b.get("score_q", None)
+            pred_cls_q = b.get("pred_cls_q", None)
+            if not (torch.is_tensor(score_q) and isinstance(stats, dict)):
+                return fallback
+            score_q = score_q.reshape(-1)
+            depth_std_q, past_speed_q = self._eval_traincal_depth_speed_features(
+                depth_probs_tqd=depth_probs_tqd, centers_world_tq3=centers_world_tq3,
+                present_idx=present_idx)
+            if not (torch.is_tensor(depth_std_q) and torch.is_tensor(past_speed_q)):
+                return fallback
+            if int(depth_std_q.numel()) != int(score_q.numel()):
+                return fallback
+
+            def _z(raw, key):
+                st = stats.get(key, None)
+                if st is None and key == "traj_dev":
+                    st = stats.get("traj_acc", None)      # 구 통계 파일 호환
+                if not isinstance(st, dict):
+                    return None
+                mean, std = float(st.get("mean", 0.0)), float(st.get("std", 0.0))
+                if not (std > 0.0):
+                    return None
+                x = torch.log1p(raw.clamp_min(0.0))
+                return ((x - mean) / std).clamp(-3.0, 3.0)
+
+            # 둘째 항의 feature 를 env 로 고른다. 기본은 기존과 동일한 past_speed.
+            #   past_speed : 속력 **크기** — 빠르면 감점. 난이도 prior 라 품질 신호로는 부적절하다.
+            #   traj_dev   : 등속 모델 잔차 ‖Δ²c‖ — 궤적이 등속에서 벗어나면 감점
+            #                (구 이름 traj_acc 도 받는다)
+            #   speed_std  : 구간 속력의 std — 들쭉날쭉하면 감점
+            feat2 = (os.environ.get("EOCF_EVAL_TRAINCAL_FEAT2", "").strip() or "past_speed")
+            if feat2 == "traj_acc":
+                feat2 = "traj_dev"          # 구 이름 → 새 이름
+            raw2 = past_speed_q
+            if feat2 != "past_speed":
+                mf = self._eval_traincal_motion_features(centers_world_tq3)
+                raw2 = mf.get(feat2, None)
+                if not (torch.is_tensor(raw2) and int(raw2.numel()) == int(score_q.numel())):
+                    print(f"[eval_traincal_sel] feat2={feat2} 계산 실패 — past_speed 로 되돌림", flush=True)
+                    raw2, feat2 = past_speed_q, "past_speed"
+            z_d = _z(depth_std_q, "depth_std")
+            z_s = _z(raw2, feat2)
+            if z_d is None or z_s is None:
+                print(f"[eval_traincal_sel] stats 에 '{feat2}' 없음 — traincal 비활성", flush=True)
+                return fallback
+
+            s = score_q.to(device=z_d.device, dtype=torch.float32).clamp(1e-6, 1.0 - 1e-6)
+            combined_logit = (torch.log(s / (1.0 - s))
+                              - float(alpha_depth) * z_d - float(alpha_speed) * z_s)
+            keep_mask = torch.isfinite(z_d) & torch.isfinite(z_s)
+            keep_mask &= combined_logit >= math.log(max(cutoff, 1e-6) / max(1.0 - cutoff, 1e-6))
+            if torch.is_tensor(pred_cls_q) and int(pred_cls_q.numel()) == int(score_q.numel()):
+                keep_mask &= (pred_cls_q.reshape(-1).to(z_d.device) != int(self.query_bg_class))
+            keep = torch.nonzero(keep_mask, as_tuple=False).reshape(-1)
+            if int(keep.numel()) == 0:
+                return fallback
+            # combined logit 내림차순 정렬 후 top-k(설정 시) 적용.
+            order = torch.argsort(combined_logit.index_select(0, keep), descending=True)
+            keep = keep.index_select(0, order)
+            if int(self.fg_score_topk) > 0:
+                keep = keep[:min(int(self.fg_score_topk), int(keep.numel()))]
+            keep = keep.to(torch.long).to(score_q.device)
+            if not getattr(self, "_eval_traincal_sel_logged", False):
+                self._eval_traincal_sel_logged = True
+                print(f"[eval] traincal depth+{feat2} selection ON "
+                      f"(a_depth={alpha_depth}, a_speed={alpha_speed}, cutoff={cutoff}): "
+                      f"selected={int(keep.numel())} (baseline score>=fg_thr not used) "
+                      f"depth_std[med]={float(depth_std_q.nanmedian()):.3f} "
+                      f"{feat2}[med]={float(raw2.nanmedian()):.3f}", flush=True)
+            return keep, score_q.index_select(0, keep)
+        except Exception as e:
+            print(f"[eval_traincal_sel] skipped (err={e})", flush=True)
+            return fallback
 
     @staticmethod
     def _extract_eval_global_idx(img_metas):
@@ -1797,30 +2426,26 @@ class EfficientOCF(
         import os
         import numpy as np
         def _pack(cm):
-            return dict(hist_for_iou=cm,
-                        hist_for_iou_bbox=np.zeros((2, 2), dtype=np.int64),
-                        hist_for_iou_bbox_rot=np.zeros((2, 2), dtype=np.int64),
-                        hist_for_iou_asset=np.zeros((2, 2), dtype=np.int64),
-                        height_l1=torch.tensor(0.0),
-                        iou_3d=float("nan"), iou_3d_bbox=float("nan"),
-                        iou_3d_bbox_rot=float("nan"),
-                        iou_3d_asset=float("nan"),
-                        iou_3d_asset_comps=dict(tp=0.0, fp=0.0, fn=0.0),
-                        recall_3d=float("nan"),
-                        recall_3d_comps=dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0),
-                        recall_3d_rot=float("nan"),
-                        recall_3d_rot_comps=dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0),
-                        recall_3d_asset=float("nan"),
-                        recall_3d_asset_comps=dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0))
+            z = dict(tp=0.0, fp=0.0, fn=0.0)
+            return dict(hist_for_iou_asset_present=cm,
+                        hist_for_iou_asset_future=cm.copy(),
+                        iou_3d_asset_present=float("nan"),
+                        iou_3d_asset_future=float("nan"),
+                        iou_3d_asset_present_comps=dict(z),
+                        iou_3d_asset_future_comps=dict(z))
         empty = _pack(np.zeros((2, 2), dtype=np.int64))
 
         # eval 시각화(EOCF_EVAL_VIS=1)일 때만 attn/cam-gaussian용 디버그 산출물도 함께 반환.
         _eval_vis_on = os.environ.get("EOCF_EVAL_VIS", "0") == "1"
         # oracle(GT 치팅): 학습과 100% 동일한 cost로 query를 GT에 Hungarian 매칭해 선택.
         _oracle_on = os.environ.get("EOCF_EVAL_ORACLE_MATCH", "0") == "1"
+        # per-query raw tensor dump(offline fg-score 피팅용). oracle과 동일한 GT 매칭이 필요하므로
+        # attn GT 준비 / 매칭 호출을 oracle과 공유한다. 끄면(기본) 경로가 완전히 동일하다.
+        _dump_qfeat_on = os.environ.get("EOCF_EVAL_DUMP_QFEAT", "0") == "1"
+        _need_gt_match = _oracle_on or _dump_qfeat_on
         # 학습-동일 매칭은 attn cost(0.3)에 attn target이 필요 → extract에 attn용 GT를 넘긴다.
         _attn_gt_primary, _attn_gt_fallback = None, None
-        if _oracle_on:
+        if _need_gt_match:
             _attn_gt_fallback = self._prepare_segmentation_instance3d(
                 segmentation_instance3d=segmentation_instance3d)
             _ob = self._prepare_gt_occ_inst_primary_targets(
@@ -1855,10 +2480,65 @@ class EfficientOCF(
             self._eval_future_tail(feat_out[32]) if len(feat_out) > 32 and torch.is_tensor(feat_out[32]) else None,
         )
         eval_instance_img_debug_bundle = feat_out[16]   # cam-gaussian vis용 (이미지/캘리브)
-        if not (torch.is_tensor(centers_world) and torch.is_tensor(cls_scores_qc)
-                and torch.is_tensor(segmentation_bev)):
+        # segmentation_bev 가드 제거: asset-only eval은 LoadOccupancy를 쓰지 않는다.
+        if not (torch.is_tensor(centers_world) and torch.is_tensor(cls_scores_qc)):
             return empty
         present_idx = int(present_idx) if present_idx is not None else centers_world.shape[0] - 1
+
+        # ---- trajectory xy refine (추론에도 적용; normal/oracle 공통) ----
+        # forward_train과 동일한 헤드·동일한 입력(GT 불필요: query feat + cls + 예측 offset).
+        # 이전에는 forward_train에만 배선돼 있어 eval은 refine 이전 raw trajectory를 썼다.
+        # centers_world_traj / mixture traj는 [present + F] 레이아웃(index 0 = present)이라
+        # 교체 시 present_local_idx=0을 쓴다 (refine 호출 자체는 full-window centers_world 기준).
+        _refine_feat_tqd = feat_out[13] if len(feat_out) > 13 else None
+        _refine_traj_offsets_fq2 = feat_out[18] if len(feat_out) > 18 else None
+        mix_c_traj = feat_out[29] if len(feat_out) > 29 else None
+        # 계측(opt-in, 기본 OFF): base traj / refine 후의 '현재→미래 이동량' 분포.
+        # GT는 미래 이동이 정확히 0인 객체가 75%(NOTES 07-31)라, 모델이 정지객체를 얼마나
+        # 밀고 있는지 보려면 refine 전후를 분리해서 재야 한다.
+        _traj_base_for_stats = (
+            centers_world_traj.detach().clone()
+            if (os.environ.get("EOCF_EVAL_TRAJ_STATS", "0") == "1"
+                and torch.is_tensor(centers_world_traj)) else None)
+        # 추론 전용 스위치: EOCF_EVAL_TRAJ_REFINE=0 이면 refine을 건너뛰고 base trajectory를 쓴다.
+        # 근거(NOTES 07-31 실측): base traj는 '미래 이동 <0.5m' 비율 0.753으로 GT(0.75)와 일치하는데,
+        # refine 후 0.488로 떨어진다 = refine이 정지객체를 밀어낸다. 미설정 시 기존 동작(refine ON).
+        _traj_refine_on = os.environ.get("EOCF_EVAL_TRAJ_REFINE", "1") != "0"
+        if (
+            _traj_refine_on
+            and bool(getattr(self, "query_traj_xy_refine_enabled", False))
+            and torch.is_tensor(_refine_feat_tqd)
+            and torch.is_tensor(_refine_traj_offsets_fq2)
+            and torch.is_tensor(centers_world_traj)
+        ):
+            _refined_xy_fq2, _, _ = self.query_head.refine_trajectory_absolute_xy(
+                query_feat_tqd=_refine_feat_tqd,
+                query_cls_scores_qc=cls_scores_qc,
+                centers_world_tq3=centers_world,
+                pred_traj_offsets_fq2=_refine_traj_offsets_fq2,
+                present_local_idx=int(present_idx),
+            )
+            if torch.is_tensor(_refined_xy_fq2):
+                _traj_centers_prev = centers_world_traj
+                centers_world_traj = self._replace_future_xy_in_full_centers(
+                    centers_world_traj, _refined_xy_fq2, 0)
+                mix_c_traj = self._shift_future_mixture_centers_by_refined_xy(
+                    mix_c_traj, _traj_centers_prev, _refined_xy_fq2, 0)
+                if not getattr(self, "_eval_traj_refine_logged", False):
+                    self._eval_traj_refine_logged = True
+                    # shape이 안 맞으면 helper가 원본을 그대로 돌려주므로 delta=0이 된다.
+                    # delta>0 이어야 실제로 적용된 것.
+                    _d = float((centers_world_traj[1:, :, :2]
+                                - _traj_centers_prev[1:, :, :2]).abs().mean())
+                    print(f"[eval] traj xy refine applied: mean|delta_xy|={_d:.4f}m "
+                          f"(future_steps={int(_refined_xy_fq2.shape[0])}, "
+                          f"queries={int(_refined_xy_fq2.shape[1])}, "
+                          f"traj_T={int(centers_world_traj.shape[0])})", flush=True)
+        if _traj_base_for_stats is not None:
+            self._eval_traj_disp_stats(_traj_base_for_stats, centers_world_traj, cls_scores_qc)
+        mix_future = (
+            self._eval_future_tail(mix_c_traj) if torch.is_tensor(mix_c_traj) else None,
+        ) + mix_future[1:]
 
         # ---- GT instance-3d (required by the scoring bundle) ----
         gt_seg_inst3d = self._prepare_segmentation_instance3d(
@@ -1871,6 +2551,39 @@ class EfficientOCF(
                 gt_inst = gt_inst[0]
             gt_inst = gt_inst.to(centers_world.device)
 
+        # ---- cam attention self-consistency score (opt-in EOCF_EVAL_CAM_SCORE=1) ----
+        # GT-free 스코어: query 자신의 예측 gaussian mixture를 카메라에 투영한 맵과
+        # 그 query의 2D attention map 사이의 KL 일치도(학습 경로와 동일한 두 함수 호출).
+        # 미설정(기본) 시 pack=None 이라 기존 eval 경로와 완전히 동일하다.
+        _cam_pack = None
+        if os.environ.get("EOCF_EVAL_CAM_SCORE", "0") == "1":
+            _attn_w_tqnhw = feat_out[14] if len(feat_out) > 14 else None
+            _q_match_inputs = feat_out[17] if len(feat_out) > 17 else None
+            if (
+                torch.is_tensor(_attn_w_tqnhw)
+                and isinstance(_q_match_inputs, dict)
+                and torch.is_tensor(mix_c) and torch.is_tensor(mix_s)
+                and torch.is_tensor(mix_y) and torch.is_tensor(mix_w)
+            ):
+                try:
+                    with torch.no_grad():
+                        _cam_targets = self.build_query_attn_cam_gaussian_targets(
+                            mixture_centers_world_tqg3=mix_c,
+                            mixture_sigmas_world_tqg3=mix_s,
+                            mixture_yaw_tqg=mix_y,
+                            mixture_weights_tqg=mix_w,
+                            future_egomotion=future_egomotion,
+                            query_match_inputs=_q_match_inputs)
+                        if isinstance(_cam_targets, dict):
+                            _cam_pack = self._compute_query_attn_cam_gaussian_score(
+                                query_attn_weights_tqnhw=_attn_w_tqnhw,
+                                cam_targets=_cam_targets)
+                except Exception as e:
+                    _cam_pack = None  # 어떤 실패도 eval을 죽이지 않는다(기존 동작으로 degrade).
+                    if not getattr(self, "_eval_cam_score_err_logged", False):
+                        self._eval_cam_score_err_logged = True
+                        print(f"[eval_cam_score] skipped (err={e})", flush=True)
+
         # ---- actual-inference query selection (== debug-vis row-3 scoring) ----
         sel_idx = None
         selected_score = None
@@ -1882,16 +2595,74 @@ class EfficientOCF(
             gaussian_sigmas_world_tq3=sigmas_world,
             mixture_centers_world_tqg3=mix_c, mixture_sigmas_world_tqg3=mix_s,
             mixture_yaw_tqg=mix_y, mixture_weights_tqg=mix_w,
-            traj_mode_idx_q=traj_mode_idx_q, query_attn_cam_score_pack=None)
+            traj_mode_idx_q=traj_mode_idx_q, query_attn_cam_score_pack=_cam_pack)
         if isinstance(bundle, dict):
             sel_idx = bundle.get("selected_query_idx_q", None)
             selected_score = bundle.get("selected_score_q", None)
+
+        # ---- depth-sharpness reweighted selection (opt-in EOCF_EVAL_FG_SHARP_POW>0) ----
+        # '같은 개수, 더 좋은 선택'. thr는 예산을 맞추도록 offline에서 캘리브레이션한 값을 준다
+        # (N=300 기준: pow=1 -> 0.4110 / pow=2 -> 0.1938 / pow=3 -> 0.0924 이 fg0.9와 동일 개수).
+        _sharp_pow = float(os.environ.get("EOCF_EVAL_FG_SHARP_POW", "0") or 0.0)
+        if _sharp_pow > 0.0:
+            sel_idx, selected_score = self._eval_select_by_depth_sharpness(
+                bundle=bundle,
+                depth_probs_tqd=(feat_out[11] if len(feat_out) > 11 else None),
+                present_idx=present_idx, pow_k=_sharp_pow,
+                thr=float(os.environ.get("EOCF_EVAL_FG_SHARP_THR", "0.1938")),
+                floor=float(os.environ.get("EOCF_EVAL_FG_SHARP_FLOOR", "0") or 0.0),
+                fallback=(sel_idx, selected_score))
+
+        # ---- traincal 통계 수집 모드 (opt-in EOCF_EVAL_TRAINCAL_COLLECT=<out.json>) ----
+        # checkpoint가 바뀌면 z-score가 통째로 틀어지므로(에러 없이 조용히) 모델마다 새로 뽑아야 한다.
+        # 선택 로직과 **같은 함수/같은 스코프**(pred_cls != bg)를 써서 정의 불일치를 원천 차단한다.
+        if os.environ.get("EOCF_EVAL_TRAINCAL_COLLECT", "").strip():
+            self._eval_traincal_collect_step(
+                bundle=bundle,
+                depth_probs_tqd=(feat_out[11] if len(feat_out) > 11 else None),
+                centers_world_tq3=centers_world, present_idx=present_idx)
+
+        # ---- train-calibrated depth+speed 재선택 (opt-in EOCF_EVAL_TRAINCAL_STATS=<json>) ----
+        # train 4,000 sample의 log1p population mean/std를 고정해 z-normalize한 뒤
+        # s_eff = sigmoid(logit(s) - a_d*z_d - a_s*z_s) 로 fg 컷을 다시 건다(global reselection).
+        _stats = getattr(self, "_eval_traincal_stats", None)
+        if _stats is None:
+            _stats = self._eval_traincal_load_stats()
+            self._eval_traincal_stats = _stats
+        if _stats:
+            sel_idx, selected_score = self._eval_select_by_traincal_depth_speed(
+                bundle=bundle,
+                depth_probs_tqd=(feat_out[11] if len(feat_out) > 11 else None),
+                centers_world_tq3=centers_world, present_idx=present_idx, stats=_stats,
+                alpha_depth=float(os.environ.get("EOCF_EVAL_TRAINCAL_ALPHA_DEPTH", "0.5")),
+                alpha_speed=float(os.environ.get("EOCF_EVAL_TRAINCAL_ALPHA_SPEED", "0.25")),
+                cutoff=float(os.environ.get("EOCF_EVAL_TRAINCAL_CUTOFF", "0.9")),
+                fallback=(sel_idx, selected_score))
+
+        # ---- trajectory-accel 꼬리 제거 (opt-in EOCF_EVAL_FG_TRAJ_ACC_MAX>0, 단위 m) ----
+        # 캘리브레이션(N=300, fg0.9 선택집합): 상위 2%=11.16 / 5%=6.97 / 10%=4.85 / 20%=2.94
+        # ---- TRAJ_CUT: 궤적 가속도 꼬리 제거 (기본 ON) ----
+        # 기본값 5.0m = 함의 가속도 20 m/s²(≈2g). 0으로 주면 비활성.
+        # 실측(NOTES 08-01, ep18 5119): 3D_avg 0.14876 → 0.15092 (+1.45%), present 무손실.
+        _traj_acc_max = float(os.environ.get("EOCF_EVAL_FG_TRAJ_ACC_MAX", "5.0") or 0.0)
+        # 적용 범위: all=query를 통째로 제거(기본, 기존 동작) / future=미래 프레임 렌더에서만 제외.
+        # 근거(NOTES 08-01): 컷은 future +0.0027 / present −0.0004 로 **미래에서만 이득**이다.
+        # traj_acc는 궤적에서 계산한 값이므로 궤적 파생 출력(미래)에만 적용하는 것이 신호의 의미와
+        # 맞고, 현재 프레임(궤적 미사용)까지 지우는 것은 논리 비약이다.
+        _traj_scope = os.environ.get("EOCF_EVAL_TRAJ_CUT_SCOPE", "future").strip().lower()
+        if _traj_acc_max > 0.0 and _traj_scope != "future":
+            sel_idx, selected_score = self._eval_filter_by_traj_accel(
+                sel_idx=sel_idx, selected_score=selected_score,
+                centers_world_tq3=centers_world, acc_max=_traj_acc_max,
+                fallback=(sel_idx, selected_score))
 
         # ---- oracle (GT Hungarian) selection override (opt-in EOCF_EVAL_ORACLE_MATCH=1) ----
         # Bypass confidence scoring: keep only queries Hungarian-matched to GT using the
         # SAME cost as training (center+cls+attn, full7 temporal, feature-gated).
         # 진단: oracle ≫ baseline → 스코어링 병목 / 비슷 → shape·매칭 문제.
-        if _oracle_on:
+        _baseline_sel_idx = sel_idx      # dump용: oracle override 이전의 score-기반 선택
+        _imr = None
+        if _need_gt_match:
             _imr = self._eval_train_faithful_inst_match(
                 feat_out=feat_out, future_egomotion=future_egomotion,
                 segmentation_instance3d=segmentation_instance3d,
@@ -1900,6 +2671,7 @@ class EfficientOCF(
                 gt_instance_centers_world=kwargs.get("gt_instance_centers_world", None),
                 gt_instance_centers_valid=kwargs.get("gt_instance_centers_valid", None),
                 gt_instance_ids=kwargs.get("gt_instance_ids", None))
+        if _oracle_on:
             _mqi = _imr.get("matched_query_idx", None) if isinstance(_imr, dict) else None
             if torch.is_tensor(_mqi) and int(_mqi.numel()) > 0:
                 sel_idx = torch.unique(
@@ -1913,10 +2685,40 @@ class EfficientOCF(
 
         # occ 이진화 threshold: config 단일 키(occ_score_threshold)가 기본, env로 override.
         thr = float(os.environ.get("EOCF_EVAL_OCC_THR", getattr(self, "occ_score_threshold", 0.5)))
+        # ---- per-query raw tensor dump (opt-in via EOCF_EVAL_DUMP_QFEAT) ----
+        # metric에 쓰이는 값들을 읽기만 한다(계측 전용).
+        self._maybe_dump_eval_query_features(
+            bundle=bundle, cls_scores_qc=cls_scores_qc, centers_world=centers_world,
+            mixture=(mix_c, mix_s, mix_y, mix_w), present_idx=present_idx,
+            baseline_sel_idx=_baseline_sel_idx, occ_thr=thr, oracle_match_result=_imr,
+            img_metas=img_metas,
+            # feat_out[11] = query_depth_probs_tqd [T,Q,D] (softmax된 per-query depth 분포)
+            depth_probs_tqd=(feat_out[11] if len(feat_out) > 11 else None),
+            gt_pack=dict(
+                gt_instance_centers_world=kwargs.get("gt_instance_centers_world", None),
+                gt_instance_centers_valid=kwargs.get("gt_instance_centers_valid", None),
+                gt_instance_ids=kwargs.get("gt_instance_ids", None),
+                gt_instance_dims=kwargs.get("gt_instance_dims", None),
+                gt_instance_sizes=kwargs.get("gt_instance_sizes", None),
+            ))
         # eval 기준 프레임: present(현재 1프레임) / future(미래 n_future프레임). metric·viz 공통.
         eval_mode = "present" if self._eval_mode_is_present() else "future"
         H, W, D = int(self.voxelizer.H), int(self.voxelizer.W), int(self.voxelizer.D)
         n_sel = int(sel_idx.numel()) if torch.is_tensor(sel_idx) else 0
+        # scope=future면 현재 프레임은 전체 선택(sel_idx), 미래 프레임만 컷된 집합(sel_idx_fut)을 쓴다.
+        # scope=all(기본)이면 위에서 이미 sel_idx가 잘려 있으므로 둘이 같다.
+        # ⚠ oracle(_oracle_on)에는 컷을 걸지 않는다. oracle은 GT 매칭으로 고른 '선택의 상한'을 재는
+        #    진단인데, 컷은 그 GT-매칭 query(=정답)를 지워 상한을 인위적으로 낮춘다.
+        #    scope=all은 컷이 oracle override '이전'이라 자동으로 무효화되지만,
+        #    scope=future는 override '이후'에 걸리므로 여기서 명시적으로 제외해야 한다.
+        sel_idx_fut, selected_score_fut = sel_idx, selected_score
+        if (_traj_acc_max > 0.0 and _traj_scope == "future"
+                and not _oracle_on and torch.is_tensor(sel_idx)):
+            sel_idx_fut, selected_score_fut = self._eval_filter_by_traj_accel(
+                sel_idx=sel_idx, selected_score=selected_score,
+                centers_world_tq3=centers_world, acc_max=_traj_acc_max,
+                fallback=(sel_idx, selected_score))
+        n_fut = int(sel_idx_fut.numel()) if torch.is_tensor(sel_idx_fut) else 0
         _pred_occ_vis = None
         pred_occ_eval = None
         centers_eval_tq3 = self._eval_future_tail(self._pick_tensor(centers_world_traj, centers_world))
@@ -1940,8 +2742,17 @@ class EfficientOCF(
                     if torch.is_tensor(selected_score) and int(selected_score.numel()) == n_sel
                     else cen.new_ones((n_sel,), dtype=cen.dtype)
                 )
-            cen_eval = centers_eval_tq3.index_select(1, sel_idx)             # [T,S,3]
-            weights_tq = weights_sel.view(1, -1).expand(int(cen_eval.shape[0]), -1).contiguous()
+            cen_eval = centers_eval_tq3.index_select(1, sel_idx_fut)         # [T,S_fut,3]
+            if os.environ.get("EOCF_EVAL_WEIGHT_MODE", "score") == "ones":
+                weights_fut = cen.new_ones((n_fut,), dtype=cen.dtype)
+            else:
+                weights_fut = (
+                    selected_score_fut.to(device=cen.device, dtype=cen.dtype).reshape(-1)
+                    if torch.is_tensor(selected_score_fut)
+                    and int(selected_score_fut.numel()) == n_fut
+                    else cen.new_ones((n_fut,), dtype=cen.dtype)
+                )
+            weights_tq = weights_fut.view(1, -1).expand(int(cen_eval.shape[0]), -1).contiguous()
 
             use_mix = (
                 bool(getattr(self, "query_eval_occ_use_mixture", False))
@@ -1958,12 +2769,18 @@ class EfficientOCF(
                     present_idx, mix_c, mix_s, mix_y, mix_w, centers_world, sel_idx)
                 pred_occ = self._eval_mixture_scene_occ(
                     cen.unsqueeze(0), off_sg3, sig_sg3, yaw_sg, w_sg, weights_sel.view(1, -1))
+                # 미래는 sel_idx_fut 기준으로 mixture 파라미터를 다시 뽑는다(scope=all이면 동일).
+                if n_fut == n_sel:
+                    off_f, sig_f, yaw_f, w_f = off_sg3, sig_sg3, yaw_sg, w_sg
+                else:
+                    off_f, sig_f, yaw_f, w_f = self._eval_select_mixture_params(
+                        present_idx, mix_c, mix_s, mix_y, mix_w, centers_world, sel_idx_fut)
                 pred_occ_eval = self._eval_mixture_scene_occ(
-                    cen_eval, off_sg3, sig_sg3, yaw_sg, w_sg, weights_tq)
+                    cen_eval, off_f, sig_f, yaw_f, w_f, weights_tq)
             else:
                 sig = (sigmas_world[present_idx].index_select(0, sel_idx)
                        if torch.is_tensor(sigmas_world) else None)
-                sig_eval = sigmas_eval_tq3.index_select(1, sel_idx)
+                sig_eval = sigmas_eval_tq3.index_select(1, sel_idx_fut)
                 pred_occ = self.voxelizer(
                     cen.unsqueeze(0),
                     sigmas_world=(sig.unsqueeze(0) if torch.is_tensor(sig) else None),
@@ -1979,212 +2796,139 @@ class EfficientOCF(
         if eval_mode == "present":
             pred_txyz = pred_occ3d.permute(2, 1, 0).unsqueeze(0).contiguous()  # [1,X,Y,Z]
 
-        # ---- GT BEV movable occupancy: nusocc inst3d(gt_occ_inst)의 z-collapse ----
-        # 학습 dice(loss_gmo_dice)와 동일 소스(dense_inst_txyz; nohuman·query-class 필터 동일).
-        # segmentation_bev는 bbox-AABB 렌더링이라 nusocc GT가 아님 → bbox 메트릭 전용으로만 남김.
-        if torch.is_tensor(gt_inst):
-            gt = (gt_inst > 0).any(dim=-1).to(pred_bev.device)   # [T,X,Y]
-        else:
-            gt = segmentation_bev
-            while gt.dim() > 3:              # drop batch -> [T,Hb,Wb]
-                gt = gt[0]
-            gt = (gt > 0).to(pred_bev.device)
-        pred_bev_t = pred_txyz.permute(0, 3, 2, 1).any(dim=1).contiguous()
+        # ---- asset-only metric: present / future 두 세트 ----
+        # nusocc·bbox_aabb·bbox_rot·Recall3d 계열은 전부 제거(2026-07-30). GT 로드도 함께 사라져
+        # (_eval_load_bbox_gt_v2, LoadOccupancy) eval CPU 비용이 크게 줄었다.
+        # EOCF_EVAL_MODE는 이제 시각화 기준 프레임에만 영향을 주고, metric은 항상 둘 다 계산한다.
+        pred_bev_t = pred_txyz.permute(0, 3, 2, 1).any(dim=1).contiguous()   # [F,Y,X]
+        cm_asset_future = np.zeros((2, 2), dtype=np.int64)
+        cm_asset_present = np.zeros((2, 2), dtype=np.int64)
+        iou_3d_asset_future = float("nan")
+        iou_3d_asset_present = float("nan")
+        comps_future = dict(tp=0.0, fp=0.0, fn=0.0)
+        comps_present = dict(tp=0.0, fp=0.0, fn=0.0)
+        # 4행(eval 비교) 시각화용 GT. GT 파일이 없거나 align 실패 시에도 참조되므로
+        # 반드시 여기서 초기화해 둔다(아래 if 블록 안에서만 정의하면 NameError).
+        asset_bev_vis = None
+        asset_bev_present = None
 
-        # BEV/3D 기하 정렬 (transpose, flipH, flipW): pred 그리드를 GT 방향에 맞춘다. 데이터 그리드가
-        # 같으면 고정값이라 기본값을 쓰고, 한 번 잠근 뒤 모든 샘플에 재사용한다(공정 비교).
-        # env override: EOCF_EVAL_ALIGN="frame,transpose,flipH,flipW" 강제 / "auto" 자동 캘리브레이션.
-        # (frame은 BEV 정렬에 미사용, 호환을 위해 자리만 유지.)
-        align = getattr(self, "_eval_occ_align", None)
-        if align is None:
-            env = os.environ.get("EOCF_EVAL_ALIGN", "").strip().lower()
-            if env == "auto":
-                print(f"[simple_test][diag] #selected={n_sel}/{int(cls_scores_qc.shape[0])} "
-                      f"pred_bev#={int(pred_bev.sum())} pred_shape={tuple(pred_bev.shape)} "
-                      f"gt_shape={tuple(gt.shape)} (thr={thr})", flush=True)
-                align = self._calibrate_eval_bev_align(pred_bev, gt)
-            else:
-                t, tr, fh, fw = [int(x) for x in env.split(",")] if env else (2, 1, 0, 0)
-                align = (t, bool(tr), (fh, fw))
-            self._eval_occ_align = align
-            print(f"[simple_test] BEV align {align}", flush=True)
-        if align is None:
-            return empty
-        _, bev_transpose, bev_flips = align
-        gt_bin_t = self._apply_bev_align_sequence(
-            self._eval_mode_slice(gt), bev_transpose, bev_flips)
-        t_bev = min(int(pred_bev_t.shape[0]), int(gt_bin_t.shape[0]))
-        cm_nusocc = (
-            self._binary_occ_cm(pred_bev_t[:t_bev], gt_bin_t[:t_bev])
-            if t_bev > 0 else np.zeros((2, 2), dtype=np.int64)
-        )
-
-        # ---- extra eval metrics (eval-only; never reached by training) ----
-        # 3D IoU uses nuScenes-Occupancy gt_occ [T,X,Y,Z]. Recall_3d keeps the
-        # legacy bbox-corrected formula, but on real 3D voxels:
-        # (TP + bbox_FP) / (TP + FN + FP - bbox_FP).
-        iou_3d, recall_3d = float("nan"), float("nan")
-        iou_3d_bbox = float("nan")
-        iou_3d_bbox_rot = float("nan")
-        iou_3d_asset = float("nan")
-        iou_3d_asset_comps = dict(tp=0.0, fp=0.0, fn=0.0)
-        recall_3d_rot = float("nan")
-        recall_3d_asset = float("nan")
-        r3d_comps = dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0)
-        r3d_rot_comps = dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0)
-        r3d_asset_comps = dict(tp=0.0, fp=0.0, fn=0.0, bbox_fp=0.0)
-        cm_bbox = np.zeros((2, 2), dtype=np.int64)
-        cm_bbox_rot = np.zeros((2, 2), dtype=np.int64)
-        cm_asset = np.zeros((2, 2), dtype=np.int64)
-        # bbox GT v2(annotation 재생성: 생성소멸·사람 필터 + rotated OBB) 우선 사용.
-        # 없으면 기존 bboxcls 캐시 fallback (rot 메트릭은 v2 전용이라 NaN 유지).
-        gt_bbox_rot_src = None
-        bbox_bev_vis = None
-        _bbox_v2 = self._eval_load_bbox_gt_v2(img_metas)
         gt_asset_src = self._eval_load_asset_gt(img_metas)
-        if isinstance(_bbox_v2, dict):
-            gt_bbox_src = _bbox_v2["aabb"]
-            gt_bbox_rot_src = _bbox_v2["rot"]
-        else:
-            gt_bbox_src = self._eval_bbox_cls_occ_txyz(segmentation_cls_instance3d)
-            if not torch.is_tensor(gt_bbox_src):
-                gt_bbox_src = self._eval_bbox_occ_txyz(
-                    segmentation=segmentation,
-                    segmentation_instance3d=segmentation_instance3d,
-                    gt_occ_inst=gt_occ_inst,
-                    fallback_shape=(tuple(gt_occ.shape) if torch.is_tensor(gt_occ) else None),
-                )
-        # dtype 강제 없음: v2는 uint8(메모리 1/8), fallback(bboxcls)은 long — 이후 연산은
-        # (>0)/(!=255) 뿐이라 dtype 무관.
-        if torch.is_tensor(gt_bbox_src):
-            gt_bbox_src = gt_bbox_src.to(device=pred_occ3d.device)
-        if torch.is_tensor(gt_bbox_rot_src):
-            gt_bbox_rot_src = gt_bbox_rot_src.to(device=pred_occ3d.device)
         if torch.is_tensor(gt_asset_src):
             gt_asset_src = gt_asset_src.to(device=pred_occ3d.device)
-        # 3D nusocc GT = 학습 감독과 동일한 inst3d(dense_inst). raw gt_occ는 box 밖 잔여(평균 +29%)
-        # 와 생성소멸 미필터로 모델이 배우지 않는 voxel을 구조적 FN으로 깔아 사용 중단 (NOTES 2026-07-06).
-        # inst3d에는 255(ignore)가 없어 valid 마스크도 불필요.
-        if torch.is_tensor(gt_inst):
-            gt_occ_fg = (gt_inst > 0).to(device=pred_occ3d.device)
-            gt_occ_valid = None
-        else:
-            gt_occ_fg = self._eval_nusocc_3d_fg(gt_occ, device=pred_occ3d.device)
-            gt_occ_valid = self._eval_nusocc_3d_valid(gt_occ, device=pred_occ3d.device)
-        if torch.is_tensor(gt_occ_fg) and gt_occ_fg.dim() == 4:
+        if torch.is_tensor(gt_asset_src) and gt_asset_src.dim() == 4:
             align3d = getattr(self, "_eval_3d_align", None)
             if align3d is None:
                 env3d = os.environ.get("EOCF_EVAL_3D_ALIGN", "").strip().lower()
                 if env3d == "auto":
-                    align3d = self._calibrate_eval_3d_align(pred_occ3d, gt_occ_fg)
+                    align3d = self._calibrate_eval_3d_align(pred_occ3d, gt_asset_src)
                 else:
                     t, tr, fh, fw, fz = [int(x) for x in env3d.split(",")] if env3d else (0, 1, 0, 0, 0)
                     align3d = (t, bool(tr), fh, fw, fz)
                     print(f"[simple_test] 3D align {align3d}", flush=True)
                 self._eval_3d_align = align3d
             if align3d is not None:
-                t_idx, transpose, fh, fw, fz = align3d
-                gt3d_t = self._apply_3d_align_sequence(
-                    self._eval_mode_slice(gt_occ_fg), transpose, fh, fw, fz)
-                valid3d_t = (
-                    self._apply_3d_align_sequence(self._eval_mode_slice(gt_occ_valid), transpose, fh, fw, fz)
-                    if torch.is_tensor(gt_occ_valid) and gt_occ_valid.dim() == 4 else None
-                )
-                bbox3d_t = None
-                rot3d_t = None
-                if tuple(gt3d_t.shape[1:]) == tuple(pred_occ3d.shape):
-                    if torch.is_tensor(gt_bbox_src) and gt_bbox_src.dim() == 4:
-                        bbox3d_src_t = self._eval_mode_slice((gt_bbox_src > 0) & (gt_bbox_src != 255))
-                        bbox3d_t = self._apply_3d_align_sequence(
-                            bbox3d_src_t, transpose, fh, fw, fz)
-                        if torch.is_tensor(bbox3d_t):
-                            bbox_bev_t = bbox3d_t.any(dim=1).contiguous()
-                            bbox_bev_vis = bbox_bev_t   # eval 비교 시각화(4행)용
-                            t_bbox = min(int(pred_bev_t.shape[0]), int(bbox_bev_t.shape[0]))
-                            if t_bbox > 0 and tuple(bbox_bev_t.shape[1:]) == tuple(pred_bev_t.shape[1:]):
-                                cm_bbox = self._binary_occ_cm(
-                                    pred_bev_t[:t_bbox], bbox_bev_t[:t_bbox])
-                    # rotated-OBB GT: AABB와 동일한 align 잠금·규칙으로 2D CM 채점.
-                    if torch.is_tensor(gt_bbox_rot_src) and gt_bbox_rot_src.dim() == 4:
-                        rot3d_src_t = self._eval_mode_slice((gt_bbox_rot_src > 0) & (gt_bbox_rot_src != 255))
-                        rot3d_t = self._apply_3d_align_sequence(
-                            rot3d_src_t, transpose, fh, fw, fz)
-                        if torch.is_tensor(rot3d_t):
-                            rot_bev_t = rot3d_t.any(dim=1).contiguous()
-                            t_rot = min(int(pred_bev_t.shape[0]), int(rot_bev_t.shape[0]))
-                            if t_rot > 0 and tuple(rot_bev_t.shape[1:]) == tuple(pred_bev_t.shape[1:]):
-                                cm_bbox_rot = self._binary_occ_cm(
-                                    pred_bev_t[:t_rot], rot_bev_t[:t_rot])
-                    asset3d_t = None
-                    if torch.is_tensor(gt_asset_src) and gt_asset_src.dim() == 4:
-                        asset3d_src_t = self._eval_mode_slice(gt_asset_src)
-                        asset3d_t = self._apply_3d_align_sequence(
-                            asset3d_src_t, transpose, fh, fw, fz)
-                        if torch.is_tensor(asset3d_t):
-                            asset_bev_t = asset3d_t.any(dim=1).contiguous()
-                            t_asset = min(int(pred_bev_t.shape[0]), int(asset_bev_t.shape[0]))
-                            if t_asset > 0 and tuple(asset_bev_t.shape[1:]) == tuple(pred_bev_t.shape[1:]):
-                                cm_asset = self._binary_occ_cm(
-                                    pred_bev_t[:t_asset], asset_bev_t[:t_asset])
-                    t_eval = min(int(pred_txyz.shape[0]), int(gt3d_t.shape[0]))
-                    if t_eval > 0:
-                        pred_zyx_t = pred_txyz[:t_eval].permute(0, 3, 2, 1).contiguous()
-                        gt3d_t = gt3d_t[:t_eval]
-                        if tuple(pred_zyx_t.shape) == tuple(gt3d_t.shape):
-                            bbox_arg = bbox3d_t[:t_eval] if (
-                                torch.is_tensor(bbox3d_t) and int(bbox3d_t.shape[0]) >= t_eval
-                            ) else None
-                            valid_arg = valid3d_t[:t_eval] if (
-                                torch.is_tensor(valid3d_t) and int(valid3d_t.shape[0]) >= t_eval
-                            ) else None
-                            iou_3d, recall_3d, r3d_comps = self._iou_recall_3d(
-                                pred_zyx_t, gt3d_t, bbox3d=bbox_arg, valid3d=valid_arg)
-                            # bbox 3D IoU(AABB/rot): 2D bbox 메트릭과 동일 GT를 3D 그대로 채점.
-                            # nusocc valid(255) 마스크·관용항 없음 — IoU2d(bbox_*)와 규칙 일치.
-                            if torch.is_tensor(bbox_arg):
-                                iou_3d_bbox, _, _ = self._iou_recall_3d(pred_zyx_t, bbox_arg)
-                            if torch.is_tensor(rot3d_t) and int(rot3d_t.shape[0]) >= t_eval:
-                                iou_3d_bbox_rot, _, _ = self._iou_recall_3d(
-                                    pred_zyx_t, rot3d_t[:t_eval])
-                                # Recall3d(bbox_rot): base=inst3d(gt3d_t) 그대로, 관용 영역만
-                                # AABB→rot OBB로 교체. rot⊂aabb라 관용이 좁아져 방향까지 맞아야 함.
-                                _, recall_3d_rot, r3d_rot_comps = self._iou_recall_3d(
-                                    pred_zyx_t, gt3d_t, bbox3d=rot3d_t[:t_eval], valid3d=valid_arg)
-                            if torch.is_tensor(asset3d_t) and int(asset3d_t.shape[0]) >= t_eval:
-                                asset_arg = asset3d_t[:t_eval]
-                                iou_3d_asset, _, iou_3d_asset_comps = self._iou_recall_3d(
-                                    pred_zyx_t, asset_arg)
-                                # 기존 inst3d는 필수 GT, asset-union은 추가 예측 허용 영역.
-                                _, recall_3d_asset, r3d_asset_comps = self._iou_recall_3d(
-                                    pred_zyx_t, gt3d_t, bbox3d=asset_arg, valid3d=valid_arg)
+                _, transpose, fh, fw, fz = align3d
+
+                # --- future: 미래 n_future 프레임 ---
+                asset3d_fut = self._apply_3d_align_sequence(
+                    self._eval_future_tail(gt_asset_src), transpose, fh, fw, fz)   # [F,Z,Y,X]
+                asset_bev_vis = asset3d_fut.any(dim=1).contiguous()                # [F,Y,X]
+                t_f = min(int(pred_bev_t.shape[0]), int(asset_bev_vis.shape[0]))
+                if t_f > 0 and tuple(asset_bev_vis.shape[1:]) == tuple(pred_bev_t.shape[1:]):
+                    cm_asset_future = self._binary_occ_cm(
+                        pred_bev_t[:t_f], asset_bev_vis[:t_f])
+                if t_f > 0:
+                    pred_zyx_f = pred_txyz[:t_f].permute(0, 3, 2, 1).contiguous()
+                    if tuple(pred_zyx_f.shape) == tuple(asset3d_fut[:t_f].shape):
+                        iou_3d_asset_future, _, comps_future = self._iou_recall_3d(
+                            pred_zyx_f, asset3d_fut[:t_f])
+
+                # --- present: 현재 1프레임 (pred_occ3d는 이미 렌더돼 있어 추가 비용 없음) ---
+                asset3d_pres = self._apply_3d_align_sequence(
+                    gt_asset_src[present_idx:present_idx + 1], transpose, fh, fw, fz)  # [1,Z,Y,X]
+                asset_bev_present = asset3d_pres.any(dim=1).contiguous()               # [1,Y,X]
+                pred_bev_p = pred_bev.unsqueeze(0)                                     # [1,Y,X]
+                if tuple(asset_bev_present.shape[1:]) == tuple(pred_bev_p.shape[1:]):
+                    cm_asset_present = self._binary_occ_cm(pred_bev_p, asset_bev_present)
+                pred_zyx_p = pred_occ3d.unsqueeze(0)                                   # [1,Z,Y,X]
+                if tuple(pred_zyx_p.shape) == tuple(asset3d_pres.shape):
+                    iou_3d_asset_present, _, comps_present = self._iou_recall_3d(
+                        pred_zyx_p, asset3d_pres)
+
 
         # ---- eval-time query visualization (opt-in via EOCF_EVAL_VIS) ----
         # metric 계산 뒤로 이동: 4행 비교(eval 실제 pred_bev_t vs aligned AABB GT)를
         # 채점에 쓴 텐서 그대로 넘기기 위함 — threshold/정렬/기준프레임 정의상 동일.
+        # ---- viz 전용: query_debug_vis 맨 앞 열에 present 프레임 추가 ----
+        # centers_world_traj / mixture traj는 이미 [present, f1..fF] 레이아웃(T=F+1)이고
+        # present occ(pred_occ)도 이미 렌더돼 있어, 자르지 않고 그대로 넘기면 추가 연산이 없다.
+        # metric 경로(centers_eval_tq3 / pred_occ_eval)는 건드리지 않는다.
+        _n_fut = int(self.n_future_frames)
+        _vis_centers_tq3 = self._pick_tensor(centers_world_traj, centers_world)
+        _vis_mix = tuple(
+            feat_out[i] if len(feat_out) > i and torch.is_tensor(feat_out[i]) else None
+            for i in (30, 31, 32)
+        )
+        _vis_mix = (mix_c_traj,) + _vis_mix
+        _vis_pred_occ = (
+            torch.cat([_pred_occ_vis, pred_occ_eval], dim=0)
+            if (torch.is_tensor(_pred_occ_vis) and torch.is_tensor(pred_occ_eval)
+                and _pred_occ_vis.dim() == pred_occ_eval.dim()) else None
+        )
+        # 모든 viz 텐서의 프레임 수가 정확히 (present + F)일 때만 present 열을 켠다.
+        _with_present = (
+            torch.is_tensor(_vis_centers_tq3)
+            and int(_vis_centers_tq3.shape[0]) == _n_fut + 1
+            and torch.is_tensor(_vis_pred_occ)
+            and int(_vis_pred_occ.shape[0]) == _n_fut + 1
+            and all(torch.is_tensor(m) and int(m.shape[0]) == _n_fut + 1 for m in _vis_mix)
+        )
         self._maybe_save_eval_query_vis(
             pred_occ_prob=_pred_occ_vis, gt_inst=gt_inst, centers_world=centers_world,
             present_idx=present_idx, cls_scores_qc=cls_scores_qc, bundle=bundle,
             prob_threshold=thr, img_metas=img_metas,
             img_inputs_seq=img_inputs_seq, future_egomotion=future_egomotion,
             instance_img_debug_bundle=eval_instance_img_debug_bundle,
-            eval_mode=eval_mode, centers_future_tq3=centers_eval_tq3,
-            pred_occ_future=pred_occ_eval, mix_future=mix_future,
-            eval_cmp_pack=(
-                dict(pred_bev_t=pred_bev_t.detach(), gt_bev_t=bbox_bev_vis.detach())
-                if torch.is_tensor(bbox_bev_vis) else None
-            ))
+            eval_mode=eval_mode,
+            centers_future_tq3=(_vis_centers_tq3 if _with_present else centers_eval_tq3),
+            pred_occ_future=(_vis_pred_occ if _with_present else pred_occ_eval),
+            mix_future=(_vis_mix if _with_present else mix_future),
+            future_includes_present=bool(_with_present),
+            # 4행 비교 GT = asset-union(1~3행 inst3d와 동일하게 사람/visibility 필터 적용됨).
+            # 이전엔 bbox AABB라 사람이 남아 1~3행과 객체 집합이 달랐다.
+            eval_cmp_pack=self._build_eval_cmp_pack(
+                pred_bev_t, asset_bev_vis, pred_bev, asset_bev_present, _with_present))
 
-        return dict(hist_for_iou=cm_nusocc, hist_for_iou_bbox=cm_bbox,
-                    hist_for_iou_bbox_rot=cm_bbox_rot, hist_for_iou_asset=cm_asset,
-                    height_l1=torch.tensor(0.0),
-                    iou_3d=iou_3d, iou_3d_bbox=iou_3d_bbox,
-                    iou_3d_bbox_rot=iou_3d_bbox_rot, iou_3d_asset=iou_3d_asset,
-                    iou_3d_asset_comps=iou_3d_asset_comps,
-                    recall_3d=recall_3d,
-                    recall_3d_comps=r3d_comps,
-                    recall_3d_rot=recall_3d_rot, recall_3d_rot_comps=r3d_rot_comps,
-                    recall_3d_asset=recall_3d_asset,
-                    recall_3d_asset_comps=r3d_asset_comps)
+        return dict(
+            hist_for_iou_asset_present=cm_asset_present,
+            hist_for_iou_asset_future=cm_asset_future,
+            iou_3d_asset_present=iou_3d_asset_present,
+            iou_3d_asset_future=iou_3d_asset_future,
+            iou_3d_asset_present_comps=comps_present,
+            iou_3d_asset_future_comps=comps_future,
+        )
+
+    @staticmethod
+    def _build_eval_cmp_pack(pred_bev_t, gt_bev_t, pred_bev_present,
+                             gt_bev_present, with_present):
+        """4행(eval 비교) 입력 구성.
+
+        metric은 future tail만 채점하므로 pred/GT가 F프레임이다. 1~3행에 present 열이
+        추가되면 4행도 present를 앞에 붙여야 열이 어긋나지 않는다(안 붙이면 f1이 present
+        칸에 그려지고 마지막 칸이 빈다).
+        """
+        if not (torch.is_tensor(pred_bev_t) and torch.is_tensor(gt_bev_t)):
+            return None
+        pred, gt = pred_bev_t.detach(), gt_bev_t.detach()
+        if bool(with_present) and torch.is_tensor(pred_bev_present) \
+                and torch.is_tensor(gt_bev_present):
+            p0 = pred_bev_present.detach().reshape(1, *pred.shape[1:])
+            g0 = gt_bev_present.detach().reshape(1, *gt.shape[1:])
+            if tuple(p0.shape[1:]) == tuple(pred.shape[1:]) \
+                    and tuple(g0.shape[1:]) == tuple(gt.shape[1:]):
+                pred = torch.cat([p0.to(pred.dtype), pred], dim=0)
+                gt = torch.cat([g0.to(gt.dtype), gt], dim=0)
+        return dict(pred_bev_t=pred, gt_bev_t=gt)
 
     @staticmethod
     def _binary_occ_cm(pred_bin, gt_bin):
@@ -2439,6 +3183,7 @@ class EfficientOCF(
         y_dim = int(self.voxelizer.H)
         z_dim = int(self.voxelizer.D)
         out = {}
+        n_ped_vox = 0   # 실제로 사람 voxel이 들어있었는지 확인용(아래 1회 로그)
         for name, sub in (("aabb", "segmentation_aabb"), ("rot", "segmentation_rot")):
             p = os.path.join(root, sub, key + ".npz")
             if not os.path.exists(p):
@@ -2460,11 +3205,22 @@ class EfficientOCF(
                     & (a[:, 1] >= 0) & (a[:, 1] < y_dim)
                     & (a[:, 2] >= 0) & (a[:, 2] < z_dim)
                 )
+                # pedestrian(7) 제외 — inst3d(LoadInstanceWithFlow exclude_occ_class_ids)와
+                # asset(_eval_load_asset_gt a[:,3]!=7) 기준에 맞춘다. 이게 없으면 bbox 계열
+                # 지표(IoU bbox_aabb/rot, Recall3d 관용 영역)에만 사람이 남는다.
+                ped = (a[:, 3] == 7)
+                n_ped_vox += int((keep & ped).sum())
+                keep &= ~ped
                 if drop_ids.size > 0:
                     keep &= ~np.isin(a[:, 4], drop_ids)
                 a = a[keep]
                 dense[t, a[:, 0], a[:, 1], a[:, 2]] = torch.from_numpy(a[:, 3]).to(torch.uint8)
             out[name] = dense
+        # 첫 샘플 1회만: bbox v2 원본에 사람이 실제로 있었는지 / 몇 개 걸러졌는지.
+        if not getattr(self, "_eval_bbox_v2_ped_logged", False):
+            self._eval_bbox_v2_ped_logged = True
+            print(f"[eval][bbox v2] key={key} pedestrian_voxels_removed={n_ped_vox} "
+                  f"visibility_drop_ids={int(drop_ids.size)}", flush=True)
         self._eval_bbox_v2_cache = (cache_key, out)
         return out
 

@@ -10,6 +10,8 @@
 ├── CHANGELOG.md  # 코드 수정/구현 기록
 ├── DATA_PREPROCESSING.md  # GT 캐시(efficientocf_gt/_f3) 전처리 절차 — 실행 파일·명령·순서·검증 기록 (재현용, 2026-07-13 확정)
 ├── NOTES.md  # 구현 중 주의사항·경고·후속 작업 메모
+├── RESULTS.md  # 평가 결과 정리 — dim96/feat128/res704 아키텍처 비교, fg·occ 운영점, TRAJ_CUT, 자원 한계·재현 절차 (2026-08-03)
+├── RESULTS_TABLES.md  # 실측 수치 표만 모은 파일 (config×에폭×임계값×N). baseline/TRAJ_CUT/depth+speed 별로 분리, 새 결과 나올 때마다 갱신
 ├── GUIDE.pdf  # 실험/사용 가이드 문서
 ├── run.sh  # 학습용 진입 스크립트; config 확인 후 tools/dist_train.sh 호출
 ├── run_eval.sh  # 평가용 진입 스크립트; config/checkpoint 확인 후 tools/dist_test.sh 호출
@@ -18,6 +20,10 @@
 ├── eval_total.sh  # 단일 eval 원클릭 래퍼; CONFIG/checkpoint/GPU 값만 수정 후 dist_test.sh 호출
 ├── eval_oracle.sh  # Oracle(GT 치팅) eval 래퍼; EOCF_EVAL_ORACLE_MATCH=1로 query↔GT center Hungarian 선택 → 스코어링 병목 진단
 ├── eval_sweep_thr.sh  # (FG_THR,OCC_THR) 조합 순차 스윕 래퍼; 부분 eval(EOCF_EVAL_MAX_SAMPLES=512)로 짧게 비교, 타 eval 종료 대기 후 시작
+├── eval_depth_speed.sh  # train-calibrated Depth+Speed query 재선택 eval (traincal 전용); baseline 대조군은 eval_total.sh로 뽑는다
+├── depth_std+past_speed_calibration/  # train 4,000 sample에서 뽑은 depth_std/past_speed log1p population mean/std (normalization_stats.json)
+├── depth+speed_eval결과/  # 위 정책의 타 repo 실행 결과 사본 (summary CSV/JSON + live log + 방법 문서)
+├── eval방법정리/  # Depth+Speed train-calibrated eval 방법 명세 (EVAL_METHOD.md, CODEX_HANDOFF.md)
 ├── data_vis/  # GT 파이프라인 검증 BEV 시각화 PNG
 │   └── visibility_filter_compare/  # 최초등장 visibility=1 필터 전/후/제거분 D(nusocc)·E(AABB) 7프레임 비교
 ├── data/  # 외부 데이터와 전처리 캐시를 가리키는 심볼릭 링크 모음
@@ -52,6 +58,9 @@
 │   │   │   ├── subset_attn_cover_pyr_aabb_dice3d_new_asset_all_ft_hard.py  # full epoch15에서 큰(≥6m)·먼(≥30m) matched pair만 asset focal/Dice로 학습하는 3epoch FT
 │   │   │   ├── subset_attn_cover_pyr_aabb_dice3d_new_asset_all_ft_hard_dice.py  # full epoch15에서 raw Dice 상위 30% matched pair만 asset focal/Dice로 학습하는 3epoch FT
 │   │   │   ├── subset_attn_cover_pyr_aabb_dice3d_new_filter.py  # f3 D/E에서 과거3 최초등장 visibility=1 instance를 로드 직후 7프레임 전체 제거하는 정렬 필터 실험
+│   │   │   ├── full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter.py  # 위 필터 + asset-all(inst3d 1.0/bbox 0.0) 조합의 train_capacity=23930 전체 학습본. bev_feat_dim=96
+│   │   │   ├── full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_feat128.py  # 위 대비 bev_feat_dim=96→128 단일변수
+│   │   │   ├── full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_feat128_res704.py  # 위 대비 입력 해상도 (896,1600)→(256,704) + kv_resolutions (16,44) 종속 변경 + σ-match off (CHANGELOG/NOTES 2026-08-03)
 │   │   │   ├── subset_attn.py  # subset(4000) + camera-attn 충돌 fix. GT는 gt_bbox_aabb(E) 기반 (NOTES/CHANGELOG 2026-07-02, 2026-07-13)
 │   │   │   ├── subset_attn_cover_aabb_dice.py  # subset_attn + σ-matching + dice(tversky) GT 혼합(0.1 inst3d+0.9 AABB, 2D z-collapse) (CHANGELOG 2026-07-07, 2026-07-13)
 │   │   │   ├── subset_attn_cover_pyr_aabb_dice3d.py  # 위 + dice 3D(query_gmo_dice_3d=True) + query cross-attn coarse-to-fine KV 피라미드(3-layer) (CHANGELOG 2026-07-10, 2026-07-13)
@@ -183,3 +192,13 @@
         └── visualize_results.py  # 저장된 결과 pickle을 dataset.show로 렌더링하는 도구
 
 ```
+
+## EVAL_SPEC.md (2026-08-10 신설)
+
+**다른 repo 로 평가 체계를 이식할 때 보는 문서.** 내용:
+0. 7월 스냅샷 repo 를 돌게 만드는 4가지 선행 수정 (occ_pool_ext / occ_dt / DDP 셔틀 / setsid)
+1. metric — 한 런에서 future·present 동시 산출 구조 (`pred_occ3d` 재사용, 추가 비용 0)
+2. traincal — 수식, feature 정의, 통계 수집·형식, env 인자, 실패 시 동작
+3. 공통 eval env 인자 표
+4. 스윕 인프라 패턴 + 실제로 터진 워커 버그 4개
+5. 결과 해석 규칙 (@800 의 한계, 분해능, 편향)

@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
+from mmcv.parallel.scatter_gather import scatter_kwargs
 from mmcv.runner import (HOOKS, Hook, DistSamplerSeedHook, EpochBasedRunner,
                          Fp16OptimizerHook, OptimizerHook, build_optimizer,
                          build_runner, get_dist_info)
@@ -17,6 +18,26 @@ from mmdet.utils import get_root_logger
 import time
 import os.path as osp
 from projects.occ_plugin.datasets.builder import build_dataloader
+
+
+class _Torch27MMDistributedDataParallel(MMDistributedDataParallel):
+    """Keep MMCV 1.x DataContainer scatter compatible with PyTorch 2.7."""
+
+    def scatter(self, inputs, kwargs, device_ids):
+        devices = [
+            torch.device("cuda", device) if isinstance(device, int) else device
+            for device in device_ids
+        ]
+        return scatter_kwargs(inputs, kwargs, devices, dim=self.dim)
+
+    def _run_ddp_forward(self, *inputs, **kwargs):
+        if self.device_ids:
+            inputs, kwargs = self.scatter(inputs, kwargs, self.device_ids)
+            inputs, kwargs = inputs[0], kwargs[0]
+        if self._use_python_reducer:
+            return self.module(*inputs, **kwargs)
+        with self._inside_ddp_forward():
+            return self.module(*inputs, **kwargs)
 
 
 class VisualizationIterSyncHook(Hook):
@@ -91,7 +112,7 @@ def custom_train_detector(model,
     
     if distributed:
         find_unused_parameters = cfg.get('find_unused_parameters', False)
-        model = MMDistributedDataParallel(
+        model = _Torch27MMDistributedDataParallel(
             model.cuda(),
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=False,

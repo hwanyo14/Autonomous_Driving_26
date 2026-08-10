@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "mode": "post_training_calibration",
+  "checkpoint": "/home/user/jhh/Projects/Autonomous_Driving_26_ikk_fi/epoch_18_lss_only.pth",
+  "split": "train",
+  "sample_count": 4000,
+  "scope": "all_predicted_foreground_queries",
+  "uses_ground_truth": false,
+  "features": {
+    "depth_std": {
+      "mean": 1.1490066687298401,
+      "std": 0.2715431724116579,
+      "count": 136973,
+      "transformed_log1p": true,
+      "good_direction": "low"
+    },
+    "past_speed": {
+      "mean": 1.5370710560583838,
+      "std": 0.6923375815042205,
+      "count": 136973,
+      "transformed_log1p": true,
+      "good_direction": "low"
+    }
+  }
+}

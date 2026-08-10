@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -347,6 +349,51 @@ class EfficientOCFQueryProjectionMixin:
             finite_lift_tq.unsqueeze(-1), lifted_center_tq3, torch.zeros_like(lifted_center_tq3)
         )
 
+        # ---- soft-argmax vs hard-peak 괴리 계측 (opt-in: EOCF_QFEAT_ATTN_PEAK=1, 기본 OFF) ----
+        # 가설: attention map이 단봉이면 soft-argmax와 최대峰이 일치하고, 이봉/퍼짐이면
+        # soft-argmax가 봉우리 '사이'(=아무것도 없는 자리)에 떨어진다. 이 괴리가 크면 중심이 틀렸다는 신호.
+        # depth 엔트로피(1D)와 달리 **2D 공간 다봉성**이라 기존 인자와 겹치지 않는다.
+        # 3D 거리는 두 점이 같은 depth를 쓰므로 회전이 노름을 보존해 해석적으로 계산된다:
+        #   ||Δ3D|| = depth * || K^-1 · [Δu_raw, Δv_raw, 0] || = depth * sqrt((Δu/fx)^2 + (Δv/fy)^2)
+        attn_peak_pack = {}
+        if os.environ.get("EOCF_QFEAT_ATTN_PEAK", "0") == "1":
+            try:
+                prob_tqnp = prob_tqnhw.reshape(t_depth, q_count, n_cam, -1)
+                peak_flat_tqn = prob_tqnp.argmax(dim=-1)
+                peak_prob_tqn = prob_tqnp.gather(-1, peak_flat_tqn.unsqueeze(-1)).squeeze(-1)
+                peak_feat_tqn2 = torch.stack(
+                    [(peak_flat_tqn % feat_w).to(torch.float32),
+                     torch.div(peak_flat_tqn, feat_w, rounding_mode="floor").to(torch.float32)],
+                    dim=-1,
+                )
+                d2d_feat_tqn = (center_feat_tqn2 - peak_feat_tqn2).norm(dim=-1)
+                peak_img_tqn2 = peak_feat_tqn2.clone()
+                peak_img_tqn2[..., 0] = peak_img_tqn2[..., 0] * scale_u
+                peak_img_tqn2[..., 1] = peak_img_tqn2[..., 1] * scale_v
+                d_uv_aug_tqn2 = center_img_tqn2 - peak_img_tqn2
+                d2d_img_tqn = d_uv_aug_tqn2.norm(dim=-1)
+                # 이미지 augmentation(post_rot) 역변환 후 intrinsic으로 3D 환산
+                pr_tn22 = post_rots_tn33.index_select(0, attn_src_idx_t)[:, :n_cam, :2, :2].to(torch.float32)
+                pr_inv_tn22 = torch.inverse(pr_tn22)
+                d_uv_raw_tqn2 = torch.einsum("tnij,tqnj->tqni", pr_inv_tn22, d_uv_aug_tqn2)
+                k_tn = intrins_tn33.index_select(0, attn_src_idx_t)[:, :n_cam].to(torch.float32)
+                fx_tn = k_tn[..., 0, 0].abs().clamp_min(1e-6).unsqueeze(1)
+                fy_tn = k_tn[..., 1, 1].abs().clamp_min(1e-6).unsqueeze(1)
+                d3d_tqn = torch.sqrt(
+                    (d_uv_raw_tqn2[..., 0] / fx_tn) ** 2 + (d_uv_raw_tqn2[..., 1] / fy_tn) ** 2
+                ) * depth_expect_tqn
+                _g = selected_cam_idx_tq.unsqueeze(-1)
+                attn_peak_pack = {
+                    "attn_soft_hard_d2d_feat_tq": d2d_feat_tqn.gather(2, _g).squeeze(-1),
+                    "attn_soft_hard_d2d_img_tq": d2d_img_tqn.gather(2, _g).squeeze(-1),
+                    "attn_soft_hard_d3d_tq": d3d_tqn.gather(2, _g).squeeze(-1),
+                    "attn_peak_prob_tq": peak_prob_tqn.gather(2, _g).squeeze(-1),
+                    "attn_feat_hw": center_feat_tqn2.new_tensor([float(feat_h), float(feat_w)]),
+                }
+            except Exception as e:  # 계측 실패가 추론을 죽이면 안 된다
+                print(f"[attn_peak] skipped (err={e})", flush=True)
+                attn_peak_pack = {}
+
         depth_expect_tq = depth_expect_tqn.gather(2, selected_cam_idx_tq.unsqueeze(-1)).squeeze(-1)
         depth_valid_tq = selected_valid_tq & torch.isfinite(depth_expect_tq) & (depth_expect_tq > 0.0)
         depth_mean = (
@@ -377,6 +424,7 @@ class EfficientOCFQueryProjectionMixin:
             "dbg_query_attn_soft_lift_multi_cam_candidate_count": selected_cam_pack["multi_cam_candidate_count"],
             "dbg_query_attn_soft_lift_depth_mean": depth_mean,
             "dbg_query_attn_softargmax_tau": center_feat_tqn2.new_tensor(float(self.query_attn_softargmax_tau)),
+            **attn_peak_pack,
         }
 
     def _compute_query_depth_loss_from_match(
