@@ -1,5 +1,593 @@
 # Changelog
 
+## 2026-08-10 (3) — eval 스크립트를 모델별로 분리
+
+`eval_ablation.sh`(통합 래퍼)와 `eval_depth_speed.sh`(traincal 통합)를 없애고
+`eval_total.sh` 와 같은 평면 구조(CONFIG/CHECKPOINT/PORT 를 파일 상단에 그대로 적는 방식)로
+모델당 파일 하나씩 나눴다. PORT 는 전부 다르게 두어 동시 실행 시 충돌하지 않는다.
+
+| 파일 | 대상 | traincal | checkpoint 위치 |
+|---|---|---|---|
+| `eval_total.sh` | feat128 baseline | ✗ | `./work_dirs/...` (이 머신에 없음) |
+| `eval_feat128.sh` | feat128 | ✓ | `Autonomous_Driving_26_filter` 레포 `..._feat128_ep20/epoch_19` (best) |
+| `eval_res704.sh` | res704 | ✓ | `ablation_res` 레포 `..._res704_ep20/epoch_18` (best) |
+| `eval_center.sh` | center ablation | ✗ | `ablation_center` 레포 ep15 |
+| `eval_q100.sh` | q100 ablation | ✗ | `ablation_query` 레포 **ep6** |
+| `eval_q900.sh` | q900 ablation | ✗ | `ablation_query` 레포 ep15 |
+
+- q100/q900/center 는 traincal 을 쓰지 않기로 해서 관련 env 를 아예 넣지 않았다.
+  (center 는 애초에 `query_depth_loss_weight=0.0` 이라 traincal 금지 — EVAL_SPEC §2-2)
+- **best 운영점을 두 스크립트에 고정했다** (사용자 지정): 양쪽 `cutoff=0.9`, `occ=0.85`,
+  `FEAT2=traj_dev`. alpha(depth/traj_dev)는 feat128 `0.9/0.4`, res704 `0.7/0.5`.
+- **best checkpoint 를 찾아 연결했다.** 둘 다 ep15 에서 resume 한 `_ep20` work_dir 에 있다.
+  - feat128 ep19: `Autonomous_Driving_26_filter/work_dirs/..._feat128_ep20/epoch_19_lss_only.pth`
+  - res704 ep18: `..._ablation_res/work_dirs/..._res704_ep20/epoch_18_lss_only.pth`
+  두 ckpt 모두 해당 config 로 `load_state_dict` 가 **missing=0 / shape_mismatch=0** 통과
+  (ckpt meta epoch 19/18 일치)를 확인했다.
+- `traincal/*_v3_n4000.json` 의 `checkpoint` 필드는 다른 머신 경로(`/home/cvlab/...`)를 가리키지만
+  같은 ep19/ep18 run 이다. checkpoint 를 다른 것으로 바꾸면 통계는 반드시 다시 뽑아야 한다
+  (틀려도 에러가 안 난다). 두 스크립트 주석에 재수집 명령을 적어 두었다.
+- `eval_total.sh`(feat128 baseline 대조군)의 checkpoint 는 아직 `./work_dirs/...` 를 가리켜
+  이 머신에 없다. 대조군이 필요하면 위 feat128 ep19 경로로 바꿔 쓸 것.
+
+## 2026-08-10 (2) — ablation config 3종 이식 (center / q100 / q900) + `eval_ablation.sh`
+
+타 레포에서 학습한 ablation 을 이 레포의 eval 체계로 평가하기 위해 config 3개를 가져왔다.
+checkpoint 는 각 ablation 레포 `work_dirs/` 에 그대로 두고 절대경로로 참조한다.
+
+| ablation | 출처 레포 | 실질 차이 | 가용 ckpt |
+|---|---|---|---|
+| `_feat128_center` | `ablation_center` | `query_center_from_lifting=False`, `query_depth_loss_weight=0.0` | ep1~15 |
+| `_q100_feat128` | `ablation_query` | `query_num_queries=200→100` | ep1~6 |
+| `_q900_feat128` | `ablation_query` | `query_num_queries=200→900` | ep1~15 |
+
+**q100 / q900 은 코드 변경이 필요 없었다.** `ablation_query` 가 건드린 플러그인 코드는 07-28
+traj-refine 블록 하나뿐인데, 이 레포는 filter_eval 판(단일 지점·기본 ON)으로 이미 갖고 있다.
+
+**🔴 `_center` 는 코드 이식이 필수였다.** `query_center_from_lifting` 이 이 레포
+`MODEL_CFG_DEFAULTS` 에 없는 키인데, `_merge_cfg` 가
+`merged = dict(defaults); merged.update(cfg)` 로 **미지의 키를 검증 없이 삼키고 읽지도 않는다.**
+그대로 뒀다면 `False` 가 무시되어 forward-lifting 경로로 돌아가는데, `_center` checkpoint 는
+CenterHead(MLP)로 xyz 를 직접 회귀하도록 학습된 모델이다 → **완전히 다른 모델로 평가하면서
+경고 한 줄 안 나온다.** res704 의 `kv_resolutions` 와 같은 종류의 함정이다.
+이식 내용(ablation_center `7359bc6` 원본과 블록 단위 동일함을 확인):
+- `efficientocf_config.py`: `"query_center_from_lifting": True` 기본값 + `apply_model_cfg` 파싱
+- `efficientocf.py`: `compute_direct_center=not self.query_center_from_lifting` 로 전환하고
+  lifting 호출 블록 전체를 `if self.query_center_from_lifting:` 으로 감쌌다.
+  (죽은 변수 `lifted_valid_tq` 는 원본 패치대로 제거)
+- 기본값이 `True` 라 기존 config(`feat128`, `res704` 등)의 동작은 **불변**이다.
+
+**⚠ `_center` 에는 traincal 을 쓰면 안 된다.** `query_depth_loss_weight=0.0` 이라 depth head 가
+학습된 적이 없어 `depth_std` 가 무의미하다(EVAL_SPEC §2-2). `eval_ablation.sh` 는
+`ABL=center TRAINCAL=1` 조합을 실행 전에 막는다.
+
+**신규 eval 스크립트 3개** — `eval_center.sh` / `eval_q100.sh` / `eval_q900.sh`.
+`eval_total.sh` 와 같은 평면 구조(CONFIG/CHECKPOINT/PORT 를 파일 상단에 그대로 적는 방식)로
+하나씩 분리했다. checkpoint 는 각 ablation 레포 `work_dirs/` 절대경로를 가리키고, eval 조건
+(MODE/OCC_THR/FG_THR/NMS/WEIGHT_MODE)은 `eval_total.sh` 와 동일하게 맞췄다. PORT 는
+50711/50712/50713 으로 서로 다르게 두어 동시 실행 시 충돌하지 않는다.
+이 세 ablation 에는 traincal 을 쓰지 않기로 해서 관련 env 는 넣지 않았다.
+
+**검증** — 세 config 전부 로드 OK, `build_model` 후 스위치가 실제 모델에 반영됨을 확인
+(`center: from_lifting=False/depth_w=0.0`, `q100: nq=100`, `q900: nq=900`, 기존 config 는 전부
+`from_lifting=True` 로 불변). **실제 checkpoint 3개를 `load_state_dict` 로 올려
+`missing=0 / shape_mismatch=0`** 을 확인했다. `unexpected=27` 은 voxelizer 격자 상수와
+class-map 버퍼로 학습 가중치가 아니다. 대조로 q900 ckpt 를 `nq=200` 모델에 올리면
+RuntimeError 가 나므로, 예외 없이 올라간 것 자체가 config↔ckpt 일치의 증거다.
+- 세 config 모두 test_pipeline 에 A2(`occ_dt`/`LoadOccupancy` 제거) 적용.
+
+## 2026-08-10 — eval 체계 이식 (filter_eval 레포 a22261e) — metric 동시산출 + traincal
+
+자매 레포 `Autonomous_Driving_26_filter_eval` 의 단일 커밋 `a22261e` 를 이 레포에 이식했다.
+공통 조상은 `61bf97d filter`. 상세 명세는 신설된 `EVAL_SPEC.md` 참고.
+
+**① metric — 한 런에서 future/present 동시 산출**
+- `EOCF_EVAL_MODE` 가 **시각화 기준 프레임만** 바꾸도록 변경. metric 은 항상 둘 다 계산한다.
+  현재 프레임 예측(`pred_occ3d`)은 mode 와 무관하게 이미 렌더돼 있어 GT 만 잘라 재면 되므로
+  **추가 forward 비용이 0** 이다. 이전에는 future/present 를 보려면 런을 두 번 돌려야 했다.
+- 출력: `[eval][N] IoU3d(asset)_future=... IoU2d(asset)_future=... IoU3d(asset)_present=... IoU2d(asset)_present=...`
+- `nusocc` / `bbox_aabb` / `bbox_rot` / `Recall3d` 계열 지표를 **전부 제거**했다. 딸린 GT 로더
+  (`_eval_load_bbox_gt_v2`, test_pipeline 의 `LoadOccupancy`)도 함께 빠져 eval CPU 비용이 줄었다.
+  `apis/test.py` 571 → 389줄, `efficientocf_dataset.evaluate()` 는 asset 전용.
+
+**② traincal — train-calibrated query 재선택 (신규)**
+- `s_eff = sigmoid(logit(s) - a_depth*z_depth - a_speed*z_motion)`, `s_eff >= cutoff` 로 컷.
+  `z = clip((log1p(x) - train_mean)/train_std, -3, 3)`.
+- rescue 가 아니라 **global reselection** 이다. 원래 `s >= cutoff` 였던 query 도 탈락할 수 있다.
+  GT 를 전혀 쓰지 않는 추론 전용 보정이다.
+- feature 는 `depth_std`(present depth-bin 분포 표준편차) + `traj_dev`(등속모델 잔차) 두 개.
+  `past_speed` / `speed_std` 는 폐기됐다.
+- 메서드 6개 신설: `_eval_traincal_{depth_speed_features,motion_features,load_stats,
+  collect_step,collect_dump}`, `_eval_select_by_traincal_depth_speed`.
+- 🔴 **`EOCF_EVAL_TRAINCAL_FEAT2` 의 코드 기본값이 `past_speed` 다.** `eval_depth_speed.sh` 에서
+  `FEAT2=traj_dev` 를 명시하지 않으면 **에러 없이 조용히 폐기된 feature 로 돈다.**
+- 🔴 통계 JSON 은 **checkpoint 종속**이다. 다른 ckpt 로 평가하면 z-score 가 통째로 틀어지는데
+  에러가 안 난다. 로그에 `[eval] traincal depth+traj_dev selection ON` 이 찍히는지 확인할 것.
+  안 찍히면 통계 로드 실패로 baseline 에 fallback 한 것이다.
+
+**③ 이 레포에 맞춰 의도적으로 다르게 가져온 것**
+- **부수 기능(D) 전량 미도입.** `depth_std`/`traj_dev` 외에는 쓰지 않기로 해서
+  `_maybe_dump_eval_query_features` / `_eval_traj_disp_stats` / `_eval_filter_by_traj_accel`
+  (TRAJ_CUT) / `_eval_select_by_depth_sharpness` 메서드 4개와 호출부 5곳, `DUMP_QFEAT` 게이트,
+  `utils_query_projection.py` 의 attn-peak 계측(+48줄)을 **전부 제거**했다(총 338줄).
+  대응 env(`FG_SHARP_*`, `FG_TRAJ_ACC_MAX`, `TRAJ_CUT_SCOPE`, `TRAJ_STATS`, `DUMP_QFEAT`,
+  `QFEAT_ATTN_PEAK`)는 이 레포에 존재하지 않는다.
+  ⚠ 그 결과 TRAJ_CUT 이 영구 OFF 다. filter_eval 레포 `RESULTS.md` 의 baseline 수치 중
+  `FG_TRAJ_ACC_MAX=5.0` 으로 뽑은 것은 이 레포에서 재현되지 않는다.
+- **traj xy-refine 이중 적용 해소.** 이 레포 2026-07-28 항목이 `extract_feat_query` 에 넣었던
+  opt-in(기본 OFF) 블록을 제거하고, filter_eval 방식(단일 지점, **기본 ON**, `=0` 으로 끔)으로
+  통일했다. 두 구현을 함께 두면 `EOCF_EVAL_TRAJ_REFINE=1` 에서 refine 이 2회 적용된다.
+  → NOTES 2026-07-28 "trajectory xy-refine은 기본적으로 eval에 적용되지 않는다" 항목은 **폐기**.
+- **중복 config 미도입.** filter_eval 의 `..._feat128_res704.py` 는 이 레포의
+  `..._filter_res704.py` 와 `model_cfg` 가 완전히 동일해 가져오지 않고, 기존 파일에
+  test_pipeline 수정(아래)만 적용했다.
+- **dim96 계열 config 미도입.** `..._filter.py` / `_ep20.py` / `subset_*` 2개는 구버전
+  베이스라 되살리지 않았다. `eval_oracle.sh` 의 대상을 feat128 로 재지정했다.
+
+**④ 이 머신에서 eval 이 돌게 하기 위한 선행 수정 (EVAL_SPEC §0)**
+- `occ_pool_ext.cpython-310-...so` 복사. ops 소스가 세 레포 모두 동일함을 확인 후 복사했다
+  (빌드 아님). 이게 없으면 플러그인 import 자체가 실패한다.
+- config `test_pipeline` 에서 `load_occ_dt=False` + `Collect3D` keys 의 `'occ_dt'` 제거 +
+  `LoadOccupancy` 제거. `occ_dt` 데이터셋이 이 머신에 없고 `use_query_dt_loss=False` 라
+  쓰이지도 않는데 첫 샘플에서 `FileNotFoundError` 로 죽는다. 둘 중 하나만 하면 `KeyError`.
+  적용 대상: `..._filter_feat128.py`, `..._filter_res704.py`.
+- `_Torch27MMDistributedDataParallel`(`apis/mmdet_train.py`) 신설 + `tools/test.py` 배선.
+  torch 2.7.0 + mmcv 1.7.2 조합에서 mmcv 의 `_run_ddp_forward` 가 torch 가 제거한
+  `_use_replicated_tensor_module` 을 참조해 DDP forward 첫 호출에 AttributeError 로 죽는다.
+
+**⑤ 신규 파일**
+- `EVAL_SPEC.md` — env 인자표, 조용히 실패하는 지점, 결과 해석 규칙
+- `traincal/` — traincal 관련 자산을 한 곳에 모은 디렉터리. 수집용 config 2개
+  (`..._{feat128,res704}_traincal_collect.py`, 원본은 `projects/configs/baselines/` 에 있던 것을
+  이리로 옮기고 `_base_` 를 `../projects/configs/baselines/...` 로 재지정)와 통계 JSON 21개
+  + INDEX.md 가 함께 있다. `collect_traincal_stats.sh` 의 config·출력 경로도 이 디렉터리를 본다.
+  ⚠ 통계 JSON 중 **`traj_dev` 키가 있는 것은 `*_v3_n4000.json` 2개뿐**(feat128 ep19 /
+  res704 ep18)이고 나머지 19개는 폐기된 `past_speed` 전용이다. 전부 filter_eval 레포
+  checkpoint 종속이라 다른 ckpt 에 쓰면 z-score 가 틀어지는데 에러가 안 난다.
+- `eval_depth_speed.sh`(traj_dev 판으로 재작성), `collect_traincal_stats.sh`
+
+**⑤-b 의도적으로 가져오지 않은 자산**
+filter_eval 레포의 아래 자산은 이 레포에서 쓸 수 없어 제외했다.
+- `depth_std+past_speed_calibration/`, `depth_speed_normalization_stats_all.json`
+  — 폐기된 `past_speed` 전용 통계.
+- `RESULTS.md`, `RESULTS_TABLES.md`, `depth+speed_eval결과/` — 타 레포 checkpoint 실측 수치.
+- `eval방법정리/` — `EVAL_METHOD.md` 는 2026-08-02 past_speed 시절 방법 문서로, 본문 스스로
+  "현재 코드에 그대로 적용하면 과거 방법을 재현하지 못한다"고 명시한다.
+- `eval_total_2.sh` — `eval_total.sh` 와 ckpt/threshold 만 다른 사본.
+
+**⑥ 검증** — `eo` env 에서 실제 실행: 플러그인 import OK, config 6개 로드 OK
+(`occ_dt`/`LoadOccupancy` 잔재 0), `build_model` OK(traincal 메서드 6개 확인),
+`py_compile` / `bash -n` 전부 통과. **실제 학습·eval 1 iteration 은 미실행**
+(이 레포 `work_dirs/` 에 checkpoint 가 없다).
+
+**⑦ 남은 작업**
+- `traincal_stats/*.json` 은 filter_eval 레포 checkpoint(feat128 ep19 / res704 ep18) 전용이다.
+  이 레포에서 학습한 ckpt 로 eval 하려면 `collect_traincal_stats.sh` 로 다시 뽑아야 한다.
+- `train_total.sh`(→ `..._filter_ep20.py`) 와 `train_ft.sh`(→ `..._ft_bce.py`) 가 존재하지 않는
+  config 를 가리킨다. 학습 스크립트라 이번 eval 이식 범위 밖이라 손대지 않았다.
+
+## 2026-08-10 — res704 해상도 ablation config 이식
+
+- 자매 레포 `Autonomous_Driving_26_filter_ablation_res`의
+  `full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_res704.py`를 이 레포
+  `projects/configs/baselines/`에 그대로 복사했다. **플러그인 코드 수정 없음.**
+- 호환성 확인:
+  - 두 레포의 `projects/occ_plugin/` 전체 재귀 diff → 실질 차이는 `query_head.py`의 eval 로그
+    문자열 1줄과 `efficientocf.py`의 eval 4행 비교 시각화 GT 소스(이 레포 asset-union vs 저쪽
+    bbox_aabb)뿐. 모델/transformer/loss/loader 로직 동일.
+  - 두 레포의 베이스 config `full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter.py`는 diff 0.
+  - res704가 쓰는 키(`query_transformer_kv_resolutions`,
+    `query_attn_sigma_match_loss_weight`)는 이 레포 베이스에서도 이미 사용 중 →
+    `efficientocf_config.py` 추가 배선 불필요.
+- 이식 시 발견: 원본 헤더는 베이스 대비 "변경 3곳"(input_size / kv_resolutions /
+  sigma_match_weight)이라고 적혀 있으나 실제로는 `bev_feat_dim 96 -> 128`도 함께 바뀌어 있다.
+  사용자 결정에 따라 **원본 그대로(128) 유지**했고, 4번째 변경임을 config 헤더 주석에 명시했다.
+  이 레포에는 feat_dim 단일변수 config(`..._filter_feat128.py`)가 따로 있으므로, 순수 해상도
+  비교가 필요하면 `_feat128.py`를 기준선으로 잡을 것.
+- work_dirs 출력 경로는 원본대로 `_res704` suffix 유지 → 베이스 run과 충돌 없음.
+
+## 2026-08-04 17:20 KST — traincal 통계 수집 모드 신설 (`EOCF_EVAL_TRAINCAL_COLLECT`)
+
+**추론 전용 opt-in 경로. 학습 loss / model head / config 기본값 변경 없음.**
+
+traincal 재선택은 `depth_std` / `past_speed` 의 **train split 평균·표준편차**를 필요로 하는데,
+이 둘은 model 출력이라 **checkpoint 마다 값이 달라진다.** 체크포인트를 바꾸고 통계를 재수집하지 않으면
+z-score 가 조용히 어긋난다. 그래서 통계를 코드 밖 JSON 으로 분리하고 수집 경로를 따로 만들었다.
+
+### 변경
+- `projects/occ_plugin/occupancy/detectors/efficientocf.py`
+  - `EOCF_EVAL_TRAINCAL_COLLECT=<out.json>` 이 있을 때만 `_eval_traincal_collect_step()` 호출
+  - `pred_cls != query_bg_class` 인 query 에 대해 `log1p(feature)` 를 누적
+  - `_eval_traincal_collect_dump()` 가 `_acc: {n, sum, sumsq}` 를 함께 기록 → **부분 수집 병합 가능**
+  - `os.replace` 로 원자적 쓰기 (수집 중 중간 스냅샷을 안전하게 읽을 수 있음)
+- `projects/configs/baselines/..._feat128_traincal_collect.py` (신설)
+- `projects/configs/baselines/..._feat128_res704_traincal_collect.py` (신설)
+  - base config 상속, `data.test.ann_file` 만 train 으로 교체. test_pipeline / test_mode 유지
+- `collect_traincal_stats.sh` (신설, repo root) — `CFG_NAME`/`EP`/`MAXS`/`EVERY`/`OUT`
+  - 수집 중에는 traincal **선택** env 를 unset 한다 (선택이 걸린 채 통계를 뽑으면 순환 참조)
+- `traincal_stats/` (신설) + `INDEX.md` — `<모델>_ep<에폭>_n<샘플수>.json`
+
+### 검증
+7점 수렴 곡선(4000~23930)과 eval 레벨 A/B 모두에서 **4,000 표본이면 충분**함을 확인.
+`n4000` vs `n23900` 은 future 가 소수 4자리까지 동일, TP 차이 0.06%, avg 차이 0.00004.
+
+⚠ **체크포인트를 바꾸면 통계를 반드시 재수집할 것.** 수치는 `RESULTS_TABLES.md` 참고.
+
+---
+
+## 2026-08-03 KST — train-calibrated Depth+Speed query 재선택 eval 구현
+
+**추론 전용 opt-in 경로 1개 신설. 학습 loss / model head / config 기본값 변경 없음.**
+
+타 repo(`ikk_fi`)에서 돌렸던 Depth+Speed train-calibrated eval을 이 repo에 이식했다.
+방법 명세는 `eval방법정리/EVAL_METHOD.md`, 결과 사본은 `depth+speed_eval결과/`.
+
+### 수식
+
+```text
+z_d = clip((log1p(depth_std)  - train_mean_d) / train_std_d, -3, 3)
+z_s = clip((log1p(past_speed) - train_mean_s) / train_std_s, -3, 3)
+s_eff = sigmoid( logit(s) - a_d*z_d - a_s*z_s )      # 컷: s_eff >= CUTOFF
+```
+
+`s`는 기존 fg score(`cls_prob_q`)다. train 통계는 4,000 sample에서 뽑아 **고정**하며 validation
+분포로 재정규화하지 않는다. baseline-preserving rescue가 아니라 **global reselection**이라
+원래 `s >= 0.9`였던 query도 보정 후 컷 아래로 내려가면 탈락한다.
+
+### `efficientocf.py` (+2 메서드, 호출부 1블록)
+
+- `_eval_traincal_depth_speed_features`: foreground query별 `depth_std`(present depth-bin 분포의
+  표준편차) / `past_speed`(과거 인접 XY 이동 **속력 크기 평균**, dt=0.5s) 추출.
+  depth bin 중심은 `utils_query_projection.py`의 `depth_vals_d`와 **동일 규칙**을 쓴다
+  (`(arange(D)+0.5)*bin_size + depth_min`) — 학습 타깃과 어긋나면 안 되기 때문.
+- `_eval_select_by_traincal_depth_speed`: z-normalize → combined logit → 컷 → 내림차순 정렬 →
+  top-k. 렌더 가중치(`selected_score`)는 **보정 전 score를 그대로** 반환한다(선택 변경과 렌더
+  변경을 섞지 않기 위해, depth-sharpness 경로와 동일한 이유).
+- 호출부는 depth-sharpness 블록 바로 뒤. 실패 시 전부 `fallback`으로 조용히 baseline 유지.
+
+### 환경변수 (전부 opt-in, 미설정 시 기존 동작 그대로)
+
+| 변수 | 기본 | 의미 |
+|---|---|---|
+| `EOCF_EVAL_TRAINCAL_STATS` | (없음) | normalization JSON 경로. **설정해야 활성화** |
+| `EOCF_EVAL_TRAINCAL_ALPHA_DEPTH` | 0.5 | z_depth 가중치 |
+| `EOCF_EVAL_TRAINCAL_ALPHA_SPEED` | 0.25 | z_speed 가중치 |
+| `EOCF_EVAL_TRAINCAL_CUTOFF` | 0.9 | s_eff 컷 |
+| `EOCF_EVAL_TRAINCAL_DT` | 0.5 | past_speed frame 간격(초) |
+
+### `eval_depth_speed.sh` (신설)
+
+`POLICY=baseline|traincal` 외 모든 조건이 동일해 두 런의 delta가 곧 이 수식의 순수 효과다.
+운영점은 `fg0.9 / occ0.75 / NMS=0 / WEIGHT_MODE=ones / TRAJ_CUT OFF` — `RESULTS.md` §3.1의
+`acc_max=0 (OFF)` 행(future 0.1412 / present 0.1790)과 직접 비교 가능하도록 맞췄다.
+
+---
+
+## 2026-08-03 KST — `RESULTS.md` 신설 + 평가 러너 config 파라미터화
+
+**문서 1개 신설, 코드 변경 없음.**
+
+### `RESULTS.md` (신설)
+
+dim96 / feat128 / res704 세 config 의 평가 결과를 한 파일로 통합. `PROJECT_STRUCTURE.md` 에 등록.
+NOTES.md 가 "구현 중 주의사항"이라면 RESULTS.md 는 **"측정 결과와 그 해석"** 을 담는다.
+
+수록 내용: 지표 우선순위와 800/5119 편향 · TRAJ_CUT 임계값 스윕과 5개 체크포인트 이득 ·
+구조별 fg/occ 최적 운영점 · 에폭 곡선 · 아키텍처 3종 비교 · 열린 항목 5개 · 재현 절차와 자원 한계.
+
+### 평가 러너 (`scratchpad/eval_run.sh`)
+
+기존 `f128_run.sh` 는 config 가 하드코딩돼 있어 feat128 전용이었다. `CFG` 를 인자로 받도록
+일반화해 dim96/feat128/res704 를 같은 스크립트로 돌린다. TAG 접두어는 config 접미어로 자동 판별
+(`*_feat128_res704`→`res704`, `*_feat128`→`f128`, 그 외→`dim96`).
+
+⚠ **`setsid` 로 띄울 것.** `nohup ... &` 만으로는 부모 셸이 종료될 때 프로세스 그룹째 SIGTERM 을
+받아 죽는다 (2026-08-03 실제 발생 — dim96 두 런이 로딩 직후 `signal: 15` 로 사망).
+
+---
+
+## 2026-08-03 KST — `_res704` config 신설: 입력 해상도 (896,1600) → (256,704)
+
+**config 파일 1개만 수정.** 코드 변경 없음, 다른 config 영향 없음.
+
+**대상**: `projects/configs/baselines/full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_feat128_res704.py`
+(수정 전에는 `_feat128`과 byte-identical 복사본이었음 — `_feat128`은 `_filter` 대비 `bev_feat_dim=96→128` 한 줄만 차이)
+
+### 바뀐 값 3개
+
+| 키 | before | after |
+|---|---|---|
+| `data_config['input_size']` | (896, 1600) | **(256, 704)** |
+| `query_transformer_kv_resolutions` | ((14,25),(28,50),(56,100)) | **((4,11),(8,22),(16,44))** |
+| `query_attn_sigma_match_loss_weight` | 0.25 | **0.0** |
+
+`kv_resolutions`는 독립 하이퍼파라미터가 아니라 `input_size`의 **종속 변수**다. img_neck(SECONDFPN,
+`upsample_strides=[0.25,0.5,1,2]`)이 backbone stride 4/8/16/32를 전부 stride-16으로 통합하므로
+context feature = `input_size/16` = (16,44)이고, `transformer.py:236-240`이 `kv_resolutions[-1]`과
+불일치하면 `ValueError`로 즉시 죽는다. 피라미드 16→8→4 / 44→22→11은 정수배라
+`avg_pool2d` 정확 경로 유지(`adaptive_avg_pool2d` fallback 안 탐), `learnable_kv_downsample=False`
+(`efficientocf_config.py:217` 기본값)라 신규 파라미터도 없다.
+
+### 파생 효과 — 이미지 경로 전 구간이 정확히 1/8
+
+전부 stride-16 하나에 묶여 있어 동일 비율로 감소한다 (카메라당):
+
+| | before | after |
+|---|---|---|
+| 입력 픽셀 | 1.43M | 0.18M |
+| backbone s4/s8/s16/s32 | (224,400)/(112,200)/(56,100)/(28,50) | (64,176)/(32,88)/(16,44)/(8,22) |
+| context 토큰 | 5,600 | 704 |
+| KV 토큰 총합(6cam, L1+L2+L3) | 44,100 | 5,544 |
+| LSS frustum ray (D=112) | 627K | 79K |
+| depth loss 격자 | (56,100) | (16,44) |
+
+**불변**: `occ_size [512,512,40]`, `point_cloud_range`, `grid_config`, `bev_feat_dim=128`,
+`query_num_queries=200`, `query_matched_gmo_bce_occ_size (128,128,20)`, gaussian·dice·tversky·traj 전부.
+BEV·loss 격자 해상도는 그대로이고 **그 격자를 채우는 이미지 증거의 밀도만 1/8**이 된다.
+
+**파라미터 shape은 해상도 무관** — backbone/neck는 FCN, position embedding은
+`build_2d_sincos_pos_embed`로 매 forward 생성(학습 파라미터 아님), `query`/`query_id_embed`/
+`cam_id_embed`는 개수 고정. 따라서 파라미터 수 동일 + ckpt shape 호환 (본 실험은 from-scratch 전제).
+
+### ⚠ crop이 같이 바뀐다 (config에 안 적히는 두 번째 변수)
+
+`loading_bevdet.py:190-215` `sample_augmentation`은 base resize를 `fW/1600`으로 잡는다:
+
+| | before | after |
+|---|---|---|
+| base resize | 1.0 | 0.44 |
+| resize jitter 범위 | 0.94 ~ 1.11 | 0.38 ~ 0.55 |
+| resized newH | 900 | 396 |
+| `crop_h` (상단 절단) | 4 px | **140 px** |
+| 세로 FOV 유지율 | 99.6% | **64.6%** |
+
+BEVDet 256×704 표준 레시피 그대로지만 **"단순 downscale"이 아니다** — 세로 시야 상단 약 35%가
+잘려 가까운 트럭/버스 상단이 이미지 밖으로 나가고, GMO/attn GT의 경계 clip 비율이 올라간다.
+가로는 성질 동일(base에서 `crop_w=0`, jitter에 따라 좌우 랜덤크롭 또는 우측 패딩).
+
+### σ-match off의 범위
+
+`query_attn_sigma_match_loss_weight=0.0`이면 해당 loss 항이 생성되지 않아
+`query_attn_sigma_match_start_iter=500` / `..._min_mask_px=4`도 함께 무효화된다(값은 남겨둠).
+**다만 나머지 attn 감독은 그대로 켜져 있다** — `use_query_attn_bbox_loss=True`(inside-mass),
+`query_attn_bbox_other_weight=0.3`, 매칭 cost `inside_log`(0.3). 이것들이 이제 카메라당
+(16,44)=704칸 격자에서 계산되므로 원거리 객체가 1칸 미만이 되어 inside-mass/soft-IoU 신호가
+거칠어진다. **이 실험의 주 리스크는 kv가 아니라 여기와 LSS 밀도 쪽이다.**
+
+### `visualization_cfg` 4개 경로는 건드리지 않았다 — 실제로 미사용값이기 때문
+
+- 학습: `mmdet_train.py:141` → `_configure_visualization_dirs()`가 4개 attribute를 전부
+  `{work_dir}/vis/{timestamp}/{folder}`로 덮어쓴다 (`mmdet_train.py:60-86`).
+- eval: `efficientocf.py:1333`이 `EOCF_EVAL_VIS_DIR`(기본 `./work_dirs/eval_vis`) 기준으로 잡고,
+  mixture3d/cam_gaussian도 그 하위로 재지정(`efficientocf.py:1422`, `1458`).
+
+run 격리는 `work_dir`(학습)과 `EOCF_EVAL_VIS_DIR`(평가)로 이미 되고 있다. 경로 외 옵션
+(`gaussian_vis_mode`, `max_frames`, `topk_matched`, `max_queries`, `eval_occ_size` 등)은 실제 동작하며
+해상도와 무관하므로 유지.
+
+### 검증
+
+config를 순수 python으로 exec해 확인: `input_size=(256,704)`, `kv=((4,11),(8,22),(16,44))`,
+`len(kv)==num_layers=3`, `input_size/16=(16,44)==kv[-1]` ✓, 피라미드 정수배 ✓, `sigma_w=0.0`,
+`bev_feat_dim=128`. **학습 실행은 아직 안 했다.**
+
+## 2026-07-31 KST — trajectory 가속도 꼬리컷 추가(`EOCF_EVAL_FG_TRAJ_ACC_MAX`) + 계측 스위치 2종
+
+**전부 추론 전용 opt-in이며 기본값에서 기존 동작과 완전히 동일하다.** 학습 경로는 건드리지 않았다.
+
+### 1. `EOCF_EVAL_FG_TRAJ_ACC_MAX` (m, 기본 0=비활성) — 유일하게 이득이 확인된 변경
+
+**근거 (NOTES 2026-07-31)**: `traj_acc = |c₂−2c₁+c₀|`(과거 3프레임 xy 가속도 잔차)는 신규 인자
+9종 중 cls_prob·거리를 모두 제거하고도 판별력이 남는 유일한 인자(잔차화 AUC 0.567)이고,
+xy중심오차와 ρ=+0.424로 붙는다.
+
+**변경 (`efficientocf.py`)**
+- `_eval_filter_by_traj_accel()` 신설. fg threshold 선택이 끝난 뒤 `traj_acc > acc_max`인
+  query를 **제거**한다(재랭킹 아님). `centers_world`의 마지막 3프레임만 쓰며 추가 forward 없음.
+- 호출부는 depth-sharpness 게이트 **직후**. 실패 시 fallback을 그대로 반환하고 eval을 죽이지 않는다.
+
+**⚠ 왜 곱셈이 아니라 컷인가**: `traj_acc`는 **비단조**다. 4분위 중심오차가
+0.768 / 1.005 / 1.203 / **2.024m** 로 Q4에서만 급등한다. 단조 곱셈(`cls/(1+acc)^k`)은
+fg 0.80~0.95 **전 예산에서 음수**였다. Q4만 제거하는 형태라야 데이터 모양과 맞는다.
+
+**실측 (ep20, 800샘플, fg0.9/occ0.75/nms0/weight=ones)**
+
+| | 기준 | acc_max=6.97 | 변화 |
+|---|---|---|---|
+| IoU3d(asset)_future | 0.1429 | **0.1447** | **+0.0018** |
+| micro IoU3d | 0.1440 | 0.1467 | +0.0027 |
+| IoU2d(asset)_future | 0.2039 | 0.2084 | +0.0045 |
+| TP / FP / FN | 1.735e7 / 5.735e7 / 4.579e7 | 1.717e7 / **5.390e7** / 4.597e7 | TP −1.0% / **FP −6.0%** |
+
+**⚠ 컷 값 캘리브레이션은 체크포인트 의존이다.** 아래는 **ep18 N=300 덤프**의 fg0.9 선택집합 기준:
+상위 2%=11.16 / 5%=6.97 / 10%=4.85 / 20%=2.94 (m). 위 실측은 **ep20**에 이 값을 그대로 적용한 것이라
+'상위 5%' 라벨은 ep20에서 부정확하다(이득 자체는 ep20 동일조건 비교라 유효).
+**다른 체크포인트에 쓸 때는 재캘리브레이션할 것.**
+
+**⚠ 예산이 줄어드는 방식이다.** threshold를 올려 예산을 줄이는 것 자체는 손해다
+(실측 fg0.92=0.1391 < fg0.90=0.1429). 그런데도 이득이 났다 = 버린 집합이 특별히 나빴다는 뜻.
+따라서 판정은 '같은 예산의 cls 컷보다 낫다'가 아니라 **'베이스라인보다 낫다'**로 해야 한다.
+
+### 2. `EOCF_EVAL_TRAJ_REFINE` (기본 1=기존 동작) — A/B 진단용
+
+`0`이면 `refine_trajectory_absolute_xy`를 건너뛰고 base trajectory를 쓴다.
+**결론: 켜는 게 맞다.** ep20 5119 A/B에서 OFF가 전 구간 열세(70% 지점 0.1390 vs ON 최종 0.1407).
+base traj의 이동량 분포가 GT와 더 잘 맞는데도(아래) IoU는 refine이 이긴다 —
+**분포 일치 ≠ 개별 중심 정확도.** refine의 이동은 허위 이동이 아니라 중심 교정이다.
+
+### 3. 계측 스위치 (기본 OFF, metric 무영향)
+
+- **`EOCF_EVAL_TRAJ_STATS`** (`efficientocf.py`, `_eval_traj_disp_stats`): 현재→미래 이동량 분포를
+  base traj / refine 후로 **분리** 출력. `EOCF_EVAL_TRAJ_STATS_EVERY`로 주기 조절.
+  발견: GT의 75%가 미래 이동 정확히 0m인데 base traj는 `<0.5m` 비율 0.753으로 일치, refine 후 0.488.
+- **`EOCF_QFEAT_ATTN_PEAK`** (`utils_query_projection.py`): attention map의 soft-argmax와
+  hard-peak 괴리를 2D(feature/이미지)·3D(depth 환산)로 산출해 `_last_query_attn_soft_lift_pack`
+  경유로 qfeat 덤프에 실는다. **feat_out 인덱스를 건드리지 않는다.**
+  결과는 닫힘(NOTES 참조) — 3D는 `depth × √((Δu/fx)²+(Δv/fy)²)`라 사실상 거리의 열화판이다.
+
+**함께 확인된 운영점**: fg 0.90 / occ 0.75가 최적. fg 0.01 단위 미세스윕에서
+0.88=0.1411 / **0.90=0.1429** / 0.92=0.1391 로 단봉이며, occ(0.7/0.75/0.8)는 5119에서도 편차 0.0001.
+
+## 2026-07-30 KST — depth sharpness 기반 fg 선택 재가중 추가 (`EOCF_EVAL_FG_SHARP_POW`, 추론 전용)
+
+**근거 (offline N=300, NOTES 2026-07-30 참조)**: depth 분포의 sharpness `1 - H_norm`은 거리 대역
+'안에서' cls_prob보다 'TP를 낼 query'를 잘 가린다(AUC 0.75~0.90 vs 0.71~0.83). 예산(선택 개수)을
+fg0.9와 동일하게 고정했을 때 `cls * sharp^2`의 precision이 **0.636 → 0.708 (+11%)**.
+
+**변경 (`projects/occ_plugin/occupancy/detectors/efficientocf.py`)**
+- `_eval_select_by_depth_sharpness()` 신설. `score_sel = cls_prob * (1 - H_norm)^k`로 threshold
+  선택을 다시 하고, **렌더 가중치(`selected_score`)는 원래 cls_prob을 유지**한다
+  (sharp를 곱한 값을 넘기면 blob 높이가 같이 낮아져 '선택 변경'과 '렌더 변경'이 섞임 → 단일변수 위반).
+- `simple_test`의 bundle 생성 직후 · oracle override 직전에 게이트를 삽입.
+  `EOCF_EVAL_FG_SHARP_POW=k`(>0)일 때만 동작하고, cut은 `EOCF_EVAL_FG_SHARP_THR`.
+  **예산 정합 cut (N=300 캘리브레이션)**: pow=1 → 0.4110 / pow=2 → **0.1938** / pow=3 → 0.0924.
+- 실패 시 기존 선택(fallback)을 그대로 반환하고 eval을 죽이지 않는다. 첫 샘플 1회 로그로
+  `selected=N`과 sharp 분포를 찍는다.
+
+**⚠ 주의**
+- 이 경로는 oracle override와 동일하게 bundle 내부의 **distance-NMS/topk를 우회**한다.
+  `EOCF_EVAL_NMS_RADIUS=0` 운영점에서는 무차이지만, NMS를 켠 채 쓰면 그 필터가 빠진다.
+- cut은 절대값이라 checkpoint/N이 바뀌면 예산이 달라진다. 비교 실험 시 재캘리브레이션할 것.
+- `EOCF_EVAL_FG_THR`은 이 경로에서 **사용되지 않는다**(선택이 통째로 교체됨).
+
+**함께 확인된 사항**: `cls + w*far*sharp`처럼 **먼 대역에 가점**하는 형태는 크게 손해다
+(AP 0.528 → 0.363). 먼 대역 양성률이 3.2%라 근거리를 밀어내는 거래가 되기 때문. **곱셈이어야 한다.**
+
+## 2026-07-30 KST — qfeat 덤프에 per-query depth 분포 추가 (fg score 재설계 계측)
+
+**목적**: fg score를 cls 확률 외의 신호로 재설계하기 위해, query별 depth 분포의 sharpness
+(entropy/top-1/std)를 offline에서 평가할 수 있게 한다. **계측 전용 — 플래그 OFF(기본)면 코드 경로 무변화.**
+
+**변경 (`projects/occ_plugin/occupancy/detectors/efficientocf.py`)**
+- `_maybe_dump_eval_query_features()`에 `depth_probs_tqd` 인자 추가. present 프레임만
+  `depth_probs_qd [Q,D] fp16`으로 저장(샘플당 +25KB) + `depth_min`/`depth_max` 스칼라.
+  bin은 uniform이라 offline에서 중심 복원 가능. range 규칙은 학습 타깃과 동일하게
+  `query_inst_depth_range_mode`('custom' vs `grid_config['dbound']`)를 따른다.
+- `simple_test` 호출부에서 `feat_out[11]`(= `query_depth_probs_tqd`, softmax된 `[T,Q,D]`)을 전달.
+  인덱스는 기존 배선(`feat_out[2]/[4]/[8]/[13]/[14]/[16]/[22]/[23]/[24~27]`)과 교차검증해 확정.
+
+**검증**: N=300 덤프 실행에서 `[200,64] fp16`, 행합 1.000, bin range 2.0~58.0m,
+normalized entropy 0.397~0.942(분포 있음), top-1 median 0.127 확인.
+depth head는 `_compute_query_depth_loss_from_match`(weight 1.0, matched pair CE)로 실제 학습됨.
+
+**주의**: 픽셀 단위 LSS depth는 이 계측에 쓸 수 없다 — `_extract_depth_and_context_for_query`가
+`depth_net`의 depth head를 `context_depth_proxy_head`로 대체하고, `get_depth_loss` 호출이
+detector에 없어 config의 `loss_depth_weight=3.0/kld`는 실제로 적용되지 않는다(감독 없음).
+
+## 2026-07-30 KST — eval per-query raw tensor dump 추가 (`EOCF_EVAL_DUMP_QFEAT`, offline fg-score 피팅용)
+
+**목적**: fg score function을 바꿀 때마다 GPU eval을 재실행하지 않도록, 샘플별 per-query
+raw 텐서 + oracle(GT Hungarian) 매칭 라벨을 한 번만 덤프해두고 offline에서 스코어를 재설계·피팅한다.
+**계측 전용 — 플래그가 꺼져 있으면(기본) metric/코드 경로가 완전히 동일하다.**
+
+**주요 변경**
+- `projects/occ_plugin/occupancy/detectors/efficientocf.py`
+  - `_maybe_dump_eval_query_features()` 신설 (`_maybe_save_eval_query_vis` 바로 뒤).
+    `EOCF_EVAL_DUMP_QFEAT=1`일 때만 동작하며, 샘플당
+    `<EOCF_EVAL_VIS_DIR|./work_dirs/eval_vis>/qfeat/sample_<idx:06d>.pt` 1개를 저장한다.
+    파일명 인덱스는 `_extract_eval_global_idx(img_metas)` → 없으면 `rank*1e6 + local counter`
+    (`_maybe_save_eval_query_vis`와 동일 규칙). `EOCF_EVAL_VIS_EVERY`로 솎지 않고 **전 샘플** 저장.
+    전체 try/except로 감싸 실패해도 eval이 죽지 않는다.
+  - `simple_test`: `_dump_qfeat_on` / `_need_gt_match = _oracle_on or _dump_qfeat_on` 도입.
+    attn GT 준비(`_attn_gt_primary/_fallback`)와 `_eval_train_faithful_inst_match()` 호출을
+    oracle과 공유하도록 게이트만 넓혔다 → **dump=1일 때 `EOCF_EVAL_ORACLE_MATCH=0`이어도**
+    GT Hungarian 매칭 라벨을 얻는다. oracle override 로직(`if _oracle_on:`)은 그대로.
+  - `_baseline_sel_idx`로 oracle override **이전**의 score-기반 선택을 보존해 함께 덤프.
+  - dump 호출 위치는 occ threshold(`thr`) 확정 직후 — 이후의 early-return에 걸리지 않는다.
+- `utils_visualization.py`는 **무수정**: 필요한 `score_q/iou_q/cls_prob_q/pred_cls_q/
+  cam_attn_score_q/selected_query_idx_q`가 이미 bundle에 들어 있다.
+
+**덤프 키** (모두 cpu, None은 생략)
+`cls_scores_qc[Q,C] f32` / `pred_cls_q[Q] i64` / `cls_prob_q,score_q,iou_q,cam_attn_score_q[Q] f32` /
+`centers_world_tq3[T,Q,3] f32` / `mixture_{centers_tqg3,sigmas_tqg3,yaw_tqg,weights_tqg}` /
+`present_idx,bg_class(int)` / `fg_thr,occ_thr(float)` / `baseline_selected_idx_q[S] i64` /
+`oracle_{matched_query_idx,matched_inst_idx,gt_ids}[*] i64` /
+`gt_instance_centers_world, gt_instance_centers_valid, gt_instance_ids`.
+
+**주의**: test_pipeline의 `Collect3D` keys에 `gt_instance_dims`/`gt_instance_sizes`가 없어
+해당 키는 덤프되지 않는다 (코드는 있으면 자동 포함하도록만 해둠).
+
+## 2026-07-30 KST — eval 지표를 asset present/future 전용으로 정리 (nusocc·bbox 계열 전면 제거)
+
+**지표 구성 변경**
+- 제거: `IoU2d/3d(nusocc)`, `IoU2d/3d(bbox_aabb)`, `IoU2d/3d(bbox_rot)`, `Recall3d` 3종(+comps).
+- 유지·신설: `IOU_2d_asset_{present,future}`, `IOU_3d_asset_{present,future}`,
+  그리고 3D 각각의 `TP/FP/FN` + `micro`.
+- `EOCF_EVAL_MODE`는 이제 **시각화 기준 프레임에만** 영향. metric은 항상 present·future 둘 다 계산한다.
+
+**왜 빨라지는가 (GPU 4% / CPU 병목 상황 대응)**
+- `_eval_load_bbox_gt_v2` 호출 제거 → 샘플당 npz 2개 로드 + `[7,512,512,40]` dense 2개 생성이 사라짐(실측 ~30ms + 146MB 할당).
+- `_iou_recall_3d` 호출 6회 → 2회.
+- test_pipeline에서 `LoadOccupancy` 제거 → `gt_occ`/`segmentation`/`segmentation_bev`/`instance_bev` 7프레임 복원이 사라짐. (train_pipeline은 그대로 유지 — 학습 loss에 필요)
+- present 지표 추가 비용은 거의 0: 예측 `pred_occ3d`는 BEV 정렬용으로 이미 렌더돼 있고, GT는 present 1프레임만 같은 `align3d`로 정렬한다.
+
+**남긴 로드**
+- `LoadInstanceWithFlow`(+`load_gt_bbox_aabb=True`)는 유지. oracle Hungarian이 요구하는
+  `gt_instance_centers_world/valid/ids`가 이 aabb 슬롯에서 파생되고, query_debug_vis 1~3행 GT도
+  `gt_occ_inst`에서 나온다. (eval 전용 `_eval_load_bbox_gt_v2`와는 다른 경로 — 혼동 주의)
+- `segmentation_bev` early-return 가드 제거(LoadOccupancy가 없으므로 항상 None).
+
+**수정 파일**: `efficientocf.py`(metric 블록·return·_pack), `apis/test.py`(single/multi 누적·출력),
+`efficientocf_dataset.py`(evaluate), full config(test_pipeline).
+
+## 2026-07-30 KST — query_debug_vis에 present 열 추가 + 4행 열 정렬 버그 수정
+
+- eval/oracle의 `query_debug_vis`가 미래 4프레임만 보여주던 것을 **present + 미래 4 = 5열**로 확장.
+  `centers_world_traj`와 mixture traj가 이미 `[present, f1..fF]`(T=F+1) 레이아웃이고 present occ
+  (`pred_occ`)도 metric용으로 이미 렌더돼 있어, `_eval_future_tail`로 자르지 않고 그대로 넘기는
+  것만으로 **추가 연산 없이** 구현됨. metric 경로(`centers_eval_tq3`/`pred_occ_eval`)는 무변경.
+- 안전장치: 중심·occ·mixture 4종의 프레임 수가 모두 정확히 `n_future+1`일 때만 present 열을 켜고,
+  하나라도 어긋나면 기존 4열 동작으로 자동 폴백(`future_includes_present` 플래그).
+- **버그 수정**: 위 변경 직후 1~3행은 5열인데 4행(eval 비교)만 4프레임이라 **f1이 present 칸에
+  그려지고 마지막 칸이 비는 열 밀림**이 있었다. `_build_eval_cmp_pack` 헬퍼를 추가해 present
+  프레임 pred(`pred_bev`)와 GT(같은 align으로 1프레임만 생성한 `asset_bev_present`)를 앞에
+  붙여 열을 맞췄다.
+- mixture3d는 present 열이 붙으면 '미래 2번째' 인덱스가 밀리므로 `frame_idx` 1 → 2로 보정하고
+  GT도 동일 레이아웃으로 넘겨 **이전과 같은 프레임**을 계속 렌더한다.
+- 주의: 4행 캡션의 per-column IoU에 present 열 값이 새로 표시되지만, **metric(IoU3d/2d asset)은
+  여전히 미래 4프레임만** 채점한다. 그림의 present 열은 참고용이다.
+
+## 2026-07-28 KST — trajectory xy refine을 추론(eval/oracle)에도 적용
+
+- 그동안 `refine_trajectory_absolute_xy`는 `forward_train`에서만 호출돼, eval은 **refine 이전
+  raw trajectory**로 미래 프레임을 렌더했다. 학습으로 만든 보정 능력이 추론에서 통째로 버려지던 상태.
+- `simple_test`에 동일 호출을 추가했다. 입력은 전부 추론 시 확보 가능(GT 불필요):
+  `feat_out[13]`(query future feat) / `cls_scores_qc` / `centers_world` / `feat_out[18]`(traj offsets)
+  / `present_idx=feat_out[23]`.
+- 적용 대상: `centers_world_traj`의 미래 XY(`_replace_future_xy_in_full_centers`)와
+  future mixture 중심(`_shift_future_mixture_centers_by_refined_xy`). 두 텐서는
+  `[present + F]` 레이아웃(index 0 = present)이라 교체 시 **present_local_idx=0**을 쓴다
+  (refine 호출 자체는 full-window `centers_world` 기준이라 `present_idx`를 그대로 넘김).
+- metric 경로는 `centers_eval_tq3 ← centers_world_traj`로 이어지므로 IoU에 직접 반영된다.
+  mixture 렌더는 present 모양을 trajectory 중심에 얹는 구조라 중심 이동만으로 함께 갱신된다.
+- oracle도 같은 `simple_test`를 타므로 자동 적용. env 스위치 없이 **항상 적용**(사용자 요청).
+- 첫 샘플 1회 `[eval] traj xy refine applied: mean|delta_xy|=...m (future_steps=, queries=, traj_T=)`
+  로그. helper는 shape 불일치 시 원본을 그대로 반환하므로 **delta=0이면 실제로는 미적용**이라는
+  뜻 — 이 값으로 배선 성공 여부를 판정할 것.
+- **주의: 이 시점 이후 eval 숫자는 이전 run과 직접 비교 불가.**
+
+## 2026-07-27 13:30 KST — eval GT 필터 일치화(4행 GT=asset, bbox v2 사람 제외) + 실행 blocker 2건
+
+**eval 시각화/지표 GT 정합**
+- `query_debug_vis` 4행(eval 비교 행)의 GT를 bbox AABB → **asset-union**으로 교체.
+  metric 블록에서 이미 만들던 `asset_bev_t`를 `asset_bev_vis`로 hoist해 `eval_cmp_pack`에
+  넘긴다(추가 연산 없음). 1~3행(inst3d)과 동일한 객체 집합이 되고, 4행 IoU가
+  `IoU2d(asset)`와 같은 GT를 본다. 그림 캡션도 `pred occ vs bbox_aabb` → `pred occ vs asset`
+  (query_head.py:3929).
+- `_eval_load_bbox_gt_v2`에 pedestrian(7) 제외 추가. inst3d(`LoadInstanceWithFlow
+  exclude_occ_class_ids=(7,)`)·asset(`a[:,3]!=7`)과 기준을 맞춘 것 — 이 로더만 클래스 필터가
+  없어 bbox 계열 지표(IoU bbox_aabb/rot, Recall3d 관용 영역)와 4행 그림에만 사람이 남아 있었다.
+  첫 샘플 1회 `[eval][bbox v2] key=... pedestrian_voxels_removed=N visibility_drop_ids=M` 로그로
+  실제 사람 voxel 유무를 확인할 수 있게 했다(N=0이면 원래 없던 것 → 수치 변화도 없음).
+
+**실행 blocker**
+- full config의 `LoadOccupancy`(train/test 양쪽) `load_occ_dt=True` → `False`,
+  Collect3D `keys`에서 `'occ_dt'` 제거. `./data/occ_dt`가 이 머신에 없고 `use_query_dt_loss=False`라
+  쓰이지도 않는데 첫 샘플에서 `FileNotFoundError`로 죽었다. (`load_occ_dt=False`면 `results['occ_dt']`가
+  안 생기므로 Collect3D key도 반드시 같이 빼야 `KeyError`가 안 난다.)
+- `_Torch27MMDistributedDataParallel`(mmdet_train.py) + tools/test.py 배선 복원.
+  torch 2.7.0 + mmcv 1.7.2 조합에서 mmcv의 `_run_ddp_forward`가 torch가 제거한
+  `_use_replicated_tensor_module`를 참조해 DDP forward 첫 호출에 AttributeError로 죽는다.
 ## 2026-07-28 — trajectory xy-refine 추론 적용 스위치 (EOCF_EVAL_TRAJ_REFINE)
 
 - 기존에 `refine_trajectory_absolute_xy`(query_head.py:1620) 호출부는 `forward_train`
@@ -1846,6 +2434,144 @@ py_compile 통과. 시각화 전용이라 학습/평가 수치 영향 없음.
 - checkpoint의 epoch/iteration, optimizer 및 LR scheduler 진행 상태를 복구하여
   warmup을 재실행하지 않고 epoch 3 학습을 이어간다.
 
+### 2026-07-30 — eval fg-score에 cam attention self-consistency 항 활성화(opt-in)
+
+- `efficientocf.py:simple_test`에 `EOCF_EVAL_CAM_SCORE=1` 게이트를 추가했다. 켜면 학습 경로와
+  동일한 2단계 호출(`build_query_attn_cam_gaussian_targets` → `_compute_query_attn_cam_gaussian_score`)을
+  `torch.no_grad()`로 수행해 `query_attn_cam_score_pack`을 만들고, 기존에 하드코딩되어 있던
+  `query_attn_cam_score_pack=None` 대신 이 pack을 `_build_query_visualization_bundle`에 넘긴다.
+  입력은 `feat_out[14]`(query attn weights), `feat_out[17]`(camera calib), `feat_out[24..27]`(mixture)로
+  전부 예측/캘리브 값이며 GT를 쓰지 않는다. 어떤 예외도 `pack=None`으로 degrade하며 eval을 죽이지 않는다.
+- `utils_visualization.py:_build_query_visualization_bundle`의 score weight에 env override
+  `EOCF_EVAL_W_IOU` / `EOCF_EVAL_W_CLS` / `EOCF_EVAL_W_CAM`를 추가했다(미설정 시 기존 config 값).
+  config 수정 없이 weight sweep이 가능하다. 기존 `EOCF_EVAL_FG_THR` 블록의 중복 `import os as _os`는 제거했다.
+- `_maybe_dump_eval_query_features`의 qfeat payload에 `cam_attn_score_valid_q`를 추가해
+  offline 피팅에서 유효 query만 골라낼 수 있게 했다(`cam_attn_score_q`는 이미 dump 중).
+- 세 env가 모두 미설정이면 동작은 이전과 완전히 동일하다(iou_q=0, cam=0, weight=config 값).
+
+## 2026-08-08 13:10 — @5119 큐 재편 (α_s 상단 확장)
+
+**결과**: res704 신기록 `traj_dev α0.7/0.4·fg0.9·occ0.85` = 0.1433/0.1849/0.15162 (세 목표 통과).
+feat128 신기록 `traj_dev α0.9/0.3·fg0.9·occ0.85` = 0.1528/0.1977/0.16178 (이전 0.16038 대비 +0.0014).
+
+**Ablation @5119 확정** — 두 항 모두 필요:
+- feat128 −운동(α0.9/0) 0.1504/0.1963 (Δfut −0.0024) · res704 −운동(α0.6/0) 0.1411/0.1846 (−0.0021)
+- res704 −depth(α0/0.3) 0.1403/0.1795 (−0.0029/−0.0056). feat128 −depth 는 진행 중
+
+**발견**: @5119 는 @800 보다 **한 칸 높은 α_s** 를 선호 (feat128 0.2→0.3, res704 0.3→0.4). 두 config 공통.
+@800 1등이 @5119 에서 feat128 3등 / res704 7등 → @800 은 후보 선별용이지 순위 예측용이 아님.
+
+**변경 파일**: `work_dirs/_eval_scripts/tasks_r704.txt` (7작업) · `tasks_f128.txt` (9작업) 전면 재작성.
+@800 확장 중단, @5119 중심으로 α_s 상단(res704 0.5 / feat128 0.4)과 occ 축을 승자 지점에서 확인.
+`RESULTS_TABLES.md`: 최고 기록 · 2-④ feat128 traj_dev 절 신설 · 3-③ @5119 표 확장 · 6절 큐 갱신.
+
+## 2026-08-08 19:20 — @5119 고원 확인 · ablation 완결 · speed_std 대조
+
+**신규 결과 5건**
+- feat128 α0.9/0.4 = 0.1530/0.1976/0.16192 (탐색 최대값, α0.9/0.3 과 0.00014 차 = 동점)
+- feat128 −depth(α0/0.2) = 0.1485/0.1885 → Δfut −0.0043 / Δpres −0.0092. **ablation 4칸 완결**
+- res704 α0.7/0.5 = 0.1434/0.1846/0.15164 · α0.7/0.4·occ0.90 = 0.1432/0.1855/0.15166
+- res704 @800 speed_std α0.6/0.3 = 0.1470/0.1872 (traj_dev 0.1475/0.1877 에 -0.0005)
+
+**결론 1 — res704 α·occ 표면은 고원.** @5119 11개 중 상위 7개가 0.00020 안(분해능 0.0004의 절반).
+α_s 0.3→0.5, occ 0.85→0.90 어느 쪽도 유의하지 않다. 추가 스윕 중단, α0.6/0.3·occ0.85 확정.
+feat128 은 고원이 좁다(상위 3개만 동점, 4위 α0.9/0.2 는 0.00076 아래) → α_s 선택이 실제로 중요.
+
+**결론 2 — 두 항 모두 필수, depth 가 더 크다.** future 기준 depth 제거가 운동 제거의 1.5~1.8배.
+res704 는 depth 를 빼면 present 가 목표선 아래로 내려간다.
+
+**결론 3 — traj_dev > speed_std > past_speed.** 설계 의도(방향 변화까지 봐야 함)와 순서 일치.
+
+**변경**: RESULTS_TABLES.md 헤더/2-④/3-③/5절, speed_std 대조 표 신설. NOTES.md 는 08-08 항목 유지.
+
+## 2026-08-08 19:30 — feature 는 depth+traj_dev 로 고정, 큐 축소
+
+**지시**: traincal 둘째 feature 는 `traj_dev` 단독 확정. `past_speed`/`speed_std` 는 폐기이며
+대조군·ablation 명목으로도 다시 돌리지 않는다. RESULTS_TABLES.md 상단·5절·speed_std 절과
+두 task 파일 헤더에 명시. speed_std 절은 기존 @800 한 점으로 종결 표기.
+
+**worker.sh 확장**: task 형식에 6번째 칸 `FG` 추가(생략 시 0.9). fg 축을 별도 스크립트 없이
+큐로 돌릴 수 있게 했다. tag_of / PICKED / 실행 인자 / 라벨 4곳 수정, 기존 5칸 줄은 그대로 동작.
+
+**큐 축소**: 대기 14개 → 7개. 잘라낸 것 —
+- res704 α0.8/0.4, α0.6/0.4(실행 중 중단), α0.7/0.2 진단: α·occ 표면이 고원(상위 7개가 0.00020 안)
+- feat128 α1.0/0.3: α_d 0.8↔0.9 이미 동점
+- @800 5개: @800 은 순위를 못 맞힌다(5회 오판)
+- speed_std/past_speed 관련 전부: 폐기 feature
+
+**남긴 것**: res704 fg 0.85/0.95 · feat128 α_d 0.6(실행 중)/occ 0.90·0.80/fg 0.85·0.95.
+fg 는 past_speed 스윕에서 정한 값이라 traj_dev 에서 유일하게 미검증인 축이다.
+
+## 2026-08-08 19:45 — occ 교란 발견, 큐 확장 (야간 무인 운전)
+
+**발견**: baseline(occ0.75) 과 최종(occ0.85) 사이에 occ 가 같이 바뀌어,
+보고 중인 이득(feat128 +0.0096 / res704 +0.0066)이 traincal 기여와 occ 기여로 분리돼 있지 않다.
+res704 에서 occ 0.75→0.85 단독 이득이 +0.00118 이었으므로 무시 못 할 크기다.
+**해법**: α_d=α_s=0 이면 s_eff=s 라 선택이 baseline 과 동일 → `α0/0·occ0.85` 가 "occ 만 올린 점".
+`α0/0·occ0.75` 는 baseline 과 정확히 일치해야 하므로 평가 경로 정합성 검증도 된다. 양 config 큐에 추가.
+
+**추가 큐**: res704 6개(occ분리·정합성·fg×occ 코너 4) · feat128 2개(occ분리·정합성). 전부 @5119.
+fg·occ 는 지금까지 각각 1D 로만 훑어서(상대 고정) joint optimum 확인이 안 됐다 → 코너 4점.
+
+**worker.sh 수정 부작용 처리**: 실행 중인 bash 는 메모리의 옛 코드로 계속 돌아
+f128 워커가 6번째 칸(FG)을 못 읽는다 → fg 작업이 cut0.9 로 태그돼 '완료'로 조용히 스킵될 뻔했다.
+`restart_f128_when_idle.sh` 로 현재 런 종료 즉시 워커를 죽여 watchdog 이 새 코드로 재기동하게 했다.
+(r704 워커는 유휴 시점에 이미 재기동 완료, fg0.85 정상 시작 확인)
+
+**속도 참고치**: res704 1,858 ms/sample · feat128 2,191 ms/sample (2슬롯 동시 벽시계, 순수 forward 아님).
+
+## 2026-08-09 13:35 — 야간 12런 완료: 이득 분해 · fg 확정 · 하이퍼파라미터 통일
+
+**① 이득 분해 (res704)** — "occ 튜닝일 뿐" 반론이 막혔다.
+baseline 0.1366/0.1743 → 전역재선택 0.1376/0.1767 → occ0.85 0.1377/0.1781 → 최종 0.1432/0.1851.
+future 총이득의 **83%**, present 의 65% 가 depth·traj_dev 점수 자체에서 나온다. occ 기여는 1.5%.
+⚠ α0/0·occ0.75 가 baseline 과 불일치(+0.0010/+0.0024) — traincal 의 **전역 재선택** 때문으로 보인다.
+버그가 아니라 별도 기여 항으로 읽어야 하며, 코드에서 두 선택 경로 차이를 한 번 확인할 것.
+
+**② fg=0.90 확정** — traj_dev 로 직접 검증. feat128 0.85/0.95 = −0.0039/−0.0069,
+res704 = −0.0051/−0.0037. α·occ 마진의 10배. fg×occ 코너 4점도 전부 아래 → 상호작용 없음.
+
+**③ 하이퍼파라미터 통일 가능** — feat128 α_d 0.9→0.6 으로 내려도 0.1529/0.1968/0.16168 로 동점
+(avg 차 0.00010 = 분해능의 1/4, future 는 오히려 높음). 두 config 가 α0.6/0.3·fg0.9·occ0.85 공유 가능.
+"해상도가 바뀌어도 재튜닝 불필요" 주장이 가능해졌다.
+
+**④ occ 축 @5119 확인** — feat128 occ 0.80/0.85/0.90 = 0.16158/0.16178/0.16146 → 0.85 봉우리 유지(동점권).
+
+**restart_f128_when_idle.sh 정상 작동** — 22:20:48 에 f128 워커 재기동, fg 작업이 올바른 태그로 실행됨.
+
+## 2026-08-09 13:40 — 불필요 런 중단, feat128 단독 실행으로 전환
+res704 fg0.95·occ0.90 코너(66% 진행)를 중단했다. fg0.95 는 occ0.85 에서 0.1395 로 이미
+결정적으로 졌고 fg×occ 상호작용도 없음이 확인돼 결과에 쓸 데가 없다.
+슬롯 A 에 남은 작업이 없으므로 중단해도 손실이 없고, GPU 경합이 사라져
+feat128 남은 2런(이득 분해)이 40~60분 빨리 끝난다. res704 는 이로써 **완료**.
+
+## 2026-08-09 14:30 — feat128 이득 분해 · _center ablation 환경 구축
+
+**feat128 이득 분해** (@5119): baseline 0.1432/0.1811 → α0/0·occ0.85 0.1451/0.1854
+→ 최종 α0.9/0.3 0.1528/0.1977. **future 총이득의 80%, present 의 74%가 traincal 점수 자체**에서 나온다.
+res704(83%/65%)와 동일한 결론 — 두 config 독립 확인. "occ 튜닝일 뿐" 반론이 양쪽에서 막혔다.
+
+**🔴 center 워커 가드 버그 (pipefail + grep -q)**
+heavy_running() 을 `pgrep | while ... | grep -q` 로 짰는데, grep -q 가 첫 매치에서 빠져나가면
+앞단이 SIGPIPE(141)로 죽고 **set -o pipefail 이 141 을 파이프라인 결과로 삼아 판정이 뒤집혔다**.
+대화형 셸(pipefail 없음)에서 테스트해서 통과한 게 함정이었다. 실제로 가드가 뚫려
+896x1600 center 런 2개가 동시에 떴다(08-06 동반 사망과 같은 조합) — 즉시 중단하고 수정.
+→ 명령치환 안에서 `grep -c` 로 개수만 세고 판정은 [ ] 로 하도록 변경. pipefail 환경에서 재검증 완료.
+**교훈: 가드 함수는 실제 실행 환경(set -uo pipefail)에서 테스트할 것.**
+
+**부수**: pkill -f 패턴이 자기 셸을 매치해 exit 144 (자기 자신 kill). PID 로만 죽일 것.
+
+## 2026-08-10 10:15 — EVAL_SPEC.md 신설 (평가 체계 이식 문서)
+다른 repo(특히 7월 스냅샷 ablation repo)로 평가 체계를 옮기기 위한 명세를 작성했다.
+코드에서 직접 뽑은 내용이며 추측 없음.
+- 0절: eval 이 돌게 만드는 선행 수정 4가지
+- 1절: future/present 동시 산출 구조. **핵심은 pred_occ3d(현재 프레임 예측)가 mode 와
+  무관하게 이미 렌더돼 있다는 것** — GT 만 present 로 잘라 IoU 를 한 번 더 재면 되고 추가 비용 0.
+  7월 repo 는 eval_mode=='present' 분기와 _eval_mode_slice() 로 한쪽만 계산한다(이식 대상).
+- 2절: traincal 수식/feature/통계 형식/env. depth head 가 죽은 ablation 에는 적용 금지 명시.
+- 3절: 공통 env 인자 표 (VIS=0, TRAJ_ACC_MAX=0, NMS=0 등)
+- 4절: 스윕 인프라 + 워커 버그 4개 (pipefail+grep -q / 부분완료 오인 / 실행중 스크립트 수정 / pkill 자살)
+- 5절: 결과 해석 규칙 (@800 5회 오판, 분해능 0.0004, 모델별 편향 상이)
 ### 2026-07-29 09:50 KST — eval NameError 수정
 
 - `efficientocf.py` `extract_feat_query`에서 `EOCF_EVAL_TRAJ_REFINE` 환경변수를 읽을 때 `NameError: name 'os' is not defined`로 eval이 죽던 문제를 수정했다.

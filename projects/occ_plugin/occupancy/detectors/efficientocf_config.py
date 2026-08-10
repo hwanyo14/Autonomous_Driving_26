@@ -253,6 +253,11 @@ MODEL_CFG_DEFAULTS = {
     "query_attn_softargmax_tau": 1.0,
     "query_depth_loss_weight": 1.0,
     "query_depth_label_smoothing": 0.0,
+    # [forward-lifting ablation] True(기본) = attn soft-argmax(u,v) + depth 분포를
+    # unprojection해서 3D center를 만든다(forward lifting). False = query feature를
+    # CenterHead(MLP)에 넣어 xyz를 직접 회귀하고 lifting 경로는 호출조차 하지 않는다.
+    # attention 모듈/attn loss는 양쪽 모두 그대로 — center 읽기 용도만 빠진다.
+    "query_center_from_lifting": True,
     # QueryDepthHead capacity (depth bin classifier MLP). Defaults reproduce the
     # original 2-layer, hidden=embed_dim head. hidden_mult widens hidden=embed_dim*mult.
     "query_depth_head_num_layers": 2,
@@ -609,6 +614,7 @@ def apply_model_cfg(self, cfg):
     self.query_attn_softargmax_tau = float(cfg["query_attn_softargmax_tau"])
     self.query_depth_loss_weight = float(cfg["query_depth_loss_weight"])
     self.query_depth_label_smoothing = float(cfg["query_depth_label_smoothing"])
+    self.query_center_from_lifting = bool(cfg["query_center_from_lifting"])
     self.query_depth_head_num_layers = int(cfg["query_depth_head_num_layers"])
     self.query_depth_head_hidden_mult = int(cfg["query_depth_head_hidden_mult"])
     self.query_inst_depth_num_bins = int(cfg["query_inst_depth_num_bins"])

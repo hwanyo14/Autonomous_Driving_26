@@ -324,38 +324,22 @@ test_pipeline = [
         img_norm_cfg=img_norm_cfg,
         test_mode=True,
     ),
-    dict(
-        type='LoadOccupancy',
-        to_float32=True,
-        occ_path=occ_path,
-        ocf_dataset_path=ocf_dataset_path,
-        grid_size=occ_size,
-        unoccupied=empty_idx,
-        pc_range=point_cloud_range,
-        use_fine_occ=use_fine_occ,
-        test_mode=True,
-        dt_path=occ_dt_path,
-        load_occ_dt=True,
-        dt_type='float16',
-        strict_dt=True,
-        validate_height_cache=False,
-        write_height_cache=write_height_cache,
-    ),
     dict(type='OccDefaultFormatBundle3D', class_names=class_names, with_label=False),
     dict(
         type='Collect3D',
+        # asset-only eval: LoadOccupancy 제거(2026-07-30). oracle 매칭·시각화에 필요한
+        # inst3d/centers/ids만 LoadInstanceWithFlow로 로드한다.
         keys=[
             'img_inputs_seq',
-            'gt_occ',
             'future_egomotion',
-            'segmentation',
-            'segmentation_bev',
-            'instance_bev',
             'gt_occ_inst',
             'gt_instance_centers_world',
             'gt_instance_centers_valid',
             'gt_instance_ids',
-            'occ_dt',
+            # 크기별 분석용(2026-07-30): LoadInstanceWithFlow가 centers와 동일 조건에서
+            # 항상 함께 생성 — qfeat 덤프에서 대형 객체 recall을 크기별로 보기 위해 통과시킨다.
+            'gt_instance_sizes',
+            'gt_instance_dims',
         ],
         meta_keys=[
             'pc_range', 'occ_size', 'scene_token', 'lidar_token',

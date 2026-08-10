@@ -3771,7 +3771,7 @@ class QueryHead(nn.Module):
                 _overlay_pred_bev(hi_ov, pred_bev, gt_bev, hi_color)
                 _overlay_pred_bev(hi_cls_ov, pred_bev, gt_bev, hi_color)
 
-            # eval 비교 행: matched 대신 'eval 실제 pred occ(빨강) vs bbox AABB GT(초록), 겹침 흰색'
+            # eval 비교 행: matched 대신 'eval 실제 pred occ(빨강) vs asset-union GT(초록), 겹침 흰색'
             if (
                 eval_cmp_pred_np is not None and eval_cmp_gt_np is not None
                 and t < int(eval_cmp_pred_np.shape[0]) and t < int(eval_cmp_gt_np.shape[0])

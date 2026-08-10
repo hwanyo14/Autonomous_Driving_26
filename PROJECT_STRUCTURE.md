@@ -18,6 +18,16 @@
 ├── eval_total.sh  # 단일 eval 원클릭 래퍼; CONFIG/checkpoint/GPU 값만 수정 후 dist_test.sh 호출
 ├── eval_oracle.sh  # Oracle(GT 치팅) eval 래퍼; EOCF_EVAL_ORACLE_MATCH=1로 query↔GT center Hungarian 선택 → 스코어링 병목 진단
 ├── eval_sweep_thr.sh  # (FG_THR,OCC_THR) 조합 순차 스윕 래퍼; 부분 eval(EOCF_EVAL_MAX_SAMPLES=512)로 짧게 비교, 타 eval 종료 대기 후 시작
+├── eval_feat128.sh  # feat128(896x1600, query200) traincal(depth_std+traj_dev) 재선택 eval. baseline 대조군은 eval_total.sh. ⚠ ckpt 가 이 머신에 없다
+├── eval_res704.sh  # res704(256x704) traincal 재선택 eval. ckpt 는 ablation_res 레포 ..._res704_ep20/epoch_18
+├── eval_center.sh  # [ablation] center(query_center_from_lifting=False) eval. ckpt 는 ablation_center 레포. ⚠ depth head 미학습이라 traincal 금지
+├── eval_q100.sh  # [ablation] query_num_queries=100 eval. ckpt 는 ablation_query 레포 (ep6 까지만 존재)
+├── eval_q900.sh  # [ablation] query_num_queries=900 eval. ckpt 는 ablation_query 레포
+├── collect_traincal_stats.sh  # traincal 정규화 통계 수집기 (train split, deterministic test pipeline, GT 미사용). 결과 JSON은 ./traincal/ 에 생성되며 ⚠ checkpoint 마다 다시 뽑아야 한다
+├── traincal/  # traincal(depth_std+traj_dev) 정규화 통계 일체 — 수집용 config 2개 + 결과 JSON
+│   ├── full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_feat128_traincal_collect.py  # feat128 통계 수집용 (베이스 config 상속, test ann_file만 train)
+│   ├── full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_res704_traincal_collect.py  # res704 통계 수집용
+│   └── *.json  # 통계 JSON. ⚠ checkpoint 종속 + traj_dev 키가 있는 *_v3_*.json 2개만 traj_dev 실험에 쓸 수 있다 (나머지 19개는 폐기된 past_speed 전용)
 ├── data_vis/  # GT 파이프라인 검증 BEV 시각화 PNG
 │   └── visibility_filter_compare/  # 최초등장 visibility=1 필터 전/후/제거분 D(nusocc)·E(AABB) 7프레임 비교
 ├── data/  # 외부 데이터와 전처리 캐시를 가리키는 심볼릭 링크 모음
@@ -52,6 +62,11 @@
 │   │   │   ├── subset_attn_cover_pyr_aabb_dice3d_new_asset_all_ft_hard.py  # full epoch15에서 큰(≥6m)·먼(≥30m) matched pair만 asset focal/Dice로 학습하는 3epoch FT
 │   │   │   ├── subset_attn_cover_pyr_aabb_dice3d_new_asset_all_ft_hard_dice.py  # full epoch15에서 raw Dice 상위 30% matched pair만 asset focal/Dice로 학습하는 3epoch FT
 │   │   │   ├── subset_attn_cover_pyr_aabb_dice3d_new_filter.py  # f3 D/E에서 과거3 최초등장 visibility=1 instance를 로드 직후 7프레임 전체 제거하는 정렬 필터 실험
+│   │   │   ├── full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_feat128.py  # 위 대비 bev_feat_dim=96→128 단일변수
+│   │   │   ├── full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_feat128_center.py  # [ablation] query_center_from_lifting=False — center 를 lifting 대신 CenterHead(MLP) 직접 회귀 + depth loss 0. ckpt 는 ablation_center 레포 (CHANGELOG 2026-08-10)
+│   │   │   ├── full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_q100_feat128.py  # [ablation] query_num_queries 200→100. ckpt 는 ablation_query 레포
+│   │   │   ├── full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_q900_feat128.py  # [ablation] query_num_queries 200→900. ckpt 는 ablation_query 레포
+│   │   │   ├── full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_res704.py  # 위 feat128 대비 입력 해상도 (896,1600)→(256,704) + kv_resolutions (4,11)/(8,22)/(16,44) 종속 변경 + σ-match off (CHANGELOG 2026-08-10)
 │   │   │   ├── subset_attn.py  # subset(4000) + camera-attn 충돌 fix. GT는 gt_bbox_aabb(E) 기반 (NOTES/CHANGELOG 2026-07-02, 2026-07-13)
 │   │   │   ├── subset_attn_cover_aabb_dice.py  # subset_attn + σ-matching + dice(tversky) GT 혼합(0.1 inst3d+0.9 AABB, 2D z-collapse) (CHANGELOG 2026-07-07, 2026-07-13)
 │   │   │   ├── subset_attn_cover_pyr_aabb_dice3d.py  # 위 + dice 3D(query_gmo_dice_3d=True) + query cross-attn coarse-to-fine KV 피라미드(3-layer) (CHANGELOG 2026-07-10, 2026-07-13)
@@ -183,3 +198,13 @@
         └── visualize_results.py  # 저장된 결과 pickle을 dataset.show로 렌더링하는 도구
 
 ```
+
+## EVAL_SPEC.md (2026-08-10 신설)
+
+**다른 repo 로 평가 체계를 이식할 때 보는 문서.** 내용:
+0. 7월 스냅샷 repo 를 돌게 만드는 4가지 선행 수정 (occ_pool_ext / occ_dt / DDP 셔틀 / setsid)
+1. metric — 한 런에서 future·present 동시 산출 구조 (`pred_occ3d` 재사용, 추가 비용 0)
+2. traincal — 수식, feature 정의, 통계 수집·형식, env 인자, 실패 시 동작
+3. 공통 eval env 인자 표
+4. 스윕 인프라 패턴 + 실제로 터진 워커 버그 4개
+5. 결과 해석 규칙 (@800 의 한계, 분해능, 편향)

@@ -2,6 +2,60 @@
 # Spatiotemporal Decoupling for Efficient Vision-Based Occupancy Forecasting
 # https://github.com/BIT-XJY/EfficientOCF
 #
+# ============================================================================
+# [_res704 ablation 2026-07-28] 입력 이미지 해상도 896x1600 -> 256x704.
+#   베이스: full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter.py (동일 파일에서 파생).
+#   상세 근거/검증 내역은 레포 루트 RES704_ABLATION.md 참고.
+#
+#   변경 3곳 (이 외 model/GT/loss/schedule 전부 동일):
+#     1) data_config['input_size'] (896,1600) -> (256,704)
+#     2) query_transformer_kv_resolutions ((14,25),(28,50),(56,100)) -> ((4,11),(8,22),(16,44))
+#        - 필수. ★조용히 망가지는 항목★ — query_transformer_learnable_kv_downsample이
+#          기본 False라서 transformer.py:236의 ValueError 가드가 안 걸린다. 옛 값을 그대로
+#          두면 크래시 없이 adaptive_avg_pool2d로 16x44 feature를 56x100으로 '업샘플'해
+#          KV를 만든다(실측: token 4224 -> 33600). 학습은 도는데 KV가 무의미해지고
+#          메모리/시간만 8배 먹으므로 로그만 봐선 못 잡는다.
+#     3) query_attn_sigma_match_loss_weight 0.25 -> 0.0 (의도적 비활성, 아래 근거)
+#     4) bev_feat_dim 96 -> 128
+#        - [2026-08-10 이식 시 확인] 원본 헤더는 "변경 3곳"이라 적혀 있지만 실제 diff에는
+#          이 항목이 더 있다(원본 레포 Autonomous_Driving_26_filter_ablation_res 기준).
+#          이 레포에는 feat_dim만 96->128 바꾼 단일변수 config
+#          (full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_feat128.py)가 따로 있으므로,
+#          이 config는 베이스(96) 대비 "해상도 + feat_dim" 2축이 동시에 바뀐 상태다.
+#          단일변수 해상도 비교가 필요하면 _feat128.py를 기준선으로 잡을 것.
+#   + visualization_cfg work_dirs 경로에 _res704 suffix (베이스 run과 출력 충돌 방지)
+#
+#   [자동 대응 — 수정 불필요] 아래는 input_size로부터 파생되므로 손댈 필요 없음:
+#     - sample_augmentation: resize = fW/W = 704/1600 = 0.44 자동 (loading_bevdet.py:190)
+#     - ViewTransformer frustum / depth GT downsample: input_size 기준 (downsample=16)
+#       256/16=16, 704/16=44 모두 정수
+#     - img_neck SECONDFPN: stride4/8/16/32 = 64x176,32x88,16x44,8x22
+#       -> upsample_strides [0.25,0.5,1,2] 적용 시 전부 16x44 정수
+#     - transformer pos embed: sin-cos 동적 생성이라 해상도 무관 (transformer.py:947)
+#     - grid_config / occ_size / point_cloud_range / GT 파이프라인 전부 무관
+#     - 플러그인 코드에 하드코딩된 896/1600/56/100 없음 (grep 확인)
+#
+#   [FoV] crop_h=(0.0,0.0) bottom-align이므로 상단이 잘림:
+#     resize 0.44 -> newH=396, crop_h = 396-256 = 140 (상단 35% drop, 원본 기준 318줄).
+#     남는 수직 시야 = 수평 위쪽 +7.8° ~ 아래 -17.9° (CAM_FRONT f=1266, cy=491.5 기준).
+#     버리는 +7.8°~+21.2° 광선은 24m 이후 z-max(=3.0, 지면 약 4.8m) 복셀 천장을 벗어나
+#     어떤 voxel에도 기여하지 않음 -> LSS 볼륨 기하와 정합적. 실손실은 10~20m 이내
+#     대형차 지붕 상단 정도. BEVDet/Occ3D 계열은 512x1408, 640x1600에서도 동일 35% crop
+#     유지 = 저해상도 부작용이 아니라 의도된 FoV 설계.
+#
+#   [σ-matching off 근거] attn map 해상도 56x100 -> 16x44 로 GT cam mask 면적 12.25배 감소.
+#     min_mask_px=4 게이트가 attn map 픽셀 기준이라 유지하면 대부분 skip(무의미),
+#     1로 낮추면 1~2px 마스크의 σ가 sig_floor=0.25px에 clamp되어 "폭을 0.25px로 좁혀라"는
+#     가짜 타깃 -> attn 붕괴 위험. 저해상도에서 2차 모멘트 추정이 성립하지 않으므로 off.
+#     => 이 run은 _cover(σ-matching) 실험축이 빠진 상태. 베이스와 비교 시 반드시 감안.
+#     모니터: dbg_query_attn_sigma_* 키가 아예 안 나오는 게 정상.
+#
+#   [주의] 단일변수 아님. 해상도 변경은 attn/center 감독 품질(GT cam mask가 16x44에서 생성 →
+#     작은 객체는 마스크가 빌 수 있음)에 동반 영향. 순수 BEV IoU 비교용으로만 해석할 것.
+#   [주의] load_from/resume_from 없음(from-scratch). 896 체크포인트로 resume 불가
+#     (frustum shape + kv_downsampler shape 불일치).
+# ============================================================================
+#
 # [gt_bbox_aabb = AABB 2026-07-15] gt_bbox_aabb 자리(dice bbox 90% + center/attn/size GT)의 소스를
 # AABB(segmentation_aabb) GT로 사용. train/test LoadInstanceWithFlow 둘 다 gt_bbox_aabb_subdir=
 # 'segmentation_aabb' + gt_bbox_aabb_key='segmentation_aabb_saved_list2'로 배선(loader 기본값과 동일).
@@ -161,7 +215,8 @@ data_config = {
         'CAM_BACK_RIGHT',
     ],
     'Ncams': 6,
-    'input_size': (896, 1600),
+    # [_res704 ablation] 896x1600 -> 256x704 (BEVDet/Occ3D 표준). 파일 상단 주석 참고.
+    'input_size': (256, 704),
     'src_size': (900, 1600),
     # Image-view augmentation.
     'resize': (-0.06, 0.11),
@@ -324,38 +379,22 @@ test_pipeline = [
         img_norm_cfg=img_norm_cfg,
         test_mode=True,
     ),
-    dict(
-        type='LoadOccupancy',
-        to_float32=True,
-        occ_path=occ_path,
-        ocf_dataset_path=ocf_dataset_path,
-        grid_size=occ_size,
-        unoccupied=empty_idx,
-        pc_range=point_cloud_range,
-        use_fine_occ=use_fine_occ,
-        test_mode=True,
-        dt_path=occ_dt_path,
-        load_occ_dt=True,
-        dt_type='float16',
-        strict_dt=True,
-        validate_height_cache=False,
-        write_height_cache=write_height_cache,
-    ),
     dict(type='OccDefaultFormatBundle3D', class_names=class_names, with_label=False),
     dict(
         type='Collect3D',
+        # asset-only eval: LoadOccupancy 제거(2026-07-30). oracle 매칭·시각화에 필요한
+        # inst3d/centers/ids만 LoadInstanceWithFlow로 로드한다.
         keys=[
             'img_inputs_seq',
-            'gt_occ',
             'future_egomotion',
-            'segmentation',
-            'segmentation_bev',
-            'instance_bev',
             'gt_occ_inst',
             'gt_instance_centers_world',
             'gt_instance_centers_valid',
             'gt_instance_ids',
-            'occ_dt',
+            # 크기별 분석용(2026-07-30): LoadInstanceWithFlow가 centers와 동일 조건에서
+            # 항상 함께 생성 — qfeat 덤프에서 대형 객체 recall을 크기별로 보기 위해 통과시킨다.
+            'gt_instance_sizes',
+            'gt_instance_dims',
         ],
         meta_keys=[
             'pc_range', 'occ_size', 'scene_token', 'lidar_token',
@@ -427,7 +466,7 @@ grid_config = {
     'dbound': [2.0, 58.0, 0.5],
 }
 
-bev_feat_dim = 96
+bev_feat_dim = 128
 numC_Trans = bev_feat_dim
 
 gn_cfg = dict(type='GN', num_groups=16, requires_grad=True)
@@ -472,9 +511,16 @@ model_cfg = dict(
     query_attn_bbox_other_mode='union',
     query_attn_bbox_unmatched_weight=0.0,
     # σ-matching (attn 폭 감독) — 파일 상단 [_cover 실험] 주석 참고.
-    # 0.25 = 초기 기여 ~0.3 (raw ~0.5-0.8×2축) — center_match(~1.7)의 1/5 수준으로
+    # 원래 0.25 = 초기 기여 ~0.3 (raw ~0.5-0.8×2축) — center_match(~1.7)의 1/5 수준으로
     #   폭은 당기되 위치 감독을 못 이기는 세기. inside-mass(총량)·other(0.3)는 그대로 병행.
-    query_attn_sigma_match_loss_weight=0.25,
+    # [_res704] 0.25 -> 0.0 으로 의도적 비활성화. attn map 해상도가 56x100 -> 16x44 로
+    #   내려가 GT cam mask 면적이 12.25배 줄어드는데, min_mask_px=4 게이트는 attn map 픽셀
+    #   기준이라 (a) 유지하면 거의 모든 객체가 게이트에 걸려 loss가 사실상 안 걸리고,
+    #   (b) 1로 낮추면 1~2px 마스크의 σ가 sig_floor(0.25px)에 clamp되어 "attn 폭을 0.25px로
+    #   좁혀라"는 가짜 타깃이 생겨 attn이 점으로 붕괴할 위험. 저해상도에선 σ 추정 자체가
+    #   성립하지 않으므로 "우연히 꺼짐"이 아니라 "명시적으로 끔"으로 기록.
+    #   (utils_loss.py _compute_query_attn_bbox_loss sigma-matching 블록 참조)
+    query_attn_sigma_match_loss_weight=0.0,
     # 1 epoch(8GPU subset ≈ 500 iter) 후 개입: center/attn이 자리 잡기 전에 폭을 당기면
     #   co-training이 흔들릴 수 있어 warmup.
     query_attn_sigma_match_start_iter=500,
@@ -483,11 +529,15 @@ model_cfg = dict(
     query_attn_cam_gaussian_truncate_sigma=1.777,
     query_num_queries=200,
     # [pyr 실험] cross-attention을 coarse->fine KV 해상도 피라미드 3-layer로 확장.
-    # jhh_gi 레포 transformer.py 이식(NOTES.md 2026-07-07). data_config['input_size']=
-    # (896,1600) 기준 context feature 원본 해상도가 (56,100)이므로 최종 layer를 원본 해상도로 맞춤.
-    # layer1(14,25) 전역 대략 위치 -> layer2(28,50) 중간 정제 -> layer3(56,100) 원본 해상도 정밀화.
+    # jhh_gi 레포 transformer.py 이식(NOTES.md 2026-07-07). 최종 layer는 img_neck(SECONDFPN,
+    # stride16 통합)의 실제 context feature 해상도 = input_size/16 과 반드시 일치해야 함.
+    # ※ learnable_kv_downsample=False(기본)면 불일치해도 ValueError가 안 나고 adaptive pool로
+    #   조용히 업/다운샘플됨 — 반드시 수동 확인할 것 (파일 상단 [_res704] 주석 참조).
+    # [_res704] input_size=(256,704) -> 256/16=16, 704/16=44 이므로 (16,44)가 원본 해상도.
+    # layer1(4,11) 전역 대략 위치 -> layer2(8,22) 중간 정제 -> layer3(16,44) 원본 해상도 정밀화.
+    # 16->8->4, 44->22->11 전부 정수배라 avg_pool 경로 유지(adaptive fallback 아님).
     query_transformer_num_layers=3,
-    query_transformer_kv_resolutions=((14, 25), (28, 50), (56, 100)),
+    query_transformer_kv_resolutions=((4, 11), (8, 22), (16, 44)),
     query_cls_match_cost_weight=0.2,
     query_center_match_cost_weight=10.0,
     query_temporal_offset_match_cost_weight=0.0, #0으로 제거
@@ -593,22 +643,22 @@ debug_cfg = dict(
 
 visualization_cfg = dict(
     # ── 2D query_debug_vis ─────────────────────────────────────────────
-    debug_query_vis_dir="./work_dirs/full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_ep20/query_debug_vis",
+    debug_query_vis_dir="./work_dirs/subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_res704/query_debug_vis",
     debug_query_gaussian_vis_mode='prob',     # footprint 렌더 외형(prob heatmap)
     # ── cam_gaussian ───────────────────────────────────────────────────
-    debug_query_cam_gaussian_vis_dir="./work_dirs/full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_ep20/query_cam_gaussian_vis",
+    debug_query_cam_gaussian_vis_dir="./work_dirs/subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_res704/query_cam_gaussian_vis",
     debug_query_cam_gaussian_vis_max_frames=3,
     debug_query_cam_gaussian_vis_gt_overlay_enabled=True,
     debug_query_cam_gaussian_vis_topk_matched=8,
     # ── 3D mixture3d ───────────────────────────────────────────────────
-    debug_query_mixture3d_vis_dir="./work_dirs/full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_ep20/query_mixture3d_vis",
+    debug_query_mixture3d_vis_dir="./work_dirs/subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_res704/query_mixture3d_vis",
     debug_query_mixture3d_vis_max_queries=50,
     debug_query_mixture3d_vis_max_gt_points=40000,
     debug_query_mixture3d_vis_occ_max_voxels_per_query=4000,
     # eval mixture3d도 lightweight 128x128x10으로 렌더해 train 중 eval/debug vis 메모리 spike를 줄임.
     debug_query_mixture3d_vis_eval_occ_size=(128, 128, 10),
     debug_query_attn_softargmax_vis_dir=(
-        "./work_dirs/full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_ep20/query_attn_softargmax_vis"
+        "./work_dirs/subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_res704/query_attn_softargmax_vis"
     ),
 )
 
@@ -688,10 +738,7 @@ lr_config = dict(
     min_lr_ratio=1e-3,
 )
 
-# ep15까지 학습된 baseline(full_attn_..._filter/epoch_15_lss_only.pth)에서 resume하여 5 epoch 연장.
-# cosine은 epoch/max_epochs로 매번 새로 계산되므로 ep16 진행률이 15/20=0.75가 되어
-# LR이 3.6e-6 → 4.4e-5로 warm restart된다(= 원래 ep12 수준). base LR(3e-4)은 ckpt의 initial_lr 유지.
-runner = dict(type='EpochBasedRunner', max_epochs=20)
+runner = dict(type='EpochBasedRunner', max_epochs=15)
 checkpoint_config = dict(interval=1, filename_tmpl='epoch_{}_lss_only.pth')
 
 # 주의: hook은 매 epoch 시작 시 begin_epoch ≤ 현재 epoch인 "마지막 stage 하나"만 적용함.

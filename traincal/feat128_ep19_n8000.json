@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "mode": "post_training_calibration",
+  "checkpoint": "/home/cvlab/Desktop/NIPS2026/Autonomous_Driving_26_filter/work_dirs/full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_feat128/epoch_19_lss_only.pth",
+  "split": "train",
+  "sample_count": 8000,
+  "scope": "all_predicted_foreground_queries",
+  "uses_ground_truth": false,
+  "features": {
+    "depth_std": {
+      "mean": 1.1208170210477262,
+      "std": 0.2731968063209487,
+      "count": 282980,
+      "transformed_log1p": true,
+      "good_direction": "low",
+      "_acc": {
+        "n": 282980,
+        "sum": 317168.80061608553,
+        "sumsq": 376608.8256263639
+      }
+    },
+    "past_speed": {
+      "mean": 1.4907454879380155,
+      "std": 0.6306736215367571,
+      "count": 282980,
+      "transformed_log1p": true,
+      "good_direction": "low",
+      "_acc": {
+        "n": 282980,
+        "sum": 421851.15817669965,
+        "sumsq": 741427.7840323508
+      }
+    }
+  }
+}

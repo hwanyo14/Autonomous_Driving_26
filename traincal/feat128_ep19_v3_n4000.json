@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "mode": "post_training_calibration",
+  "checkpoint": "/home/cvlab/Desktop/NIPS2026/Autonomous_Driving_26_filter/work_dirs/full_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_feat128/epoch_19_lss_only.pth",
+  "split": "train",
+  "sample_count": 3800,
+  "scope": "all_predicted_foreground_queries",
+  "uses_ground_truth": false,
+  "features": {
+    "depth_std": {
+      "mean": 1.1214213404008935,
+      "std": 0.274016599592291,
+      "count": 134498,
+      "transformed_log1p": true,
+      "good_direction": "low",
+      "_acc": {
+        "n": 134498,
+        "sum": 150828.92744123936,
+        "sumsq": 179241.57333880046
+      }
+    },
+    "past_speed": {
+      "mean": 1.4887287840795016,
+      "std": 0.6265714720282458,
+      "count": 134498,
+      "transformed_log1p": true,
+      "good_direction": "low",
+      "_acc": {
+        "n": 134498,
+        "sum": 200231.0440011248,
+        "sumsq": 350892.53187291656
+      }
+    },
+    "traj_dev": {
+      "mean": 1.0569636365076363,
+      "std": 0.6126057479796629,
+      "count": 134498,
+      "transformed_log1p": true,
+      "good_direction": "low",
+      "_acc": {
+        "n": 134498,
+        "sum": 142159.49518300407,
+        "sumsq": 200732.6068516765
+      }
+    },
+    "speed_std": {
+      "mean": 0.4602591224025974,
+      "std": 0.42760447901391846,
+      "count": 134498,
+      "transformed_log1p": true,
+      "good_direction": "low",
+      "_acc": {
+        "n": 134498,
+        "sum": 61903.93144490455,
+        "sumsq": 53084.21538750822
+      }
+    }
+  },
+  "corr_with_depth_std": {
+    "past_speed": 0.24140802590807095,
+    "traj_dev": 0.2522567738031686,
+    "speed_std": 0.16352950494505922
+  }
+}

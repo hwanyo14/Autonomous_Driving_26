@@ -178,8 +178,8 @@ bda_aug_conf = dict(
     flip_dy_ratio=0.5,
 )
 
-# train_capacity = 23930  # default: use all sequences
-train_capacity = 4000  # 3880
+train_capacity = 23930  # default: use all sequences
+# train_capacity = 4000  # 3880
 # train_capacity = 7  # 3880
 
 test_capacity = 5119  # default: use all sequences
@@ -324,38 +324,22 @@ test_pipeline = [
         img_norm_cfg=img_norm_cfg,
         test_mode=True,
     ),
-    dict(
-        type='LoadOccupancy',
-        to_float32=True,
-        occ_path=occ_path,
-        ocf_dataset_path=ocf_dataset_path,
-        grid_size=occ_size,
-        unoccupied=empty_idx,
-        pc_range=point_cloud_range,
-        use_fine_occ=use_fine_occ,
-        test_mode=True,
-        dt_path=occ_dt_path,
-        load_occ_dt=True,
-        dt_type='float16',
-        strict_dt=True,
-        validate_height_cache=False,
-        write_height_cache=write_height_cache,
-    ),
     dict(type='OccDefaultFormatBundle3D', class_names=class_names, with_label=False),
     dict(
         type='Collect3D',
+        # asset-only eval: LoadOccupancy 제거(2026-07-30). oracle 매칭·시각화에 필요한
+        # inst3d/centers/ids만 LoadInstanceWithFlow로 로드한다.
         keys=[
             'img_inputs_seq',
-            'gt_occ',
             'future_egomotion',
-            'segmentation',
-            'segmentation_bev',
-            'instance_bev',
             'gt_occ_inst',
             'gt_instance_centers_world',
             'gt_instance_centers_valid',
             'gt_instance_ids',
-            'occ_dt',
+            # 크기별 분석용(2026-07-30): LoadInstanceWithFlow가 centers와 동일 조건에서
+            # 항상 함께 생성 — qfeat 덤프에서 대형 객체 recall을 크기별로 보기 위해 통과시킨다.
+            'gt_instance_sizes',
+            'gt_instance_dims',
         ],
         meta_keys=[
             'pc_range', 'occ_size', 'scene_token', 'lidar_token',
@@ -427,7 +411,7 @@ grid_config = {
     'dbound': [2.0, 58.0, 0.5],
 }
 
-bev_feat_dim = 96
+bev_feat_dim = 128
 numC_Trans = bev_feat_dim
 
 gn_cfg = dict(type='GN', num_groups=16, requires_grad=True)
@@ -460,7 +444,12 @@ model_cfg = dict(
     # query_class_ids는 8개 raw 유지, num_classes만 2, 가중치 2개. raw->compact는 many-to-one.
     query_cls_binary_fg=True,
     query_num_classes=2,
-    query_cls_loss_class_weights=[0.05, 1.0],
+    # [q900 ablation] bg weight를 query 수에 반비례로 스케일: 0.05 × (200/900) ≈ 0.0111.
+    # cls loss는 weighted CE reduction='mean' (Σ w_y·l / Σ w_y) 이라, bg weight를 고정하면
+    # unmatched query가 4.5배로 늘면서 (a) bg/fg 질량비와 (b) 정규화 분모(=fg per-instance
+    # gradient 크기)가 동시에 바뀐다 → query 수 외의 교란변수. 1/Q 스케일이면 bg 총 질량
+    # w_bg·(Q-M)이 200-query run과 같아져 cls loss가 Q에 대해 사실상 불변이 됨.
+    query_cls_loss_class_weights=[0.0111, 1.0],
     query_attn_match_metric='inside_log',
     query_attn_match_cost_weight=0.3,
     query_embed_dim=bev_feat_dim,
@@ -481,7 +470,7 @@ model_cfg = dict(
     query_attn_sigma_match_min_mask_px=4,
     query_require_history_all_valid=True,
     query_attn_cam_gaussian_truncate_sigma=1.777,
-    query_num_queries=200,
+    query_num_queries=900,  # [q900 ablation] main run(200) 대비 query 수만 4.5배
     # [pyr 실험] cross-attention을 coarse->fine KV 해상도 피라미드 3-layer로 확장.
     # jhh_gi 레포 transformer.py 이식(NOTES.md 2026-07-07). data_config['input_size']=
     # (896,1600) 기준 context feature 원본 해상도가 (56,100)이므로 최종 layer를 원본 해상도로 맞춤.
@@ -593,22 +582,22 @@ debug_cfg = dict(
 
 visualization_cfg = dict(
     # ── 2D query_debug_vis ─────────────────────────────────────────────
-    debug_query_vis_dir="./work_dirs/subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter/query_debug_vis",
+    debug_query_vis_dir="./work_dirs/subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_q900/query_debug_vis",
     debug_query_gaussian_vis_mode='prob',     # footprint 렌더 외형(prob heatmap)
     # ── cam_gaussian ───────────────────────────────────────────────────
-    debug_query_cam_gaussian_vis_dir="./work_dirs/subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter/query_cam_gaussian_vis",
+    debug_query_cam_gaussian_vis_dir="./work_dirs/subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_q900/query_cam_gaussian_vis",
     debug_query_cam_gaussian_vis_max_frames=3,
     debug_query_cam_gaussian_vis_gt_overlay_enabled=True,
     debug_query_cam_gaussian_vis_topk_matched=8,
     # ── 3D mixture3d ───────────────────────────────────────────────────
-    debug_query_mixture3d_vis_dir="./work_dirs/subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter/query_mixture3d_vis",
+    debug_query_mixture3d_vis_dir="./work_dirs/subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_q900/query_mixture3d_vis",
     debug_query_mixture3d_vis_max_queries=50,
     debug_query_mixture3d_vis_max_gt_points=40000,
     debug_query_mixture3d_vis_occ_max_voxels_per_query=4000,
     # eval mixture3d도 lightweight 128x128x10으로 렌더해 train 중 eval/debug vis 메모리 spike를 줄임.
     debug_query_mixture3d_vis_eval_occ_size=(128, 128, 10),
     debug_query_attn_softargmax_vis_dir=(
-        "./work_dirs/subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter/query_attn_softargmax_vis"
+        "./work_dirs/subset_attn_cover_pyr_aabb_dice3d_new_asset_all_filter_q900/query_attn_softargmax_vis"
     ),
 )
 

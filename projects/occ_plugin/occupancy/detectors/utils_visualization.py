@@ -1640,9 +1640,11 @@ class EfficientOCFVisualizationMixin:
             iou_q = centers_world_tq3.new_zeros((q_count,), dtype=torch.float32)
         iou_q = iou_q.to(dtype=torch.float32).clamp(0.0, 1.0)
 
-        w_iou = float(self.fg_score_iou_weight)
-        w_cls = float(self.fg_score_cls_weight)
-        w_cam = float(self.fg_score_cam_attn_weight)
+        # eval 실험용 override: EOCF_EVAL_W_IOU / W_CLS / W_CAM (미설정 시 config 값).
+        import os as _os
+        w_iou = float(_os.environ.get("EOCF_EVAL_W_IOU", self.fg_score_iou_weight))
+        w_cls = float(_os.environ.get("EOCF_EVAL_W_CLS", self.fg_score_cls_weight))
+        w_cam = float(_os.environ.get("EOCF_EVAL_W_CAM", self.fg_score_cam_attn_weight))
         cam_attn_score_q = centers_world_tq3.new_zeros((q_count,), dtype=torch.float32)
         cam_attn_score_valid_q = torch.zeros((q_count,), device=centers_world_tq3.device, dtype=torch.bool)
         if isinstance(query_attn_cam_score_pack, dict):
@@ -1668,7 +1670,6 @@ class EfficientOCFVisualizationMixin:
         selected_candidate_idx = torch.nonzero(fg_mask_q, as_tuple=False).squeeze(1)
         if int(selected_candidate_idx.numel()) > 0:
             candidate_scores = score_q.index_select(0, selected_candidate_idx)
-            import os as _os
             _fg_thr = float(_os.environ.get("EOCF_EVAL_FG_THR", self.fg_score_threshold))
             keep_thr = candidate_scores >= _fg_thr
             selected_candidate_idx = selected_candidate_idx[keep_thr]

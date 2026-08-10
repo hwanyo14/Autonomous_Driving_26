@@ -470,119 +470,38 @@ class EfficientOCFDataset(NuScenesDataset):
         return input_dict
 
     def evaluate(self, results, logger=None, **kawrgs):
-        '''
-        Evaluate by IOU and VPQ metrics for model evaluation
-        '''
+        """asset-union GT 기준 present/future 2D·3D IoU만 평가한다.
+
+        nusocc / bbox_aabb / bbox_rot / Recall3d 계열은 2026-07-30에 제거됨.
+        """
         eval_results = {}
-        
-        ''' calculate IOU 2D (nusocc occupancy GT) '''
-        hist_for_iou = sum(results['hist_for_iou'])
-        ious = cm_to_ious(hist_for_iou)
-        res_table, res_dic = format_iou_results(ious, return_dic=True)
-        for key, val in res_dic.items():
-            eval_results['IOU_{}'.format(key)] = val
+
+        for tag in ("present", "future"):
+            cm_key = f"hist_for_iou_asset_{tag}"
+            if results.get(cm_key):
+                ious = cm_to_ious(sum(results[cm_key]))
+                eval_results[f"IOU_2d_asset_{tag}"] = float(ious[1])
+
+            i3_key = f"iou_3d_asset_{tag}"
+            if results.get(i3_key):
+                vals = results[i3_key]
+                eval_results[f"IOU_3d_asset_{tag}"] = float(sum(vals) / len(vals))
+
+            comps_key = f"iou_3d_asset_{tag}_comps"
+            if results.get(comps_key):
+                comps = np.sum(np.stack(
+                    [np.asarray(c, dtype=np.float64) for c in results[comps_key]]), axis=0)
+                tp, fp, fn = [float(v) for v in comps[:3]]
+                denom = tp + fp + fn
+                eval_results[f"IOU_3d_asset_{tag}_TP"] = tp
+                eval_results[f"IOU_3d_asset_{tag}_FP"] = fp
+                eval_results[f"IOU_3d_asset_{tag}_FN"] = fn
+                eval_results[f"IOU_3d_asset_{tag}_micro"] = (
+                    tp / denom if denom > 0 else float("nan"))
+
         if logger is not None:
-            logger.info('IOU (nusocc) 2D Evaluation')
-            logger.info(res_table)
-
-        ''' calculate IOU 2D (bbox-AABB GT) '''
-        if results.get('hist_for_iou_bbox'):
-            hist_bbox = sum(results['hist_for_iou_bbox'])
-            ious_bbox = cm_to_ious(hist_bbox)
-            res_table_b, res_dic_b = format_iou_results(ious_bbox, return_dic=True)
-            for key, val in res_dic_b.items():
-                eval_results['IOU_bbox_{}'.format(key)] = val
-            if logger is not None:
-                logger.info('IOU (bbox-AABB) 2D Evaluation')
-                logger.info(res_table_b)
-
-        ''' calculate IOU 2D (bbox rotated-OBB GT, v2 캐시) '''
-        if results.get('hist_for_iou_bbox_rot'):
-            hist_bbox_rot = sum(results['hist_for_iou_bbox_rot'])
-            ious_bbox_rot = cm_to_ious(hist_bbox_rot)
-            res_table_r, res_dic_r = format_iou_results(ious_bbox_rot, return_dic=True)
-            for key, val in res_dic_r.items():
-                eval_results['IOU_bbox_rot_{}'.format(key)] = val
-            if logger is not None:
-                logger.info('IOU (bbox rotated-OBB) 2D Evaluation')
-                logger.info(res_table_r)
-
-        ''' calculate IOU 2D (asset-union GT) '''
-        if results.get('hist_for_iou_asset'):
-            hist_asset = sum(results['hist_for_iou_asset'])
-            ious_asset = cm_to_ious(hist_asset)
-            res_table_asset, res_dic_asset = format_iou_results(ious_asset, return_dic=True)
-            for key, val in res_dic_asset.items():
-                eval_results['IOU_asset_{}'.format(key)] = val
-            eval_results['IOU_2d_asset'] = float(ious_asset[1])
-            if logger is not None:
-                logger.info('IOU (asset-union) 2D Evaluation')
-                logger.info(res_table_asset)
-
-        ''' calculate height metric '''
-        if results.get('height_l1'):
-            height_l1 = sum(results['height_l1'])
-            eval_results['Height_L1'] = height_l1 / len(results['height_l1'])
-
-        ''' calculate VPQ '''
-        if 'vpq_metric' in results.keys() and 'vpq_len' in results.keys():
-            vpq_sum = sum(results['vpq_metric'])
-            # eval_results['VPQ'] = vpq_sum/results['vpq_len']
-            eval_results['VPQ'] = (vpq_sum/results['vpq_len'])[0]
-
-        '''calculate 3d metric (nusocc occupancy GT / bbox-AABB GT)'''
-        if results.get('iou_3d'):
-            eval_results['IOU_3d_nusocc'] = sum(results['iou_3d']) / len(results['iou_3d'])
-        if results.get('iou_3d_bbox'):
-            eval_results['IOU_3d_bbox_aabb'] = sum(results['iou_3d_bbox']) / len(results['iou_3d_bbox'])
-        if results.get('iou_3d_bbox_rot'):
-            eval_results['IOU_3d_bbox_rot'] = sum(results['iou_3d_bbox_rot']) / len(results['iou_3d_bbox_rot'])
-        if results.get('iou_3d_asset'):
-            eval_results['IOU_3d_asset'] = sum(results['iou_3d_asset']) / len(results['iou_3d_asset'])
-        if results.get('iou_3d_asset_comps') is not None and len(results['iou_3d_asset_comps']) > 0:
-            comps = np.sum(np.stack([
-                np.asarray(c) for c in results['iou_3d_asset_comps']
-            ]), axis=0)
-            tp, fp, fn = [float(v) for v in comps]
-            denom = tp + fp + fn
-            eval_results['IOU_3d_asset_TP'] = tp
-            eval_results['IOU_3d_asset_FP'] = fp
-            eval_results['IOU_3d_asset_FN'] = fn
-            eval_results['IOU_3d_asset_micro'] = tp / denom if denom > 0 else float('nan')
-        # Recall3d(bbox_aabb): base=inst3d, 관용=AABB box. Recall3d(bbox_rot): 관용=rot OBB (더 엄격).
-        if results.get('recall_3d'):
-            eval_results['Recall3d(bbox_aabb)'] = sum(results['recall_3d']) / len(results['recall_3d'])
-        if results.get('recall_3d_comps') is not None and len(results['recall_3d_comps']) > 0:
-            comps = np.sum(np.stack([np.asarray(c) for c in results['recall_3d_comps']]), axis=0)
-            tp, fp, fn, bfp = [float(v) for v in comps]
-            denom = tp + fn + fp - bfp
-            eval_results['Recall3d(bbox_aabb)_TP'] = tp
-            eval_results['Recall3d(bbox_aabb)_FP'] = fp
-            eval_results['Recall3d(bbox_aabb)_FN'] = fn
-            eval_results['Recall3d(bbox_aabb)_bboxFP'] = bfp
-            eval_results['Recall3d(bbox_aabb)_micro'] = (tp + bfp) / denom if denom > 0 else float('nan')
-        if results.get('recall_3d_rot'):
-            eval_results['Recall3d(bbox_rot)'] = sum(results['recall_3d_rot']) / len(results['recall_3d_rot'])
-        if results.get('recall_3d_rot_comps') is not None and len(results['recall_3d_rot_comps']) > 0:
-            comps = np.sum(np.stack([np.asarray(c) for c in results['recall_3d_rot_comps']]), axis=0)
-            tp, fp, fn, bfp = [float(v) for v in comps]
-            denom = tp + fn + fp - bfp
-            eval_results['Recall3d(bbox_rot)_TP'] = tp
-            eval_results['Recall3d(bbox_rot)_FP'] = fp
-            eval_results['Recall3d(bbox_rot)_FN'] = fn
-            eval_results['Recall3d(bbox_rot)_bboxFP'] = bfp
-            eval_results['Recall3d(bbox_rot)_micro'] = (tp + bfp) / denom if denom > 0 else float('nan')
-        if results.get('recall_3d_asset'):
-            eval_results['Recall3d(asset)'] = sum(results['recall_3d_asset']) / len(results['recall_3d_asset'])
-        if results.get('recall_3d_asset_comps') is not None and len(results['recall_3d_asset_comps']) > 0:
-            comps = np.sum(np.stack([np.asarray(c) for c in results['recall_3d_asset_comps']]), axis=0)
-            tp, fp, fn, bfp = [float(v) for v in comps]
-            denom = tp + fn + fp - bfp
-            eval_results['Recall3d(asset)_TP'] = tp
-            eval_results['Recall3d(asset)_FP'] = fp
-            eval_results['Recall3d(asset)_FN'] = fn
-            eval_results['Recall3d(asset)_assetFP'] = bfp
-            eval_results['Recall3d(asset)_micro'] = (tp + bfp) / denom if denom > 0 else float('nan')
+            for k in sorted(eval_results):
+                logger.info("%s: %.6f", k, eval_results[k])
 
         def _to_py(val):
             if torch.is_tensor(val):

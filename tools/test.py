@@ -7,7 +7,7 @@ import os
 import torch
 from mmcv import Config, DictAction
 from mmcv.cnn import fuse_conv_bn
-from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
+from mmcv.parallel import MMDataParallel
 from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
                          wrap_fp16_model)
 from mmdet3d.apis import single_gpu_test
@@ -16,6 +16,9 @@ from projects.occ_plugin.datasets.builder import build_dataloader
 from mmdet3d.models import build_model
 from mmdet.apis import set_random_seed
 from projects.occ_plugin.occupancy.apis.test import custom_single_gpu_test, custom_multi_gpu_test
+from projects.occ_plugin.occupancy.apis.mmdet_train import (
+    _Torch27MMDistributedDataParallel,
+)
 from mmdet.datasets import replace_ImageToTensor
 import time
 import os.path as osp
@@ -258,7 +261,7 @@ def main():
         model = MMDataParallel(model, device_ids=[0])
         outputs = custom_single_gpu_test(model, data_loader, args.show, args.show_dir)
     else:
-        model = MMDistributedDataParallel(
+        model = _Torch27MMDistributedDataParallel(
             model.cuda(),
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=False)
